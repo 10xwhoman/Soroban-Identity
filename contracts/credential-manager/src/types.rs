@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Map, String};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Map, String, Vec};
 
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
@@ -30,7 +30,15 @@ pub struct Credential {
     /// A cancelled credential can never be activated and is treated as
     /// equivalent to revoked for all verification purposes. #731
     pub activation_cancelled: bool,
+    /// Credential IDs that must exist and be valid before this credential can
+    /// be issued. Supports educational/certification chains (e.g. a Master's
+    /// degree requiring a Bachelor's). #814
+    pub prerequisite_credentials: Vec<BytesN<32>>,
 }
+
+/// Maximum number of prerequisite levels that may be traversed when verifying
+/// a credential's dependency chain. #814
+pub const MAX_DEPENDENCY_DEPTH: u32 = 5;
 
 impl Credential {
     /// Returns `true` when the credential is currently active at `now`.
