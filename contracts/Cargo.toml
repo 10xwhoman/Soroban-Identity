@@ -43,6 +43,10 @@ revocation-registry = { path = "revocation-registry" }
 selective-disclosure = { path = "selective-disclosure" }
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }
 
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+
 [profile.release]
 opt-level = "z"
 lto = true
