@@ -163,6 +163,33 @@ export function buildRevokeCredentialArgs(params: {
 }
 
 /**
+ * Build args for `revoke_credential_with_reason(issuer, credential_id, reason)`. #951
+ *
+ * @param params.reason Numeric `RevocationReason` value (encoded as `u32`).
+ */
+export function buildRevokeCredentialWithReasonArgs(params: {
+  issuer: string;
+  credentialId: Buffer;
+  reason: number;
+}): xdr.ScVal[] {
+  return [
+    nativeToScVal(params.issuer, { type: 'address' }),
+    nativeToScVal(params.credentialId, { type: 'bytes' }),
+    nativeToScVal(params.reason, { type: 'u32' }),
+  ];
+}
+
+/** Build args for `get_revocation_record(credential_id)`. #951 */
+export function buildGetRevocationRecordArgs(params: { credentialId: Buffer }): xdr.ScVal[] {
+  return [nativeToScVal(params.credentialId, { type: 'bytes' })];
+}
+
+/** Build args for `get_revoked_by_reason(reason)`. #951 */
+export function buildGetRevokedByReasonArgs(params: { reason: number }): xdr.ScVal[] {
+  return [nativeToScVal(params.reason, { type: 'u32' })];
+}
+
+/**
  * Build args for `revoke_credentials_batch(issuer, ids, reason)`.
  *
  * @param params.issuer        Registered issuer address (must sign the tx).
