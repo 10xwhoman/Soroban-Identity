@@ -240,6 +240,7 @@ Features:
 - Create your own on-chain DID
 - Verify credentials by ID
 - Issue credentials (registered issuers)
+- Export credentials as PDF (with a verification QR code), JSON (W3C VC + export metadata), XML or CSV, individually or in batches (one combined file or a ZIP), using built-in or custom PDF templates
 
 ---
 
