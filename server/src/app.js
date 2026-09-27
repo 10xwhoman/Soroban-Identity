@@ -69,7 +69,7 @@ import { handleEventsRequest } from "./sse.js";
 import { handleLongPollRequest } from "./long-poll.js";
 import { logger } from "./logger.js";
 import { AnalyticsService, detectCountry } from "./analytics.js";
-import { TieredRateLimiter } from "./rate-limiter.js";
+import { createRateLimiter } from "./middleware/ratelimit.js";
 import { ApiKeyService } from "./api-keys.js";
 import { EmailTransport } from "./email.js";
 import { pickQuotaBinding, QuotaTracker, notifyQuotaThresholdOwner } from "./quota.js";
@@ -129,13 +129,9 @@ export function createApp({
 
   // One limiter per app instance, so its buckets live as long as the server
   // rather than being rebuilt per request.
-  const limiter =
-    rateLimiter ??
-    new TieredRateLimiter({
-      whitelist: config.rateLimitWhitelist ?? [],
-      trustProxy: config.trustProxy ?? false,
-      maxBuckets: config.rateLimitMaxBuckets ?? 10000,
-    });
+  // #956: per-IP, per-user, endpoint and tier budgets with burst allowance
+  // and premium bypass. A caller-supplied limiter only needs a check() method.
+  const limiter = rateLimiter ?? createRateLimiter(config, { metrics });
 
   // One quota tracker per app instance (#748), independent of the rate
   // limiter above: it counts against calendar day/month budgets rather than
@@ -392,7 +388,7 @@ export function createApp({
       const rateResult = limiter.check(req, url.pathname);
 
       if (rateResult.whitelisted) {
-        res.setHeader("X-RateLimit-Bypass", "whitelist");
+        res.setHeader("X-RateLimit-Bypass", rateResult.bypass ?? "whitelist");
       } else {
         // Report whichever budget is closest to exhaustion, so a client sees
         // the limit that will actually stop it first.
@@ -401,8 +397,12 @@ export function createApp({
         res.setHeader("X-RateLimit-Limit", String(reported.limit));
         res.setHeader("X-RateLimit-Remaining", String(reported.remaining));
         res.setHeader("X-RateLimit-Reset", String(reported.resetAt));
-        if (rateResult.scope === "endpoint" || rateResult.endpoint?.rule) {
-          res.setHeader("X-RateLimit-Scope", rateResult.scope === "endpoint" ? "endpoint" : "tier");
+        if (!rateResult.allowed) {
+          res.setHeader("X-RateLimit-Scope", rateResult.scope);
+        } else if (reported.rule === "ip" || reported.rule === "user") {
+          res.setHeader("X-RateLimit-Scope", reported.rule);
+        } else if (rateResult.endpoint?.rule) {
+          res.setHeader("X-RateLimit-Scope", "tier");
         }
       }
 
@@ -412,6 +412,19 @@ export function createApp({
         // An endpoint denial is not a tier problem, so it must not be dressed
         // up as one — upgrading would not raise a per-endpoint limit.
         const isEndpointDenial = rateResult.scope === "endpoint";
+        // Per-IP and per-user denials are abuse controls, not tier limits.
+        const isClientDenial = rateResult.scope === "ip" || rateResult.scope === "user";
+
+        if (isClientDenial) {
+          return sendJson(res, 429, {
+            error: "rate_limit_exceeded",
+            code: "RATE_LIMIT_EXCEEDED",
+            scope: rateResult.scope,
+            message: `Too many requests from this ${rateResult.scope === "ip" ? "IP address" : "account"}. Retry in ${rateResult.retryAfter}s.`,
+            limit: rateResult.limit,
+            retryAfter: rateResult.retryAfter,
+          });
+        }
 
         if (!isEndpointDenial && rateResult.tier === "free") {
           res.setHeader(
@@ -1049,6 +1062,14 @@ export function createApp({
           !(await requireAdmin(req, res, config))
         )
           return;
+
+        // #956: rate limiter state — decision counts, live buckets and the
+        // most recent violations. Prometheus series back the Grafana board.
+        if (req.method === "GET" && pathname === "/admin/rate-limits") {
+          if (!await requireAuth(req, res, config, ['admin:read'])) return;
+          const stats = typeof limiter.getStats === "function" ? limiter.getStats() : {};
+          return sendJson(res, 200, stats);
+        }
 
         // Analytics Dashboard
         if (req.method === "GET" && url.pathname === "/admin/analytics/dashboard") {
