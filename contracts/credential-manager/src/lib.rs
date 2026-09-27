@@ -1,5 +1,8 @@
 #![no_std]
 
+mod templates;
+pub use templates::{CredentialTemplate, TemplateRef};
+
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short,
     Address, Bytes, BytesN, Env, Map, String, Symbol, Vec,
