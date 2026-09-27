@@ -14,6 +14,13 @@ import {
 } from "./storage.js";
 import { findExpiringCredentials, paginate, paginateCursor } from "./expiry.js";
 import {
+  buildPaginationMeta,
+  decodeOffsetCursor,
+  paginateArray,
+  resolvePageSize,
+  setPaginationHeaders,
+} from "./routes/pagination.js";
+import {
   createWebhookRecord,
   deleteWebhookRecord,
   getWebhookRecord,
@@ -686,12 +693,23 @@ export function createApp({
           if (!validated.ok) return;
           const limitNum = validated.data.query.limit ?? 50;
           const credentials = await readCredentials(config);
+          const direction = validated.data.query.direction ?? "next";
           const { items, nextCursor, previousCursor } = paginateCursor(credentials, {
             limit: limitNum,
             cursor: validated.data.query.cursor ?? null,
-            direction: validated.data.query.direction ?? "next",
+            direction,
           });
-          return sendFormatted(req, res, 200, { items, nextCursor });
+          // #958: has_more follows the direction of travel.
+          const pagination = buildPaginationMeta({
+            totalCount: credentials.length,
+            pageSize: Math.min(200, Math.max(1, limitNum)),
+            hasMore: direction === "prev" ? Boolean(previousCursor) : Boolean(nextCursor),
+            nextCursor,
+            previousCursor,
+            extraLinkParams: { prev: { direction: "prev" } },
+          });
+          setPaginationHeaders(res, url, pagination);
+          return sendFormatted(req, res, 200, { items, nextCursor, previousCursor, pagination });
 
           if (wantsJsonLd(req, url)) {
             return sendJson(
@@ -1244,10 +1262,14 @@ export function createApp({
           if (!await requireAuth(req, res, config, ['admin:read'])) return;
           const validated = validateRequest(res, schemas.webhookLogsQuery, { query: url.searchParams });
           if (!validated.ok) return;
-          const limit = validated.data.query.limit ?? 50;
           const webhookId = validated.data.query.webhookId ?? null;
-          const logs = await readWebhookLogs(config, { webhookId, limit });
-          return sendJson(res, 200, { logs });
+          const all = await readWebhookLogs(config, { webhookId, all: true });
+          const page = paginateArray(all, {
+            pageSize: validated.data.query.limit ?? 50,
+            cursor: url.searchParams.get("cursor"),
+          });
+          setPaginationHeaders(res, url, page.meta);
+          return sendJson(res, 200, { logs: page.items, pagination: page.meta });
         }
 
         if (req.method === "GET" && pathname === "/notifications/logs") {
@@ -1256,12 +1278,18 @@ export function createApp({
           if (limit > 200) {
             return sendJson(res, 400, { code: "INVALID_REQUEST", message: "limit must not exceed 200" });
           }
-          const logs = await readNotificationLog(config, {
-            limit,
+          const all = await readNotificationLog(config, {
             credentialId: url.searchParams.get("credentialId") ?? undefined,
             status: url.searchParams.get("status") ?? undefined,
           });
-          return sendJson(res, 200, { logs });
+          // Newest first, matching the webhook logs, so page one is the most
+          // recent activity.
+          const page = paginateArray(all.reverse(), {
+            pageSize: limit,
+            cursor: url.searchParams.get("cursor"),
+          });
+          setPaginationHeaders(res, url, page.meta);
+          return sendJson(res, 200, { logs: page.items, pagination: page.meta });
         }
 
         if (req.method === "GET" && pathname === "/cache/stats") {
@@ -1319,9 +1347,13 @@ export function createApp({
           const webhookId = decodeURIComponent(webhookLogsMatch[1]);
           const validated = validateRequest(res, schemas.webhookLogsQuery, { query: url.searchParams });
           if (!validated.ok) return;
-          const limit = validated.data.query.limit ?? 50;
-          const logs = await readWebhookLogs(config, { webhookId, limit });
-          return sendJson(res, 200, { logs });
+          const all = await readWebhookLogs(config, { webhookId, all: true });
+          const page = paginateArray(all, {
+            pageSize: validated.data.query.limit ?? 50,
+            cursor: url.searchParams.get("cursor"),
+          });
+          setPaginationHeaders(res, url, page.meta);
+          return sendJson(res, 200, { logs: page.items, pagination: page.meta });
         }
 
         const webhookIdMatch = pathname.match(/^\/webhooks\/([^/]+)$/);
@@ -1427,15 +1459,16 @@ export function createApp({
             windowDays,
             includeNotified: true,
           });
-          return sendFormatted(
-            req,
-            res,
-            200,
-            paginate(expiring, {
-              page: validated.data.query.page ?? null,
-              pageSize: validated.data.query.pageSize ?? null,
-            }),
-          );
+          const pageSize = resolvePageSize(validated.data.query.pageSize);
+          // #958: a cursor, when present, selects the page in place of `page`.
+          const cursorOffset = decodeOffsetCursor(url.searchParams.get("cursor"));
+          const pageNumber =
+            cursorOffset !== null ? Math.floor(cursorOffset / pageSize) + 1 : validated.data.query.page ?? null;
+          const report = paginate(expiring, { page: pageNumber, pageSize });
+          const offset = (report.page - 1) * report.pageSize;
+          const cursorPage = paginateArray(expiring, { pageSize: report.pageSize, offset });
+          setPaginationHeaders(res, url, cursorPage.meta);
+          return sendFormatted(req, res, 200, { ...report, pagination: cursorPage.meta });
         }
 
         return notFound(res, req);
@@ -1505,7 +1538,12 @@ export function createApp({
         if (req.method === "GET" && url.pathname === "/admin/api-keys") {
           if (!await requireAuth(req, res, config, ['admin:read'])) return;
           const keys = await apiKeyService.listKeys();
-          return sendJson(res, 200, { keys });
+          const page = paginateArray(keys, {
+            pageSize: url.searchParams.get("limit"),
+            cursor: url.searchParams.get("cursor"),
+          });
+          setPaginationHeaders(res, url, page.meta);
+          return sendJson(res, 200, { keys: page.items, pagination: page.meta });
         }
 
         const apiKeyIdMatch = url.pathname.match(/^\/admin\/api-keys\/([^/]+)$/);
@@ -1605,8 +1643,20 @@ export function createApp({
             }
 
             const total = entries.length;
-            const page = entries.slice(offset, offset + limit);
-            return sendJson(res, 200, { total, limit, offset, entries: page });
+            const page = paginateArray(entries, {
+              pageSize: limit,
+              cursor: url.searchParams.get("cursor"),
+              offset,
+              maxPageSize: 500,
+            });
+            setPaginationHeaders(res, url, page.meta);
+            return sendJson(res, 200, {
+              total,
+              limit,
+              offset: page.offset,
+              entries: page.items,
+              pagination: page.meta,
+            });
           } catch (err) {
             logger.error({ error: err.message, stack: err.stack }, 'Failed to read audit logs');
             return sendJson(res, 500, { error: 'audit_log_read_failed', message: err.message });

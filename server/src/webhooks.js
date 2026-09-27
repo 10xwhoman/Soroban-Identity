@@ -130,7 +130,8 @@ export async function appendWebhookLog(config, logEntry) {
   return record;
 }
 
-export async function readWebhookLogs(config, { webhookId = null, limit = 50 } = {}) {
+// `all: true` skips the limit so the caller can paginate the full set (#958).
+export async function readWebhookLogs(config, { webhookId = null, limit = 50, all = false } = {}) {
   const filePath = getWebhookLogsFilePath(config);
   try {
     const raw = await fs.readFile(filePath, 'utf8');
@@ -151,6 +152,7 @@ export async function readWebhookLogs(config, { webhookId = null, limit = 50 } =
     }
 
     filtered.reverse(); // Newest first
+    if (all) return filtered;
     return filtered.slice(0, Math.min(limit, 200));
   } catch (error) {
     if (error.code === 'ENOENT') return [];
