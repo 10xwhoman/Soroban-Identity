@@ -9,6 +9,53 @@ pub enum CredentialType {
     Custom,
 }
 
+/// Auto-renewal policy for a recurring credential. #869
+///
+/// When attached to a credential, the credential may be automatically
+/// renewed on verification once it is within `renewal_period` seconds of
+/// expiry. `renewal_period` is expressed in seconds and is expected to be
+/// one of the supported periods (30/60/90 days).
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct RenewalPolicy {
+    /// Whether auto-renewal is enabled for this credential.
+    pub enabled: bool,
+    /// Renewal window in seconds before `expires_at` (e.g. 30/60/90 days).
+    pub renewal_period: u64,
+    /// Number of times the credential has been auto-renewed so far.
+    pub renewal_count: u32,
+}
+
+impl RenewalPolicy {
+    /// 30 days in seconds.
+    pub const PERIOD_30_DAYS: u64 = 30 * 24 * 60 * 60;
+    /// 60 days in seconds.
+    pub const PERIOD_60_DAYS: u64 = 60 * 24 * 60 * 60;
+    /// 90 days in seconds.
+    pub const PERIOD_90_DAYS: u64 = 90 * 24 * 60 * 60;
+
+    /// Returns `true` when `period` is one of the supported renewal periods.
+    pub fn is_supported_period(period: u64) -> bool {
+        period == Self::PERIOD_30_DAYS
+            || period == Self::PERIOD_60_DAYS
+            || period == Self::PERIOD_90_DAYS
+    }
+
+    /// Returns `true` when the credential should be auto-renewed at `now`.
+    ///
+    /// Auto-renewal applies only when the policy is enabled, the credential
+    /// has a finite expiry (`expires_at != 0`), and `now` has reached the
+    /// renewal window (`expires_at - renewal_period`). Uses saturating
+    /// arithmetic so arbitrary timestamps cannot panic or overflow. #869
+    pub fn should_renew_at(&self, expires_at: u64, now: u64) -> bool {
+        if !self.enabled || expires_at == 0 {
+            return false;
+        }
+        let window_start = expires_at.saturating_sub(self.renewal_period);
+        now >= window_start
+    }
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Credential {
@@ -30,10 +77,8 @@ pub struct Credential {
     /// A cancelled credential can never be activated and is treated as
     /// equivalent to revoked for all verification purposes. #731
     pub activation_cancelled: bool,
-    /// Credential IDs that must exist and be valid before this credential can
-    /// be issued. Supports educational/certification chains (e.g. a Master's
-    /// degree requiring a Bachelor's). #814
-    pub prerequisite_credentials: Vec<BytesN<32>>,
+    /// Optional auto-renewal policy for recurring credentials. #869
+    pub renewal_policy: Option<RenewalPolicy>,
 }
 
 /// Maximum number of prerequisite levels that may be traversed when verifying
@@ -68,5 +113,14 @@ impl Credential {
         }
 
         true
+    }
+
+    /// Returns `true` when this credential is due for auto-renewal at `now`.
+    /// #869
+    pub fn should_auto_renew_at(&self, now: u64) -> bool {
+        match &self.renewal_policy {
+            Some(policy) => policy.should_renew_at(self.expires_at, now),
+            None => false,
+        }
     }
 }
