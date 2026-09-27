@@ -59,6 +59,8 @@ soroban-identity/
 ├── sdk/                       # TypeScript SDK for dApp integration
 ├── server/                    # Operational API, expiry jobs, health, and metrics
 ├── analytics/                 # On-chain analytics indexer + live dashboard
+├── infrastructure/
+│   └── cdn/                   # CDN config, cache purge, multi-region tests, metrics
 ├── scripts/
 │   └── deploy.sh              # Build + deploy all contracts to testnet
 └── docs/
