@@ -1,11 +1,14 @@
 #![no_std]
 #![deny(clippy::all)]
 
+mod versions;
+
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short,
     Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol, Val, Vec,
 };
+use versions::{CredentialVersion, MAX_VERSION_HISTORY};
 
 pub const CONTRACT_VERSION: u32 = 1;
 const EVENT_VERSION: u32 = 1;
@@ -49,6 +52,10 @@ const CRED_BY_ISSUER: Symbol = symbol_short!("BYISSUER");
 const CRED_BY_SUBJECT: Symbol = symbol_short!("BYSUBJ");
 const UPGRADE_PROPOSAL: Symbol = symbol_short!("UPGRADE");
 const DEFAULT_UPGRADE_TIMELOCK: u64 = 86_400;
+// ── Issue #812: period-based Merkle revocation lists ─────────────────────────
+const CRL_LEAVES: Symbol = symbol_short!("CRLLEAF");
+const CRL_ROOT: Symbol = symbol_short!("CRLROOT");
+const CRL_PERIOD_SECS: u64 = 86_400;
 
 // ── Issue #732: credential dependency chain storage keys ──────────────────────
 /// Maps a credential ID to its list of prerequisite credential IDs.
@@ -64,6 +71,8 @@ const MAX_DEP_DEPTH: u32 = 5;
 // ── Issue #733: batch verification cap ────────────────────────────────────────
 /// Maximum number of credential IDs accepted in a single `verify_credentials_batch` call.
 const MAX_VERIFY_BATCH: u32 = 50;
+const CRED_VERSIONS: Symbol = symbol_short!("CREDVER");
+const MAX_CREDENTIAL_VERSION_HISTORY: u32 = MAX_VERSION_HISTORY;
 
 // -- Issue #659: credential proof requirements
 /// Maps (issuer, subject) to a challenge for proof of possession.
@@ -139,21 +148,8 @@ pub enum ContractError {
     InsufficientApprovals = 30,
     /// Issue #658: admin action has expired.
     AdminActionExpired = 31,
-    NoUpgradePending = 32,
-    UpgradeAlreadyExecuted = 33,
-    UpgradeTimelockNotExpired = 34,
-    CredentialTypeAlreadyExists = 35,
-    CredentialTypeNotFound = 36,
-    CredentialTypeInactive = 37,
-    ClaimsSchemaMismatch = 38,
-    MaxCredentialTypesReached = 39,
-    DelegationNotFound = 40,
-    UnauthorizedDelegate = 41,
-    InvalidDelegationExpiry = 42,
-    DelegationAlreadyRevoked = 43,
-    ActivationTimeNotFuture = 44,
-    CredentialNotYetActive = 45,
-    ActivationAlreadyStarted = 46,
+    /// Issue #816: credential version was not found in the amendment history.
+    VersionNotFound = 32,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -287,6 +283,8 @@ pub struct Credential {
     pub claims_hash: BytesN<32>,
     pub signature: Bytes,
     pub issued_at: u64,
+    pub version: u32,
+    pub last_modified_at: u64,
     /// Unix timestamp after which the credential is considered active.
     /// `0` means immediately active (no time-lock). Implements issue #731.
     pub activation_time: u64,
@@ -323,6 +321,15 @@ pub struct Delegation {
     pub granted_at: u64,
     pub expires_at: u64,
     pub revoked: bool,
+}
+
+/// A proof that a credential ID is included in a period-based revocation tree.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevocationMerkleProof {
+    pub leaf: BytesN<32>,
+    pub siblings: Vec<BytesN<32>>,
+    pub sibling_on_left: Vec<bool>,
 }
 
 // ── Issue #661: Storage optimization structures ────────────────────────────────
@@ -683,7 +690,7 @@ impl CredentialManager {
     /// Issues a credential after validating `claims` against a registered
     /// type's schema, then delegates to [`Self::issue_credential`].
     #[allow(clippy::too_many_arguments)]
-    pub fn issue_typed_credential(
+    pub fn issue_scheduled_credential(
         env: Env,
         issuer: Address,
         subject: Address,
@@ -724,6 +731,7 @@ impl CredentialManager {
         claims_hash: BytesN<32>,
         signature: Bytes,
         expires_at: u64,
+        activation_time: u64,
         schema_hash: Option<BytesN<32>>,
         proof: Option<Bytes>,
     ) -> Result<BytesN<32>, ContractError> {
@@ -814,6 +822,8 @@ impl CredentialManager {
             claims_hash,
             signature,
             issued_at: now,
+            version: 1,
+            last_modified_at: now,
             activation_time,
             expires_at,
             revoked: false,
@@ -915,96 +925,68 @@ impl CredentialManager {
         Ok(id)
     }
 
-    /// Issues a credential that becomes valid at `activation_time`.
-    /// This additive endpoint keeps the original issuance ABI unchanged.
-    pub fn issue_scheduled_credential(
-        env: Env,
-        issuer: Address,
-        subject: Address,
-        credential_type: CredentialType,
-        claims: Map<String, String>,
-        claims_hash: BytesN<32>,
-        signature: Bytes,
-        expires_at: u64,
-        activation_time: u64,
-    ) -> Result<BytesN<32>, ContractError> {
-        let now = env.ledger().timestamp();
-        if activation_time <= now {
-            return Err(ContractError::ActivationTimeNotFuture);
-        }
-        if expires_at != 0 && expires_at <= activation_time {
-            return Err(ContractError::CredentialExpired);
-        }
-        let id = Self::issue_credential(
-            env.clone(),
-            issuer.clone(),
-            subject.clone(),
-            credential_type,
-            claims,
-            claims_hash,
-            signature,
-            expires_at,
-            None,
-            None,
-        )?;
-        let key = Self::cred_key(&id);
-        let mut credential: Credential = env.storage().persistent().get(&key).ok_or(ContractError::CredentialNotFound)?;
-        credential.activation_time = activation_time;
-        env.storage().persistent().set(&key, &credential);
-        env.events().publish(
-            (CRED, symbol_short!("scheduled")),
-            (EVENT_VERSION, id.clone(), subject, issuer, activation_time),
-        );
-        Ok(id)
+    /// Returns the Merkle root for the revocation period containing `timestamp`.
+    pub fn get_revocation_merkle_root(env: Env, issuer: Address, timestamp: u64) -> BytesN<32> {
+        let period = Self::crl_period(timestamp);
+        env.storage().persistent().get(&(CRL_ROOT, issuer, period)).unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
     }
 
-    /// Updates a scheduled credential before it becomes active. Only its issuer
-    /// may move the activation time, and the new time must remain in the future.
-    pub fn update_activation_time(
+    /// Builds a proof for `credential_id` from the stored leaves in its CRL period.
+    pub fn get_revocation_merkle_proof(
         env: Env,
         issuer: Address,
         credential_id: BytesN<32>,
-        new_activation_time: u64,
-    ) -> Result<(), ContractError> {
-        issuer.require_auth();
-        Self::require_not_paused(&env)?;
-        let now = env.ledger().timestamp();
-        if new_activation_time <= now {
-            return Err(ContractError::ActivationTimeNotFuture);
+        timestamp: u64,
+    ) -> Result<RevocationMerkleProof, ContractError> {
+        let period = Self::crl_period(timestamp);
+        let leaves: Vec<BytesN<32>> = env.storage().persistent().get(&(CRL_LEAVES, issuer, period)).ok_or(ContractError::MerkleProofNotFound)?;
+        let mut index: u32 = 0;
+        let mut found = false;
+        for leaf in leaves.iter() {
+            if leaf == credential_id { found = true; break; }
+            index += 1;
         }
-        let key = Self::cred_key(&credential_id);
-        let mut credential: Credential = env.storage().persistent().get(&key).ok_or(ContractError::CredentialNotFound)?;
-        if credential.issuer != issuer {
-            return Err(ContractError::UnauthorizedIssuer);
+        if !found { return Err(ContractError::MerkleProofNotFound); }
+        let mut level = leaves;
+        let mut siblings = Vec::new(&env);
+        let mut sibling_on_left = Vec::new(&env);
+        while level.len() > 1 {
+            let is_right = index % 2 == 1;
+            let sibling_index = if is_right { index - 1 } else { (index + 1).min(level.len() - 1) };
+            siblings.push_back(level.get(sibling_index).unwrap());
+            sibling_on_left.push_back(is_right);
+            let mut next = Vec::new(&env);
+            let mut i = 0;
+            while i < level.len() {
+                let right = (i + 1).min(level.len() - 1);
+                next.push_back(Self::hash_merkle_pair(&env, &level.get(i).unwrap(), &level.get(right).unwrap()));
+                i += 2;
+            }
+            index /= 2;
+            level = next;
         }
-        if credential.activation_time == 0 || now >= credential.activation_time {
-            return Err(ContractError::ActivationAlreadyStarted);
-        }
-        if credential.expires_at != 0 && new_activation_time >= credential.expires_at {
-            return Err(ContractError::CredentialExpired);
-        }
-        credential.activation_time = new_activation_time;
-        env.storage().persistent().set(&key, &credential);
-        env.events().publish(
-            (CRED, symbol_short!("actupdate")),
-            (EVENT_VERSION, credential_id, issuer, new_activation_time),
-        );
-        Ok(())
+        Ok(RevocationMerkleProof { leaf: credential_id, siblings, sibling_on_left })
     }
 
-    /// Returns credentials for `subject` that are issued but not active yet.
-    pub fn get_pending_activations(env: Env, subject: Address) -> Vec<BytesN<32>> {
-        let now = env.ledger().timestamp();
-        let all = Self::fetch_subject_creds(&env, &subject);
-        let mut pending = Vec::new(&env);
-        for id in all.iter() {
-            if let Some(credential) = env.storage().persistent().get::<_, Credential>(&Self::cred_key(&id)) {
-                if !credential.revoked && credential.activation_time != 0 && credential.activation_time > now {
-                    pending.push_back(id);
-                }
-            }
+    /// Verifies a revocation proof against the stored root for `timestamp`.
+    pub fn verify_revocation_merkle_proof(
+        env: Env,
+        issuer: Address,
+        timestamp: u64,
+        proof: RevocationMerkleProof,
+    ) -> bool {
+        if proof.siblings.len() != proof.sibling_on_left.len() { return false; }
+        let expected = Self::get_revocation_merkle_root(env.clone(), issuer, timestamp);
+        let mut current = proof.leaf;
+        for i in 0..proof.siblings.len() {
+            let sibling = proof.siblings.get(i).unwrap();
+            current = if proof.sibling_on_left.get(i).unwrap() {
+                Self::hash_merkle_pair(&env, &sibling, &current)
+            } else {
+                Self::hash_merkle_pair(&env, &current, &sibling)
+            };
         }
-        pending
+        current == expected
     }
 
     pub fn revoke_credential(
@@ -1038,6 +1020,7 @@ impl CredentialManager {
         env.storage()
             .persistent()
             .extend_ttl(&revocations_key, TTL_MAX, TTL_MAX);
+        Self::append_revocation_leaf(&env, &issuer, &credential_id, env.ledger().timestamp());
 
         let revoked: u32 = env.storage().instance().get(&REVOKED_CNT).unwrap_or(0);
         env.storage().instance().set(&REVOKED_CNT, &(revoked + 1));
@@ -1199,6 +1182,118 @@ impl CredentialManager {
 
     /// Verify a credential is valid, not revoked, not expired, and that its
     /// entire prerequisite chain (issue #732) also passes.
+    pub fn amend_credential(
+        env: Env,
+        issuer: Address,
+        credential_id: BytesN<32>,
+        new_claims: Map<String, String>,
+        reason: String,
+    ) -> Result<u32, ContractError> {
+        issuer.require_auth();
+        let key = Self::cred_key(&credential_id);
+        let mut cred: Credential = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::CredentialNotFound)?;
+
+        if cred.issuer != issuer {
+            return Err(ContractError::UnauthorizedIssuer);
+        }
+        if cred.revoked {
+            return Err(ContractError::CredentialRevoked);
+        }
+
+        let next_version = cred.version.saturating_add(1);
+        let amended_at = env.ledger().timestamp();
+        let summary = versions::summarize_claim_changes(&env, &cred.claims, &new_claims);
+        let version_record = CredentialVersion {
+            version: next_version,
+            claims: new_claims.clone(),
+            claims_hash: Self::claims_schema_hash(&env, &new_claims),
+            amended_at,
+            amended_by: issuer.clone(),
+            reason: reason.clone(),
+            change_summary: summary.clone(),
+        };
+
+        let history_key = (CRED_VERSIONS, credential_id.clone());
+        let mut history: Vec<CredentialVersion> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if history.len() >= MAX_CREDENTIAL_VERSION_HISTORY {
+            let mut trimmed: Vec<CredentialVersion> = Vec::new(&env);
+            for idx in 1..history.len() {
+                let item = history.get(idx as u32).unwrap();
+                trimmed.push_back(item);
+            }
+            history = trimmed;
+        }
+
+        history.push_back(version_record);
+        env.storage().persistent().set(&history_key, &history);
+
+        cred.claims = new_claims;
+        cred.claims_hash = Self::claims_schema_hash(&env, &cred.claims);
+        cred.version = next_version;
+        cred.last_modified_at = amended_at;
+        env.storage().persistent().set(&key, &cred);
+
+        env.events().publish(
+            (CRED, symbol_short!("amended")),
+            (EVENT_VERSION, credential_id, issuer, next_version, summary, reason),
+        );
+
+        Ok(next_version)
+    }
+
+    pub fn get_credential_version(
+        env: Env,
+        credential_id: BytesN<32>,
+        version: u32,
+    ) -> Result<CredentialVersion, ContractError> {
+        let history_key = (CRED_VERSIONS, credential_id.clone());
+        let history: Vec<CredentialVersion> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        for item in history.iter() {
+            if item.version == version {
+                return Ok(item);
+            }
+        }
+
+        let current = env
+            .storage()
+            .persistent()
+            .get::<_, Credential>(&Self::cred_key(&credential_id))
+            .ok_or(ContractError::CredentialNotFound)?;
+        if current.version == version {
+            return Ok(CredentialVersion {
+                version: current.version,
+                claims: current.claims.clone(),
+                claims_hash: current.claims_hash,
+                amended_at: current.last_modified_at,
+                amended_by: current.issuer.clone(),
+                reason: String::from_str(&env, "latest"),
+                change_summary: String::from_str(&env, "latest_version"),
+            });
+        }
+        Err(ContractError::VersionNotFound)
+    }
+
+    pub fn get_credential_history(env: Env, credential_id: BytesN<32>) -> Vec<CredentialVersion> {
+        env.storage()
+            .persistent()
+            .get(&(CRED_VERSIONS, credential_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     pub fn verify_credential(env: Env, credential_id: BytesN<32>) -> Result<(), ContractError> {
         let key = Self::cred_key(&credential_id);
         match env.storage().persistent().get::<_, Credential>(&key) {
@@ -1946,6 +2041,7 @@ impl CredentialManager {
         }
         cred.revoked = true;
         env.storage().persistent().set(&key, &cred);
+        Self::append_revocation_leaf(env, issuer, credential_id, env.ledger().timestamp());
         let revoked: u32 = env.storage().instance().get(&REVOKED_CNT).unwrap_or(0);
         env.storage().instance().set(&REVOKED_CNT, &(revoked + 1));
         // closes #553: include revocation timestamp in batch events too.
@@ -1955,6 +2051,49 @@ impl CredentialManager {
             (EVENT_VERSION, credential_id.clone(), issuer.clone(), revoked_at, reason.clone()),
         );
         Ok(())
+    }
+
+    fn crl_period(timestamp: u64) -> u64 {
+        (timestamp / CRL_PERIOD_SECS) * CRL_PERIOD_SECS
+    }
+
+    fn hash_merkle_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+        let mut data = Bytes::new(env);
+        data.extend_from_array(&left.to_array());
+        data.extend_from_array(&right.to_array());
+        env.crypto().sha256(&data).into()
+    }
+
+    fn append_revocation_leaf(env: &Env, issuer: &Address, credential_id: &BytesN<32>, timestamp: u64) {
+        let period = Self::crl_period(timestamp);
+        let key = (CRL_LEAVES, issuer.clone(), period);
+        let mut leaves: Vec<BytesN<32>> = env.storage().persistent().get(&key).unwrap_or_else(|| Vec::new(env));
+        if !leaves.contains(credential_id) {
+            leaves.push_back(credential_id.clone());
+            env.storage().persistent().set(&key, &leaves);
+            env.storage().persistent().extend_ttl(&key, TTL_MAX, TTL_MAX);
+            let root = Self::rebuild_merkle_root(env, &leaves);
+            let root_key = (CRL_ROOT, issuer.clone(), period);
+            env.storage().persistent().set(&root_key, &root);
+            env.storage().persistent().extend_ttl(&root_key, TTL_MAX, TTL_MAX);
+            env.events().publish((CRED, symbol_short!("crlroot")), (EVENT_VERSION, issuer.clone(), period, root));
+        }
+    }
+
+    fn rebuild_merkle_root(env: &Env, leaves: &Vec<BytesN<32>>) -> BytesN<32> {
+        if leaves.len() == 0 { return BytesN::from_array(env, &[0u8; 32]); }
+        let mut level = leaves.clone();
+        while level.len() > 1 {
+            let mut next = Vec::new(env);
+            let mut i = 0;
+            while i < level.len() {
+                let right = (i + 1).min(level.len() - 1);
+                next.push_back(Self::hash_merkle_pair(env, &level.get(i).unwrap(), &level.get(right).unwrap()));
+                i += 2;
+            }
+            level = next;
+        }
+        level.get(0).unwrap()
     }
 
     fn require_uninitialized(env: &Env) -> Result<(), ContractError> {
