@@ -28,8 +28,15 @@
   --badge-green-text:         #166534;
   --badge-red-bg:             #fee2e2;
   --badge-red-text:           #991b1b;
+  --badge-gray-bg:            #e2e8f0;
+  --badge-gray-text:          #475569;
   --badge-purple-bg:          #ede9fe;
   --badge-purple-text:        #5b21b6;
+  --badge-yellow-bg:          #fef9c3;
+  --badge-yellow-text:        #854d0e;
+  --warning-bg:               #fff7ed;
+  --warning-text:             #9a3412;
+  --warning-border:           #fdba74;
   --error-text:               #dc2626;
   --sybil-pass-bg:            rgba(34,197,94,0.15);
   --sybil-pass-text:          #16a34a;
@@ -39,12 +46,19 @@
   --sybil-fail-border:        #dc2626;
   --filter-badge-active-bg:   #7c3aed;
   --filter-badge-active-text: #ffffff;
+  --btn-text:                 #ffffff;
+  --focus-ring:               #7c3aed;
+  --success-bg:               var(--badge-green-bg);
+  --success-text:             var(--badge-green-text);
+  --danger-bg:                var(--badge-red-bg);
+  --danger-text:              var(--badge-red-text);
+  --danger-border:            #f87171;
 }
 
-/* ── Dark mode via system preference ─────────────────────────────────────────── */
+/* ── Dark mode via system preference (when no manual override) ──────────────── */
 
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not(.light):not(.dark) {
     --bg:                       #0a0a0f;
     --bg-subtle:                #0f172a;
     --card-bg:                  #111827;
@@ -70,8 +84,15 @@
     --badge-green-text:         #6ee7b7;
     --badge-red-bg:             #450a0a;
     --badge-red-text:           #fca5a5;
+    --badge-gray-bg:            #334155;
+    --badge-gray-text:          #cbd5e1;
     --badge-purple-bg:          #2e1065;
     --badge-purple-text:        #c4b5fd;
+    --badge-yellow-bg:          #422006;
+    --badge-yellow-text:        #fde047;
+    --warning-bg:               #431407;
+    --warning-text:             #fed7aa;
+    --warning-border:           #c2410c;
     --error-text:               #fca5a5;
     --sybil-pass-bg:            rgba(34,197,94,0.15);
     --sybil-pass-text:          #4ade80;
@@ -81,6 +102,13 @@
     --sybil-fail-border:        #f87171;
     --filter-badge-active-bg:   #a78bfa;
     --filter-badge-active-text: #1e1b4b;
+    --btn-text:                 #ffffff;
+    --focus-ring:               #a78bfa;
+    --success-bg:               var(--badge-green-bg);
+    --success-text:             var(--badge-green-text);
+    --danger-bg:                var(--badge-red-bg);
+    --danger-text:              var(--badge-red-text);
+    --danger-border:            #f87171;
   }
 }
 
@@ -112,8 +140,15 @@ html.dark {
   --badge-green-text:         #6ee7b7;
   --badge-red-bg:             #450a0a;
   --badge-red-text:           #fca5a5;
+  --badge-gray-bg:            #334155;
+  --badge-gray-text:          #cbd5e1;
   --badge-purple-bg:          #2e1065;
   --badge-purple-text:        #c4b5fd;
+  --badge-yellow-bg:          #422006;
+  --badge-yellow-text:        #fde047;
+  --warning-bg:               #431407;
+  --warning-text:             #fed7aa;
+  --warning-border:           #c2410c;
   --error-text:               #fca5a5;
   --sybil-pass-bg:            rgba(34,197,94,0.15);
   --sybil-pass-text:          #4ade80;
@@ -123,6 +158,13 @@ html.dark {
   --sybil-fail-border:        #f87171;
   --filter-badge-active-bg:   #a78bfa;
   --filter-badge-active-text: #1e1b4b;
+  --btn-text:                 #ffffff;
+  --focus-ring:               #a78bfa;
+  --success-bg:               var(--badge-green-bg);
+  --success-text:             var(--badge-green-text);
+  --danger-bg:                var(--badge-red-bg);
+  --danger-text:              var(--badge-red-text);
+  --danger-border:            #f87171;
 }
 
 /* ── Light mode forced via manual class toggle ───────────────────────────────── */
@@ -153,8 +195,15 @@ html.light {
   --badge-green-text:         #166534;
   --badge-red-bg:             #fee2e2;
   --badge-red-text:           #991b1b;
+  --badge-gray-bg:            #e2e8f0;
+  --badge-gray-text:          #475569;
   --badge-purple-bg:          #ede9fe;
   --badge-purple-text:        #5b21b6;
+  --badge-yellow-bg:          #fef9c3;
+  --badge-yellow-text:        #854d0e;
+  --warning-bg:               #fff7ed;
+  --warning-text:             #9a3412;
+  --warning-border:           #fdba74;
   --error-text:               #dc2626;
   --sybil-pass-bg:            rgba(34,197,94,0.15);
   --sybil-pass-text:          #16a34a;
@@ -164,6 +213,13 @@ html.light {
   --sybil-fail-border:        #dc2626;
   --filter-badge-active-bg:   #7c3aed;
   --filter-badge-active-text: #ffffff;
+  --btn-text:                 #ffffff;
+  --focus-ring:               #7c3aed;
+  --success-bg:               var(--badge-green-bg);
+  --success-text:             var(--badge-green-text);
+  --danger-bg:                var(--badge-red-bg);
+  --danger-text:              var(--badge-red-text);
+  --danger-border:            #f87171;
 }
 
 /* ── Base styles ─────────────────────────────────────────────────────────────── */
@@ -209,9 +265,18 @@ input, textarea {
   margin-bottom: 0.75rem;
 }
 
+select {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-input);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.85rem;
+  padding: 0.3rem 0.6rem;
+}
+
 button {
   background: var(--accent);
-  color: #fff;
+  color: var(--btn-text);
   border: none;
   border-radius: 8px;
   padding: 0.6rem 1.2rem;
@@ -233,7 +298,10 @@ button:disabled { background: var(--btn-disabled-bg); color: var(--btn-disabled-
 
 .badge-green  { background: var(--badge-green-bg);  color: var(--badge-green-text); }
 .badge-red    { background: var(--badge-red-bg);    color: var(--badge-red-text); }
+.badge-gray   { background: var(--badge-gray-bg);   color: var(--badge-gray-text); }
 .badge-purple { background: var(--badge-purple-bg); color: var(--badge-purple-text); }
+.badge-yellow { background: var(--badge-yellow-bg); color: var(--badge-yellow-text); }
+.badge-gray   { background: var(--border-input);    color: var(--text-muted); }
 
 .result {
   margin-top: 1rem;
@@ -253,7 +321,40 @@ button:disabled { background: var(--btn-disabled-bg); color: var(--btn-disabled-
   padding: 0.5rem 1rem;
   border-radius: 8px;
 }
-.tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.tab.active { background: var(--accent); border-color: var(--accent); color: var(--btn-text); }
+
+/* ── Spinner ─────────────────────────────────────────────────────────────────── */
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.spinner {
+  display: inline-block;
+  width: 0.85em;
+  height: 0.85em;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+}
+
+/* ── Skeleton loader ─────────────────────────────────────────────────────────── */
+
+@keyframes shimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position:  400px 0; }
+}
+
+.skeleton {
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--border-input) 25%, var(--bg-subtle) 50%, var(--border-input) 75%);
+  background-size: 800px 100%;
+  animation: shimmer 1.4s infinite linear;
+}
+
+.skeleton-card { display: flex; flex-direction: column; gap: 0.75rem; }
+.skeleton-title { height: 1.1rem; width: 40%; }
+.skeleton-row   { height: 0.85rem; }
 
 .theme-toggle {
   background: transparent;
@@ -265,3 +366,371 @@ button:disabled { background: var(--btn-disabled-bg); color: var(--btn-disabled-
   transition: background 0.2s, color 0.2s;
 }
 .theme-toggle:hover { background: var(--bg-subtle); color: var(--text); }
+
+.network-switcher {
+  align-items: center;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-input);
+  border-radius: 8px;
+  color: var(--text-muted);
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.25rem 0.4rem 0.25rem 0.7rem;
+}
+
+.network-switcher span {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.network-switcher select {
+  border: none;
+  margin: 0;
+  padding: 0.15rem 0.2rem;
+}
+
+.mainnet-warning {
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  border-radius: 8px;
+  color: var(--warning-text);
+  font-size: 0.9rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+  padding: 0.7rem 1rem;
+}
+
+/* ── Mobile hamburger menu ────────────────────────────────────────────────────
+   Hidden on desktop; on small screens the header actions collapse into a
+   slide-in drawer opened via the hamburger button. */
+
+.hamburger-btn {
+  display: none;
+  width: 44px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border-input);
+  border-radius: 8px;
+  padding: 0;
+  cursor: pointer;
+}
+
+.hamburger-btn:hover { background: var(--bg-subtle); }
+
+.hamburger-icon,
+.hamburger-icon::before,
+.hamburger-icon::after {
+  display: block;
+  width: 20px;
+  height: 2px;
+  background: var(--text);
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+
+.hamburger-icon { position: relative; }
+.hamburger-icon::before,
+.hamburger-icon::after {
+  content: "";
+  position: absolute;
+  left: 0;
+}
+.hamburger-icon::before { top: -6px; }
+.hamburger-icon::after  { top: 6px; }
+
+.hamburger-icon.open { background: transparent; }
+.hamburger-icon.open::before { top: 0; transform: rotate(45deg); }
+.hamburger-icon.open::after  { top: 0; transform: rotate(-45deg); }
+
+.mobile-drawer-backdrop { display: none; }
+
+/* ── Mobile responsive layout ─────────────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+  .container { padding: 1rem 0.75rem; }
+
+  header {
+    padding: 1.5rem 0.75rem 1rem;
+    margin-bottom: 1rem;
+  }
+
+  header h1 { font-size: 1.5rem; }
+  header p  { font-size: 0.85rem; }
+
+  .hamburger-btn {
+    display: flex;
+    position: absolute;
+    top: 1rem;
+    right: 0;
+    z-index: 40;
+  }
+
+  header > .header-actions {
+    position: fixed !important;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(80vw, 320px);
+    margin: 0;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 0.75rem !important;
+    padding: 4.5rem 1.25rem 1.5rem;
+    background: var(--card-bg);
+    border-left: 1px solid var(--card-border);
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.25);
+    transform: translateX(100%);
+    transition: transform 0.25s ease;
+    z-index: 35;
+    overflow-y: auto;
+  }
+
+  header > .header-actions.open {
+    transform: translateX(0);
+  }
+
+  header > .header-actions > * {
+    width: 100%;
+  }
+
+  header > .header-actions button,
+  header > .header-actions .network-switcher {
+    min-height: 44px;
+  }
+
+  .mobile-drawer-backdrop.open {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    z-index: 30;
+  }
+
+  .card {
+    padding: 1rem;
+    margin-bottom: 1rem;
+  }
+
+  .card h2 { font-size: 1rem; }
+
+  input, textarea {
+    font-size: 16px;
+  }
+
+  button {
+    padding: 0.5rem 1rem;
+    font-size: 0.85rem;
+  }
+
+  .tabs {
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+
+  .tab {
+    flex: 1;
+    min-width: 120px;
+    padding: 0.4rem 0.8rem;
+    font-size: 0.85rem;
+  }
+
+  .badge {
+    font-size: 0.7rem;
+    padding: 0.15rem 0.5rem;
+  }
+
+  .result {
+    font-size: 0.75rem;
+    padding: 0.5rem;
+  }
+}
+
+@media (max-width: 414px) {
+  .container { padding: 0.75rem 0.5rem; }
+
+  header {
+    padding: 1rem 0.5rem 0.75rem;
+    margin-bottom: 0.75rem;
+  }
+
+  header h1 { font-size: 1.25rem; }
+  header p  { font-size: 0.8rem; }
+
+  .card {
+    padding: 0.75rem;
+    margin-bottom: 0.75rem;
+  }
+
+  button {
+    padding: 0.4rem 0.8rem;
+    font-size: 0.8rem;
+  }
+
+  .tab {
+    min-width: 100px;
+    padding: 0.35rem 0.6rem;
+    font-size: 0.8rem;
+  }
+
+  input, textarea {
+    padding: 0.5rem 0.6rem;
+    font-size: 16px;
+  }
+}
+
+@media (max-width: 375px) {
+  .card h2 { font-size: 0.95rem; }
+
+  .badge {
+    font-size: 0.65rem;
+    padding: 0.1rem 0.4rem;
+  }
+
+  button {
+    padding: 0.4rem 0.6rem;
+    font-size: 0.75rem;
+  }
+}
+
+.loading-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.65rem;
+  min-height: 12rem;
+  color: var(--text-muted);
+}
+
+.loading-fallback__spinner {
+  width: 1rem;
+  height: 1rem;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: loading-fallback-spin 0.8s linear infinite;
+}
+
+@keyframes loading-fallback-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading-fallback__spinner { animation: none; }
+}
+
+/* ── Focus rings ─────────────────────────────────────────────────────────────
+   Visible focus indicator for all interactive elements.
+   Uses :focus-visible so mouse users don't see the ring. */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Credential cards are divs with role="button" — same ring treatment */
+[role="button"]:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: 0.5rem;
+}
+
+/* Forced-colors mode strips custom outline colours; keep a ring visible. */
+@media (forced-colors: active) {
+  :focus-visible,
+  [role="button"]:focus-visible {
+    outline: 2px solid Highlight;
+  }
+}
+
+/* ── Skip link ───────────────────────────────────────────────────────────────
+   Off-screen until focused, so keyboard users can jump past the header
+   controls straight into the page content (WCAG 2.4.1). */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 1100;
+  padding: 0.6rem 1rem;
+  background: var(--card-bg, #fff);
+  color: var(--text, #111);
+  border: 2px solid var(--focus-ring);
+  border-radius: 0 0 0.4rem 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.skip-link:focus,
+.skip-link:focus-visible {
+  left: 0;
+}
+
+/* The main landmark is focused programmatically by the skip link; it is not an
+   interactive control, so it must not paint a focus ring of its own. */
+main:focus {
+  outline: none;
+}
+
+/* ── Reduced motion ──────────────────────────────────────────────────────────
+   Honour a user's OS-level preference to limit animation (WCAG 2.3.3). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ── Visually hidden ─────────────────────────────────────────────────────────
+   Removes content from the visual layout while keeping it in the accessibility
+   tree, for labels that would be redundant on screen. Uses the clip-path
+   pattern rather than display:none, which would hide it from screen readers. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── Issue #735: Dark mode image contrast ────────────────────────────────────
+   Images and credential badges can appear washed-out in dark mode because
+   they were designed for a light background. The brightness+contrast filter
+   slightly compensates; the :hover rule removes it so full fidelity is
+   preserved when the user deliberately inspects an image.
+   Applied only under dark-mode selectors so light mode is unaffected. */
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light):not(.dark) img:not([data-no-dark-filter]),
+  :root:not(.light):not(.dark) .credential-badge img {
+    filter: brightness(0.9) contrast(1.1);
+    transition: filter 0.2s;
+  }
+
+  :root:not(.light):not(.dark) img:not([data-no-dark-filter]):hover,
+  :root:not(.light):not(.dark) .credential-badge img:hover {
+    filter: none;
+  }
+}
+
+html.dark img:not([data-no-dark-filter]),
+html.dark .credential-badge img {
+  filter: brightness(0.9) contrast(1.1);
+  transition: filter 0.2s;
+}
+
+html.dark img:not([data-no-dark-filter]):hover,
+html.dark .credential-badge img:hover {
+  filter: none;
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@soroban-identity/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Operational HTTP service for Soroban Identity contracts",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@bull-board/api": "^6.9.1",
+    "@bull-board/express": "^6.9.1",
+    "bull": "^4.16.5",
+    "graphql": "^16.11.0",
+    "graphql-ws": "^6.0.6",
+    "pino": "^9.0.0",
+    "ws": "^8.21.3",
+    "prom-client": "^15.1.3",
+    "zod": "^4.4.3",
+    "jaeger-client": "^3.19.0"
+  }
+}
