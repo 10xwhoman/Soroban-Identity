@@ -11,6 +11,7 @@
 
 import { nativeToScVal, xdr } from '@stellar/stellar-sdk';
 import type { CredentialType } from './types';
+import { encodeI64, encodeU64 } from './codec';
 
 // ── identity-registry ────────────────────────────────────────────────────────
 
@@ -84,11 +85,23 @@ export function buildDeactivateDidArgs(params: {
   return [nativeToScVal(params.controller, { type: 'address' })];
 }
 
+/**
+ * Build args for `did_exists(controller)`.
+ *
+ * @param params.controller Stellar address to check for DID existence.
+ * @returns ScVal array ready for `contract.call('did_exists', ...)`.
+ */
+export function buildDidExistsArgs(params: {
+  controller: string;
+}): xdr.ScVal[] {
+  return [nativeToScVal(params.controller, { type: 'address' })];
+}
+
 // ── credential-manager ───────────────────────────────────────────────────────
 
 /**
  * Build args for `issue_credential(issuer, subject, credential_type, claims,
- * claims_hash, signature, expires_at)`.
+ * claims_hash, signature, expires_at, schema_hash, activation_time)`.
  *
  * @param params.issuer         Registered issuer address (must sign the tx).
  * @param params.subject        Subject receiving the credential.
@@ -97,6 +110,9 @@ export function buildDeactivateDidArgs(params: {
  * @param params.claimsHash     32-byte SHA-256 of the off-chain claims payload.
  * @param params.signature      64-byte issuer Ed25519 signature.
  * @param params.expiresAt      Unix timestamp (seconds); `0` for no expiry.
+ * @param params.schemaHash     Optional 32-byte registered schema hash buffer.
+ * @param params.activationTime Unix timestamp (seconds) before which the credential
+ *                              is inactive. `0` means immediately active (no time-lock). #731
  * @returns ScVal array ready for `contract.call('issue_credential', ...)`.
  */
 export function buildIssueCredentialArgs(params: {
@@ -107,7 +123,15 @@ export function buildIssueCredentialArgs(params: {
   claimsHash: Buffer;
   signature: Buffer;
   expiresAt: bigint;
+  schemaHash?: Buffer | null;
+  activationTime?: bigint;
 }): xdr.ScVal[] {
+  const expiresAt = encodeU64(params.expiresAt);
+  const activationTime = encodeU64(params.activationTime ?? 0n);
+  // schema_hash is Option<BytesN<32>>: None = scvVoid, Some(v) = bytes ScVal
+  const schemaHashVal = params.schemaHash
+    ? nativeToScVal(params.schemaHash, { type: 'bytes' })
+    : xdr.ScVal.scvVoid();
   return [
     nativeToScVal(params.issuer, { type: 'address' }),
     nativeToScVal(params.subject, { type: 'address' }),
@@ -115,7 +139,9 @@ export function buildIssueCredentialArgs(params: {
     nativeToScVal(params.claims, { type: 'map' }),
     nativeToScVal(params.claimsHash, { type: 'bytes' }),
     nativeToScVal(params.signature, { type: 'bytes' }),
-    xdr.ScVal.scvU64(xdr.Uint64.fromString(params.expiresAt.toString())),
+    expiresAt,
+    schemaHashVal,
+    activationTime,
   ];
 }
 
@@ -133,6 +159,47 @@ export function buildRevokeCredentialArgs(params: {
   return [
     nativeToScVal(params.issuer, { type: 'address' }),
     nativeToScVal(params.credentialId, { type: 'bytes' }),
+  ];
+}
+
+/**
+ * Build args for `revoke_credentials_batch(issuer, ids, reason)`.
+ *
+ * @param params.issuer        Registered issuer address (must sign the tx).
+ * @param params.credentialIds Array of 32-byte credential ID buffers to revoke.
+ * @param params.reason        Short symbol string describing the revocation reason.
+ * @returns ScVal array ready for `contract.call('revoke_credentials_batch', ...)`.
+ */
+export function buildRevokeBatchArgs(params: {
+  issuer: string;
+  credentialIds: Buffer[];
+  reason: string;
+}): xdr.ScVal[] {
+  return [
+    nativeToScVal(params.issuer, { type: 'address' }),
+    xdr.ScVal.scvVec(params.credentialIds.map((id) => nativeToScVal(id, { type: 'bytes' }))),
+    nativeToScVal(params.reason, { type: 'symbol' }),
+  ];
+}
+
+/**
+ * Build args for `renew_credential(issuer, credential_id, new_expires_at)`.
+ *
+ * @param params.issuer       Registered issuer address (must sign the tx).
+ * @param params.credentialId 32-byte credential ID buffer.
+ * @param params.newExpiresAt New expiry as a Unix timestamp in **seconds**. Must be
+ *                            strictly later than the credential's current expiry.
+ * @returns ScVal array ready for `contract.call('renew_credential', ...)`.
+ */
+export function buildRenewCredentialArgs(params: {
+  issuer: string;
+  credentialId: Buffer;
+  newExpiresAt: number;
+}): xdr.ScVal[] {
+  return [
+    nativeToScVal(params.issuer, { type: 'address' }),
+    nativeToScVal(params.credentialId, { type: 'bytes' }),
+    nativeToScVal(params.newExpiresAt, { type: 'u64' }),
   ];
 }
 
@@ -268,6 +335,59 @@ export function buildListIssuerCredentialsArgs(params: {
   ];
 }
 
+
+/**
+ * Build args for `get_revocations(issuer, subject)`.
+ *
+ * @param params.issuer  Issuer address in the revocation pair.
+ * @param params.subject Subject address in the revocation pair.
+ * @returns ScVal array ready for `contract.call('get_revocations', ...)`.
+ */
+export function buildGetRevocationsArgs(params: {
+  issuer: string;
+  subject: string;
+}): xdr.ScVal[] {
+  return [
+    nativeToScVal(params.issuer, { type: 'address' }),
+    nativeToScVal(params.subject, { type: 'address' }),
+  ];
+}
+
+/**
+ * Build args for `cancel_activation(issuer, credential_id)`. #731
+ *
+ * Cancels the pending time-locked activation for a credential before the
+ * `activation_time` has been reached. Only the original issuer may call this.
+ *
+ * @param params.issuer       Registered issuer address (must sign the tx).
+ * @param params.credentialId 32-byte credential ID buffer.
+ * @returns ScVal array ready for `contract.call('cancel_activation', ...)`.
+ */
+export function buildCancelActivationArgs(params: {
+  issuer: string;
+  credentialId: Buffer;
+}): xdr.ScVal[] {
+  return [
+    nativeToScVal(params.issuer, { type: 'address' }),
+    nativeToScVal(params.credentialId, { type: 'bytes' }),
+  ];
+}
+
+/**
+ * Build args for `get_pending_activations(subject)`. #731
+ *
+ * Returns credential IDs for time-locked credentials that have not yet reached
+ * their `activation_time` and have not been cancelled.
+ *
+ * @param params.subject Stellar address of the credential subject.
+ * @returns ScVal array ready for `contract.call('get_pending_activations', ...)`.
+ */
+export function buildGetPendingActivationsArgs(params: {
+  subject: string;
+}): xdr.ScVal[] {
+  return [nativeToScVal(params.subject, { type: 'address' })];
+}
+
 // ── reputation ───────────────────────────────────────────────────────────────
 
 /**
@@ -283,12 +403,14 @@ export function buildGetReputationArgs(params: {
 }
 
 /**
- * Build args for `get_history(subject, reporter, offset, limit)`.
+ * Build args for `get_history(subject, reporter, offset, limit, from_timestamp, to_timestamp)`.
  *
- * @param params.subject   Stellar address of the credential subject.
- * @param params.reporter  Registered reporter address.
- * @param params.offset    Number of entries to skip (offset-based pagination).
- * @param params.limit     Maximum entries to return.
+ * @param params.subject        Stellar address of the credential subject.
+ * @param params.reporter       Registered reporter address.
+ * @param params.offset         Number of entries to skip (offset-based pagination).
+ * @param params.limit          Maximum entries to return.
+ * @param params.fromTimestamp  Optional minimum timestamp filter (Unix seconds).
+ * @param params.toTimestamp    Optional maximum timestamp filter (Unix seconds).
  * @returns ScVal array ready for `contract.call('get_history', ...)`.
  */
 export function buildGetHistoryArgs(params: {
@@ -296,12 +418,20 @@ export function buildGetHistoryArgs(params: {
   reporter: string;
   offset: number;
   limit: number;
+  fromTimestamp?: number;
+  toTimestamp?: number;
 }): xdr.ScVal[] {
   return [
     nativeToScVal(params.subject, { type: 'address' }),
     nativeToScVal(params.reporter, { type: 'address' }),
     nativeToScVal(params.offset, { type: 'u32' }),
     nativeToScVal(params.limit, { type: 'u32' }),
+    params.fromTimestamp !== undefined
+      ? nativeToScVal({ Some: params.fromTimestamp }, { type: { Some: ['u64'] } as never })
+      : nativeToScVal(null, { type: 'option' }),
+    params.toTimestamp !== undefined
+      ? nativeToScVal({ Some: params.toTimestamp }, { type: { Some: ['u64'] } as never })
+      : nativeToScVal(null, { type: 'option' }),
   ];
 }
 
@@ -332,7 +462,7 @@ export function buildPassesSybilCheckArgs(params: {
 }): xdr.ScVal[] {
   return [
     nativeToScVal(params.subject, { type: 'address' }),
-    xdr.ScVal.scvI64(xdr.Int64.fromString(params.minScore.toString())),
+    encodeI64(params.minScore),
     nativeToScVal(params.minReporters, { type: 'u32' }),
   ];
 }
@@ -355,7 +485,7 @@ export function buildSubmitScoreArgs(params: {
   return [
     nativeToScVal(params.reporter, { type: 'address' }),
     nativeToScVal(params.subject, { type: 'address' }),
-    xdr.ScVal.scvI64(xdr.Int64.fromString(params.delta.toString())),
+    encodeI64(params.delta),
     nativeToScVal(params.reason, { type: 'string' }),
   ];
 }

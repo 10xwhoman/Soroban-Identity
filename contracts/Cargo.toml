@@ -7,15 +7,27 @@ publish = false
 [workspace]
 members = [
     ".",
+    "shared-errors",
     "identity-registry",
     "credential-manager",
     "reputation",
+    "governance",
+    "soroban-identity-interface",
+    "schema-registry",
+    "revocation-registry",
+    "selective-disclosure",
 ]
 default-members = [
     ".",
+    "shared-errors",
     "identity-registry",
     "credential-manager",
     "reputation",
+    "governance",
+    "soroban-identity-interface",
+    "schema-registry",
+    "revocation-registry",
+    "selective-disclosure",
 ]
 resolver = "2"
 
@@ -23,7 +35,17 @@ resolver = "2"
 credential-manager = { path = "credential-manager" }
 identity-registry = { path = "identity-registry" }
 reputation = { path = "reputation" }
+governance = { path = "governance" }
+shared-errors = { path = "shared-errors" }
+soroban-identity-interface = { path = "soroban-identity-interface" }
+schema-registry = { path = "schema-registry" }
+revocation-registry = { path = "revocation-registry" }
+selective-disclosure = { path = "selective-disclosure" }
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
 
 [profile.release]
 opt-level = "z"
