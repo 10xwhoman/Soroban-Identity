@@ -153,6 +153,7 @@ pub enum ContractError {
     DelegationAlreadyRevoked = 43,
     ActivationTimeNotFuture = 44,
     CredentialNotYetActive = 45,
+    ActivationAlreadyStarted = 46,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -912,6 +913,98 @@ impl CredentialManager {
             ),
         );
         Ok(id)
+    }
+
+    /// Issues a credential that becomes valid at `activation_time`.
+    /// This additive endpoint keeps the original issuance ABI unchanged.
+    pub fn issue_scheduled_credential(
+        env: Env,
+        issuer: Address,
+        subject: Address,
+        credential_type: CredentialType,
+        claims: Map<String, String>,
+        claims_hash: BytesN<32>,
+        signature: Bytes,
+        expires_at: u64,
+        activation_time: u64,
+    ) -> Result<BytesN<32>, ContractError> {
+        let now = env.ledger().timestamp();
+        if activation_time <= now {
+            return Err(ContractError::ActivationTimeNotFuture);
+        }
+        if expires_at != 0 && expires_at <= activation_time {
+            return Err(ContractError::CredentialExpired);
+        }
+        let id = Self::issue_credential(
+            env.clone(),
+            issuer.clone(),
+            subject.clone(),
+            credential_type,
+            claims,
+            claims_hash,
+            signature,
+            expires_at,
+            None,
+            None,
+        )?;
+        let key = Self::cred_key(&id);
+        let mut credential: Credential = env.storage().persistent().get(&key).ok_or(ContractError::CredentialNotFound)?;
+        credential.activation_time = activation_time;
+        env.storage().persistent().set(&key, &credential);
+        env.events().publish(
+            (CRED, symbol_short!("scheduled")),
+            (EVENT_VERSION, id.clone(), subject, issuer, activation_time),
+        );
+        Ok(id)
+    }
+
+    /// Updates a scheduled credential before it becomes active. Only its issuer
+    /// may move the activation time, and the new time must remain in the future.
+    pub fn update_activation_time(
+        env: Env,
+        issuer: Address,
+        credential_id: BytesN<32>,
+        new_activation_time: u64,
+    ) -> Result<(), ContractError> {
+        issuer.require_auth();
+        Self::require_not_paused(&env)?;
+        let now = env.ledger().timestamp();
+        if new_activation_time <= now {
+            return Err(ContractError::ActivationTimeNotFuture);
+        }
+        let key = Self::cred_key(&credential_id);
+        let mut credential: Credential = env.storage().persistent().get(&key).ok_or(ContractError::CredentialNotFound)?;
+        if credential.issuer != issuer {
+            return Err(ContractError::UnauthorizedIssuer);
+        }
+        if credential.activation_time == 0 || now >= credential.activation_time {
+            return Err(ContractError::ActivationAlreadyStarted);
+        }
+        if credential.expires_at != 0 && new_activation_time >= credential.expires_at {
+            return Err(ContractError::CredentialExpired);
+        }
+        credential.activation_time = new_activation_time;
+        env.storage().persistent().set(&key, &credential);
+        env.events().publish(
+            (CRED, symbol_short!("actupdate")),
+            (EVENT_VERSION, credential_id, issuer, new_activation_time),
+        );
+        Ok(())
+    }
+
+    /// Returns credentials for `subject` that are issued but not active yet.
+    pub fn get_pending_activations(env: Env, subject: Address) -> Vec<BytesN<32>> {
+        let now = env.ledger().timestamp();
+        let all = Self::fetch_subject_creds(&env, &subject);
+        let mut pending = Vec::new(&env);
+        for id in all.iter() {
+            if let Some(credential) = env.storage().persistent().get::<_, Credential>(&Self::cred_key(&id)) {
+                if !credential.revoked && credential.activation_time != 0 && credential.activation_time > now {
+                    pending.push_back(id);
+                }
+            }
+        }
+        pending
     }
 
     pub fn revoke_credential(
