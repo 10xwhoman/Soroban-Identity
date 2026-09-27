@@ -81,6 +81,9 @@ if [[ "$NETWORK" == "mainnet" ]]; then
 fi
 
 SOURCE_ACCOUNT="$STELLAR_SECRET_KEY"
+# Soroban uses deployer-derived deterministic IDs (salt), rather than Ethereum CREATE2.
+# Keep salts stable so retries do not create duplicate contract instances.
+SALT_PREFIX="${SOROBAN_DEPLOY_SALT_PREFIX:-soroban-identity}"
 
 # Retry configuration with exponential backoff
 MAX_RETRIES="${MAX_RETRIES:-3}"
@@ -115,6 +118,7 @@ echo "  Network:  $STELLAR_NETWORK"
 echo "  RPC URL:  $STELLAR_RPC_URL"
 echo "  Max Retries:  $MAX_RETRIES"
 echo "  Initial Retry Delay:  ${RETRY_DELAY}s"
+echo "  Deterministic salt:    ${SALT_PREFIX}:<contract>"
 echo "========================================"
 echo ""
 
@@ -174,7 +178,8 @@ if ! REGISTRY_ID=$(retry_command stellar contract deploy \
   --wasm "$REGISTRY_WASM" \
   --source "$SOURCE_ACCOUNT" \
   --network "$STELLAR_NETWORK" \
-  --rpc-url "$STELLAR_RPC_URL"); then
+  --rpc-url "$STELLAR_RPC_URL" \
+  --salt "$(printf '%s' "${SALT_PREFIX}:identity-registry" | sha256sum | cut -c1-64)"); then
   echo "Error: Failed to deploy identity-registry contract"
   exit 1
 fi
@@ -185,7 +190,8 @@ if ! CREDENTIAL_ID=$(retry_command stellar contract deploy \
   --wasm "$CREDENTIAL_WASM" \
   --source "$SOURCE_ACCOUNT" \
   --network "$STELLAR_NETWORK" \
-  --rpc-url "$STELLAR_RPC_URL"); then
+  --rpc-url "$STELLAR_RPC_URL" \
+  --salt "$(printf '%s' "${SALT_PREFIX}:credential-manager" | sha256sum | cut -c1-64)"); then
   echo "Error: Failed to deploy credential-manager contract"
   exit 1
 fi
@@ -196,7 +202,8 @@ if ! REPUTATION_ID=$(retry_command stellar contract deploy \
   --wasm "$REPUTATION_WASM" \
   --source "$SOURCE_ACCOUNT" \
   --network "$STELLAR_NETWORK" \
-  --rpc-url "$STELLAR_RPC_URL"); then
+  --rpc-url "$STELLAR_RPC_URL" \
+  --salt "$(printf '%s' "${SALT_PREFIX}:reputation" | sha256sum | cut -c1-64)"); then
   echo "Error: Failed to deploy reputation contract"
   exit 1
 fi

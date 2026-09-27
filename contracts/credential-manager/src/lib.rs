@@ -2,6 +2,7 @@
 #![deny(clippy::all)]
 
 mod versions;
+pub mod encryption;
 
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
