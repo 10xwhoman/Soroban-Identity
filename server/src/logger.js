@@ -22,12 +22,13 @@ function createLogger() {
     timestamp: pino.stdTimeFunctions.isoTime,
     base: undefined, // Remove default pid/hostname
     mixin() {
-      // Inject requestId from AsyncLocalStorage context if available
+      // Inject requestId and correlationId (#946) from the request context
       const store = requestContextStore.getStore();
-      if (store && store.requestId) {
-        return { requestId: store.requestId };
-      }
-      return {};
+      if (!store) return {};
+      const fields = {};
+      if (store.requestId) fields.requestId = store.requestId;
+      if (store.correlationId) fields.correlationId = store.correlationId;
+      return fields;
     },
   });
 }
