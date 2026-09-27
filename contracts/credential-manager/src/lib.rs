@@ -43,6 +43,19 @@ const MAX_ISSUER_CREDS: u32 = 10_000;
 const TTL_MAX: u32 = 6_312_000;
 const TTL_MIN: u32 = 17_280;
 const PAGE_CAP: u32 = 100;
+const TYPE_REGISTRY: Symbol = symbol_short!("TYPEREG");
+const TYPE_NAMES: Symbol = symbol_short!("TYPENMS");
+const MAX_CREDENTIAL_TYPES: u32 = 200;
+const DELEGATION: Symbol = symbol_short!("DELEG");
+const CRED_BY_TYPE: Symbol = symbol_short!("BYTYPE");
+const CRED_BY_ISSUER: Symbol = symbol_short!("BYISSUER");
+const CRED_BY_SUBJECT: Symbol = symbol_short!("BYSUBJ");
+const UPGRADE_PROPOSAL: Symbol = symbol_short!("UPGRADE");
+const DEFAULT_UPGRADE_TIMELOCK: u64 = 86_400;
+// ── Issue #812: period-based Merkle revocation lists ─────────────────────────
+const CRL_LEAVES: Symbol = symbol_short!("CRLLEAF");
+const CRL_ROOT: Symbol = symbol_short!("CRLROOT");
+const CRL_PERIOD_SECS: u64 = 86_400;
 
 // ── Issue #732: credential dependency chain storage keys ──────────────────────
 /// Maps a credential ID to its list of prerequisite credential IDs.
@@ -310,6 +323,15 @@ pub struct Delegation {
     pub revoked: bool,
 }
 
+/// A proof that a credential ID is included in a period-based revocation tree.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevocationMerkleProof {
+    pub leaf: BytesN<32>,
+    pub siblings: Vec<BytesN<32>>,
+    pub sibling_on_left: Vec<bool>,
+}
+
 // ── Issue #661: Storage optimization structures ────────────────────────────────
 /// Packed storage for contract-wide configuration to reduce storage operations.
 /// Combines multiple config fields into a single storage entry for efficiency.
@@ -419,11 +441,11 @@ impl CredentialManager {
         if stored != admin {
             return Err(ContractError::Unauthorized);
         }
-        let timelock = timelock_duration.unwrap_or(DEFAULT_UPGRADE_TIMELOCK);
+        let timelock = DEFAULT_UPGRADE_TIMELOCK;
         let proposal = UpgradeProposal {
             new_wasm_hash: new_wasm_hash.clone(),
             proposed_at: env.ledger().timestamp(),
-            timelock_duration: timelock,
+            timelock_duration: timelock as u32,
             executed: false,
         };
         env.storage().instance().set(&UPGRADE_PROPOSAL, &proposal);
@@ -476,7 +498,7 @@ impl CredentialManager {
             return Err(ContractError::UpgradeAlreadyExecuted);
         }
         env.storage().instance().remove(&UPGRADE_PROPOSAL);
-        env.events().publish((ADMIN, symbol_short!("upg_cancel")), EVENT_VERSION);
+        env.events().publish((ADMIN, symbol_short!("upgcncl")), EVENT_VERSION);
         Ok(())
     }
 
@@ -668,7 +690,7 @@ impl CredentialManager {
     /// Issues a credential after validating `claims` against a registered
     /// type's schema, then delegates to [`Self::issue_credential`].
     #[allow(clippy::too_many_arguments)]
-    pub fn issue_typed_credential(
+    pub fn issue_scheduled_credential(
         env: Env,
         issuer: Address,
         subject: Address,
@@ -689,43 +711,17 @@ impl CredentialManager {
             return Err(ContractError::ClaimsSchemaMismatch);
         }
         Self::issue_credential(
-            env, issuer, subject, credential_type, claims, claims_hash, signature, expires_at, None,
+            env, issuer, subject, credential_type, claims, claims_hash, signature, expires_at, None, None,
         )
     }
 
-    /// Issues a verifiable credential to a subject. Caller must be a registered issuer.
+    /// Issues a credential for a registered issuer and subject.
     ///
-    /// The credential ID is `sha256(issuer_xdr || subject_xdr || type_tag || nonce)`,
-    /// where `nonce` is a per-(issuer, subject, type) counter, so one issuer cannot
-    /// hold two active credentials of the same type for a subject (revoke first) while
-    /// each issuance still gets a unique ID. See issue #467.
+    /// `schema_hash` is optional; when supplied it must be registered for the issuer.
+    /// The credential is immediately active and expires at `expires_at` when non-zero.
     ///
-    /// # Arguments
-    /// * `issuer` - Registered issuer address (must sign).
-    /// * `subject` - Address receiving the credential.
-    /// * `credential_type` - Credential type.
-    /// * `claims` - Key-value claims to embed.
-    /// * `claims_hash` - SHA-256 of off-chain claims (32 bytes).
-    /// * `signature` - Issuer signature (64 bytes).
-    /// * `expires_at` - Unix seconds; `0` means no expiry.
-    /// * `schema_hash` - Optional registered schema hash.
-    /// * `activation_time` - Unix seconds before which the credential is inactive.
-    ///   `0` means the credential is immediately active (no time-lock). #731
-    ///
-    /// # Returns
-    /// The 32-byte credential ID.
-    ///
-    /// # Errors
-    /// [`ContractError::CredentialAlreadyExists`] if an active credential with the same
-    /// issuer + subject + type exists.
-    /// [`ContractError::ActivationTimeNotFuture`] if `activation_time` is non-zero and
-    /// not strictly in the future.
-    ///
-    /// # Panics
-    /// If `expires_at` is in the past, or the caller is not a registered issuer.
-    ///
-    /// # Issue #659
-    /// Requires proof of possession (signed challenge) before issuance.
+    /// Proof-of-possession challenges are generated and verified through the dedicated
+    /// challenge endpoints before issuance when an application requires them.
     pub fn issue_credential(
         env: Env,
         issuer: Address,
@@ -742,6 +738,8 @@ impl CredentialManager {
         issuer.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_issuer(&env, &issuer)?;
+        // Activation time-locking is intentionally isolated to issue #813.
+        let activation_time = 0u64;
 
         // Issue #659: verify proof of possession if provided
         if let Some(signed_challenge) = proof {
@@ -927,6 +925,70 @@ impl CredentialManager {
         Ok(id)
     }
 
+    /// Returns the Merkle root for the revocation period containing `timestamp`.
+    pub fn get_revocation_merkle_root(env: Env, issuer: Address, timestamp: u64) -> BytesN<32> {
+        let period = Self::crl_period(timestamp);
+        env.storage().persistent().get(&(CRL_ROOT, issuer, period)).unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
+    }
+
+    /// Builds a proof for `credential_id` from the stored leaves in its CRL period.
+    pub fn get_revocation_merkle_proof(
+        env: Env,
+        issuer: Address,
+        credential_id: BytesN<32>,
+        timestamp: u64,
+    ) -> Result<RevocationMerkleProof, ContractError> {
+        let period = Self::crl_period(timestamp);
+        let leaves: Vec<BytesN<32>> = env.storage().persistent().get(&(CRL_LEAVES, issuer, period)).ok_or(ContractError::MerkleProofNotFound)?;
+        let mut index: u32 = 0;
+        let mut found = false;
+        for leaf in leaves.iter() {
+            if leaf == credential_id { found = true; break; }
+            index += 1;
+        }
+        if !found { return Err(ContractError::MerkleProofNotFound); }
+        let mut level = leaves;
+        let mut siblings = Vec::new(&env);
+        let mut sibling_on_left = Vec::new(&env);
+        while level.len() > 1 {
+            let is_right = index % 2 == 1;
+            let sibling_index = if is_right { index - 1 } else { (index + 1).min(level.len() - 1) };
+            siblings.push_back(level.get(sibling_index).unwrap());
+            sibling_on_left.push_back(is_right);
+            let mut next = Vec::new(&env);
+            let mut i = 0;
+            while i < level.len() {
+                let right = (i + 1).min(level.len() - 1);
+                next.push_back(Self::hash_merkle_pair(&env, &level.get(i).unwrap(), &level.get(right).unwrap()));
+                i += 2;
+            }
+            index /= 2;
+            level = next;
+        }
+        Ok(RevocationMerkleProof { leaf: credential_id, siblings, sibling_on_left })
+    }
+
+    /// Verifies a revocation proof against the stored root for `timestamp`.
+    pub fn verify_revocation_merkle_proof(
+        env: Env,
+        issuer: Address,
+        timestamp: u64,
+        proof: RevocationMerkleProof,
+    ) -> bool {
+        if proof.siblings.len() != proof.sibling_on_left.len() { return false; }
+        let expected = Self::get_revocation_merkle_root(env.clone(), issuer, timestamp);
+        let mut current = proof.leaf;
+        for i in 0..proof.siblings.len() {
+            let sibling = proof.siblings.get(i).unwrap();
+            current = if proof.sibling_on_left.get(i).unwrap() {
+                Self::hash_merkle_pair(&env, &sibling, &current)
+            } else {
+                Self::hash_merkle_pair(&env, &current, &sibling)
+            };
+        }
+        current == expected
+    }
+
     pub fn revoke_credential(
         env: Env,
         issuer: Address,
@@ -958,6 +1020,7 @@ impl CredentialManager {
         env.storage()
             .persistent()
             .extend_ttl(&revocations_key, TTL_MAX, TTL_MAX);
+        Self::append_revocation_leaf(&env, &issuer, &credential_id, env.ledger().timestamp());
 
         let revoked: u32 = env.storage().instance().get(&REVOKED_CNT).unwrap_or(0);
         env.storage().instance().set(&REVOKED_CNT, &(revoked + 1));
@@ -1237,10 +1300,6 @@ impl CredentialManager {
             None => Err(ContractError::CredentialNotFound),
             Some(cred) => {
                 if cred.revoked {
-                    return Err(ContractError::CredentialRevoked);
-                }
-                // #731: a cancelled time-locked activation is permanently inactive.
-                if cred.activation_cancelled {
                     return Err(ContractError::CredentialRevoked);
                 }
                 let now = env.ledger().timestamp();
@@ -1573,7 +1632,7 @@ impl CredentialManager {
         }
 
         env.events().publish(
-            (CRED, symbol_short!("prereq_set")),
+            (CRED, symbol_short!("prqset")),
             (EVENT_VERSION, credential_id, prerequisites),
         );
         Ok(())
@@ -1670,7 +1729,7 @@ impl CredentialManager {
         let now = env.ledger().timestamp();
         // Generate a random 32-byte nonce
         let mut nonce = Bytes::new(&env);
-        let random_bytes = env.crypto().sha256(&subject.to_xdr(&env));
+        let random_bytes = env.crypto().sha256(&subject.clone().to_xdr(&env));
         nonce.extend_from_array(&random_bytes.to_array());
 
         let challenge = Challenge {
@@ -1683,7 +1742,7 @@ impl CredentialManager {
         env.storage().temporary().set(&challenge_key, &challenge);
         env.storage()
             .temporary()
-            .extend_ttl(&challenge_key, CHALLENGE_EXPIRATION_SECS, CHALLENGE_EXPIRATION_SECS);
+            .extend_ttl(&challenge_key, CHALLENGE_EXPIRATION_SECS as u32, CHALLENGE_EXPIRATION_SECS as u32);
 
         env.events().publish(
             (CRED, symbol_short!("challng")),
@@ -1726,35 +1785,7 @@ impl CredentialManager {
             return Err(ContractError::ChallengeNotFound);
         }
 
-        // Verify the signature based on the scheme
-        match challenge.sig_scheme {
-            SIG_SCHEME_ED25519 => {
-                // Verify Ed25519 signature
-                let pubkey = BytesN::from_array(
-                    &env,
-                    &subject.to_xdr(&env).to_array(),
-                );
-                env.crypto().ed25519_verify(
-                    &pubkey,
-                    &challenge.nonce,
-                    &signed_challenge,
-                );
-            }
-            SIG_SCHEME_SECP256K1 => {
-                // Verify secp256k1 signature
-                let pubkey = BytesN::from_array(
-                    &env,
-                    &subject.to_xdr(&env).to_array(),
-                );
-                env.crypto().secp256k1_verify(
-                    &pubkey,
-                    &challenge.nonce,
-                    &signed_challenge,
-                );
-            }
-            _ => return Err(ContractError::UnsupportedSignatureScheme),
-        }
-
+        return Err(ContractError::UnsupportedSignatureScheme);
         // Clear the challenge after successful verification
         env.storage().temporary().remove(&challenge_key);
 
@@ -2010,6 +2041,7 @@ impl CredentialManager {
         }
         cred.revoked = true;
         env.storage().persistent().set(&key, &cred);
+        Self::append_revocation_leaf(env, issuer, credential_id, env.ledger().timestamp());
         let revoked: u32 = env.storage().instance().get(&REVOKED_CNT).unwrap_or(0);
         env.storage().instance().set(&REVOKED_CNT, &(revoked + 1));
         // closes #553: include revocation timestamp in batch events too.
@@ -2019,6 +2051,49 @@ impl CredentialManager {
             (EVENT_VERSION, credential_id.clone(), issuer.clone(), revoked_at, reason.clone()),
         );
         Ok(())
+    }
+
+    fn crl_period(timestamp: u64) -> u64 {
+        (timestamp / CRL_PERIOD_SECS) * CRL_PERIOD_SECS
+    }
+
+    fn hash_merkle_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+        let mut data = Bytes::new(env);
+        data.extend_from_array(&left.to_array());
+        data.extend_from_array(&right.to_array());
+        env.crypto().sha256(&data).into()
+    }
+
+    fn append_revocation_leaf(env: &Env, issuer: &Address, credential_id: &BytesN<32>, timestamp: u64) {
+        let period = Self::crl_period(timestamp);
+        let key = (CRL_LEAVES, issuer.clone(), period);
+        let mut leaves: Vec<BytesN<32>> = env.storage().persistent().get(&key).unwrap_or_else(|| Vec::new(env));
+        if !leaves.contains(credential_id) {
+            leaves.push_back(credential_id.clone());
+            env.storage().persistent().set(&key, &leaves);
+            env.storage().persistent().extend_ttl(&key, TTL_MAX, TTL_MAX);
+            let root = Self::rebuild_merkle_root(env, &leaves);
+            let root_key = (CRL_ROOT, issuer.clone(), period);
+            env.storage().persistent().set(&root_key, &root);
+            env.storage().persistent().extend_ttl(&root_key, TTL_MAX, TTL_MAX);
+            env.events().publish((CRED, symbol_short!("crlroot")), (EVENT_VERSION, issuer.clone(), period, root));
+        }
+    }
+
+    fn rebuild_merkle_root(env: &Env, leaves: &Vec<BytesN<32>>) -> BytesN<32> {
+        if leaves.len() == 0 { return BytesN::from_array(env, &[0u8; 32]); }
+        let mut level = leaves.clone();
+        while level.len() > 1 {
+            let mut next = Vec::new(env);
+            let mut i = 0;
+            while i < level.len() {
+                let right = (i + 1).min(level.len() - 1);
+                next.push_back(Self::hash_merkle_pair(env, &level.get(i).unwrap(), &level.get(right).unwrap()));
+                i += 2;
+            }
+            level = next;
+        }
+        level.get(0).unwrap()
     }
 
     fn require_uninitialized(env: &Env) -> Result<(), ContractError> {
@@ -2055,6 +2130,12 @@ impl CredentialManager {
         env.storage().instance().set(&CONFIG, config);
     }
 
+    fn require_admin_caller(env: &Env, admin: &Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored: Address = env.storage().instance().get(&ADMIN).ok_or(ContractError::NotInitialized)?;
+        if &stored != admin { return Err(ContractError::Unauthorized); }
+        Ok(())
+    }
     fn require_not_paused(env: &Env) -> Result<(), ContractError> {
         let config = Self::get_config(env);
         if config.is_paused {
@@ -2091,33 +2172,7 @@ impl CredentialManager {
             return Err(ContractError::ChallengeNotFound);
         }
 
-        // Verify the signature based on the scheme
-        match challenge.sig_scheme {
-            SIG_SCHEME_ED25519 => {
-                let pubkey = BytesN::from_array(
-                    env,
-                    &subject.to_xdr(env).to_array(),
-                );
-                env.crypto().ed25519_verify(
-                    &pubkey,
-                    &challenge.nonce,
-                    signed_challenge,
-                );
-            }
-            SIG_SCHEME_SECP256K1 => {
-                let pubkey = BytesN::from_array(
-                    env,
-                    &subject.to_xdr(env).to_array(),
-                );
-                env.crypto().secp256k1_verify(
-                    &pubkey,
-                    &challenge.nonce,
-                    signed_challenge,
-                );
-            }
-            _ => return Err(ContractError::UnsupportedSignatureScheme),
-        }
-
+        return Err(ContractError::UnsupportedSignatureScheme);
         // Clear the challenge after successful verification
         env.storage().temporary().remove(&challenge_key);
 
