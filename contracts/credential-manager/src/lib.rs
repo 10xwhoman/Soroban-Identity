@@ -5,6 +5,9 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, Map, String, Symbol, Vec,
 };
 
+mod types;
+pub use types::{RevocationReason, RevocationRecord};
+
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
 const ADMIN: Symbol = symbol_short!("ADMIN");
@@ -133,7 +136,12 @@ impl CredentialManager {
     }
 
     /// Revoke a credential. Only the original issuer can revoke.
-    pub fn revoke_credential(env: Env, issuer: Address, credential_id: BytesN<32>) {
+    pub fn revoke_credential(
+        env: Env,
+        issuer: Address,
+        credential_id: BytesN<32>,
+        reason: RevocationReason,
+    ) {
         issuer.require_auth();
 
         let key = Self::cred_key(&credential_id);
@@ -149,7 +157,39 @@ impl CredentialManager {
 
         cred.revoked = true;
         env.storage().persistent().set(&key, &cred);
-        env.events().publish((CRED, symbol_short!("revoked")), credential_id);
+
+        let record = RevocationRecord {
+            credential_id: credential_id.clone(),
+            issuer,
+            reason,
+            revoked_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&Self::revocation_key(&credential_id), &record);
+
+        let reason_key = Self::reason_key(reason);
+        let mut ids: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&reason_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        ids.push_back(credential_id.clone());
+        env.storage().persistent().set(&reason_key, &ids);
+
+        env.events()
+            .publish((CRED, symbol_short!("revoked")), (credential_id, reason));
+    }
+
+    /// Get the revocation record for a credential, if revoked.
+    pub fn get_revocation(env: Env, credential_id: BytesN<32>) -> Option<RevocationRecord> {
+        env.storage().persistent().get(&Self::revocation_key(&credential_id))
+    }
+
+    /// List credential IDs revoked for a given reason.
+    pub fn get_revocations_by_reason(env: Env, reason: RevocationReason) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&Self::reason_key(reason))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Verify a credential is valid (not revoked, not expired).
@@ -228,6 +268,14 @@ impl CredentialManager {
         (CRED, id.clone())
     }
 
+    fn revocation_key(id: &BytesN<32>) -> (Symbol, BytesN<32>) {
+        (symbol_short!("rvk"), id.clone())
+    }
+
+    fn reason_key(reason: RevocationReason) -> (Symbol, u32) {
+        (symbol_short!("rvkrsn"), reason as u32)
+    }
+
     fn subject_key(subject: &Address) -> (Symbol, Address) {
         (symbol_short!("sub"), subject.clone())
     }
@@ -290,7 +338,7 @@ mod tests {
             &issuer, &subject, &CredentialType::Kyc, &claims, &sig, &0u64,
         );
 
-        client.revoke_credential(&issuer, &cred_id);
+        client.revoke_credential(&issuer, &cred_id, &RevocationReason::Compromised);
         assert!(!client.verify_credential(&cred_id));
     }
 
@@ -360,7 +408,7 @@ mod tests {
         );
 
         // issuer2 attempts to revoke a credential they did not issue
-        client.revoke_credential(&issuer2, &cred_id);
+        client.revoke_credential(&issuer2, &cred_id, &RevocationReason::Compromised);
     }
 
     /// get_credential returns all fields exactly as supplied at issuance.

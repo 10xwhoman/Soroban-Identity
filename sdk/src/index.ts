@@ -7,8 +7,11 @@ export type {
   CredentialType,
   VerifyResult,
   VerifyFailReason,
+  RevocationReason,
+  RevocationRecord,
   SorobanIdentityConfig,
 } from "./types";
+export { REVOCATION_REASONS } from "./types";
 export type { ReputationRecord, ScoreHistoryEntry } from "./reputation";
 
 // Testnet defaults — fill contract IDs after deployment

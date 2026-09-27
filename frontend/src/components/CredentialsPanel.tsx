@@ -1,5 +1,7 @@
 import { useState } from "react";
-import type { CredentialType } from "../../../sdk/src/types";
+import type { CredentialType, RevocationReason } from "../../../sdk/src/types";
+import { REVOCATION_REASONS } from "../../../sdk/src/types";
+import { exportCredentials, type ExportFormat } from "../export";
 import type { WalletState } from "../hooks/useWallet";
 
 interface Props {
@@ -46,6 +48,10 @@ export default function CredentialsPanel({ wallet }: Props) {
 
   const [activeFilter, setActiveFilter] = useState<FilterType>("All");
 
+  const [revokeId, setRevokeId] = useState("");
+  const [revokeReason, setRevokeReason] = useState<RevocationReason>("Compromised");
+  const [revokeResult, setRevokeResult] = useState<string | null>(null);
+
   const filteredCredentials =
     activeFilter === "All"
       ? MOCK_CREDENTIALS
@@ -90,6 +96,17 @@ export default function CredentialsPanel({ wallet }: Props) {
       setIssuing(false);
     }
   };
+
+  const handleRevoke = async () => {
+    if (!wallet.connected || !revokeId.trim()) return;
+    // TODO: build tx via CredentialClient.revokeCredential(), sign via wallet.signTransaction(), submit
+    setRevokeResult(`Credential ${revokeId} revoked (reason: ${revokeReason}).`);
+  };
+
+  const handleExport = (format: ExportFormat) =>
+    exportCredentials(filteredCredentials, format).catch((e) =>
+      alert(`Export failed: ${e instanceof Error ? e.message : String(e)}`)
+    );
 
   return (
     <>
@@ -160,6 +177,15 @@ export default function CredentialsPanel({ wallet }: Props) {
             ))}
           </ul>
         )}
+        {filteredCredentials.length > 0 && (
+          <div style={{ display: "flex", gap: "0.5rem", marginTop: "1rem" }}>
+            {(["pdf", "json", "xml"] as ExportFormat[]).map((f) => (
+              <button key={f} onClick={() => handleExport(f)}>
+                Export {f.toUpperCase()}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="card">
@@ -218,6 +244,37 @@ export default function CredentialsPanel({ wallet }: Props) {
           </p>
         )}
         {issueResult && <pre className="result">{issueResult}</pre>}
+      </div>
+
+      <div className="card">
+        <h2>Revoke Credential</h2>
+        {wallet.connected ? (
+          <>
+            <input
+              placeholder="Credential ID (hex)"
+              value={revokeId}
+              onChange={(e) => setRevokeId(e.target.value)}
+            />
+            <select
+              value={revokeReason}
+              onChange={(e) => setRevokeReason(e.target.value as RevocationReason)}
+            >
+              {REVOCATION_REASONS.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+            <button onClick={handleRevoke} disabled={!revokeId}>
+              Revoke
+            </button>
+          </>
+        ) : (
+          <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
+            Connect your wallet to revoke credentials you issued.
+          </p>
+        )}
+        {revokeResult && <pre className="result">{revokeResult}</pre>}
       </div>
     </>
   );

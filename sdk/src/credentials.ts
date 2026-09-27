@@ -7,7 +7,14 @@ import {
   nativeToScVal,
   scValToNative,
 } from "@stellar/stellar-sdk";
-import type { Credential, CredentialType, SorobanIdentityConfig, VerifyResult } from "./types";
+import type {
+  Credential,
+  CredentialType,
+  RevocationReason,
+  SorobanIdentityConfig,
+  VerifyResult,
+} from "./types";
+import { REVOCATION_REASONS } from "./types";
 
 export class CredentialClient {
   private server: SorobanRpc.Server;
@@ -67,6 +74,39 @@ export class CredentialClient {
     // Returns BytesN<32> — encode as hex
     const raw = scValToNative(confirmed.returnValue!) as Uint8Array;
     return Buffer.from(raw).toString("hex");
+  }
+
+  /**
+   * Revoke a credential with a standardized reason. Only the original issuer can revoke.
+   */
+  async revokeCredential(
+    issuerKeypair: Keypair,
+    credentialId: string,
+    reason: RevocationReason = "Unspecified"
+  ): Promise<void> {
+    const account = await this.server.getAccount(issuerKeypair.publicKey());
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call(
+          "revoke_credential",
+          nativeToScVal(issuerKeypair.publicKey(), { type: "address" }),
+          nativeToScVal(Buffer.from(credentialId, "hex"), { type: "bytes" }),
+          nativeToScVal(REVOCATION_REASONS.indexOf(reason), { type: "u32" })
+        )
+      )
+      .setTimeout(this.config.txTimeout ?? 30)
+      .build();
+
+    const prepared = await this.server.prepareTransaction(tx);
+    prepared.sign(issuerKeypair);
+    const result = await this.server.sendTransaction(prepared);
+    if (result.status !== "PENDING") {
+      throw new Error(`Transaction failed: ${result.status}`);
+    }
+    await this.waitForConfirmation(result.hash);
   }
 
   /**
