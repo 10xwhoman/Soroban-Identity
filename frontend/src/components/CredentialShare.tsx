@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import type { Credential } from '../../../sdk/src/types';
 import { generateEncryptionKey, encryptCredentialData, trackShareEvent } from '../utils/credentialCrypto';
 import { useToast } from '../context/ToastContext';
+import CredentialExportMenu from './CredentialExportMenu';
 
 interface CredentialShareProps {
   credential: Credential;
@@ -116,6 +117,9 @@ export const CredentialShare: React.FC<CredentialShareProps> = ({ credential, on
             </button>
           )}
         </div>
+
+        {/* #939: download the credential as JSON, XML or PDF from the share panel. */}
+        <CredentialExportMenu credential={credential} />
 
         <p style={{ fontSize: '0.875rem', color: 'var(--text-muted, #64748b)', marginTop: 0, marginBottom: '1.25rem' }}>
           Generate an encrypted deep link. The raw claims are encrypted client-side using the Web Crypto API (AES-GCM-256) and can only be decrypted by someone with the link.
