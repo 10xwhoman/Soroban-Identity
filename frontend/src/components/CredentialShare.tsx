@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import type { Credential } from '../../../sdk/src/types';
 import { generateEncryptionKey, encryptCredentialData, trackShareEvent } from '../utils/credentialCrypto';
 import { useToast } from '../context/ToastContext';
+import SocialShare from './SocialShare';
 
 interface CredentialShareProps {
   credential: Credential;
@@ -247,6 +248,8 @@ export const CredentialShare: React.FC<CredentialShareProps> = ({ credential, on
             </div>
           </div>
         )}
+
+        <SocialShare credential={credential} />
       </div>
     </div>
   );
