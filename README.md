@@ -58,6 +58,7 @@ soroban-identity/
 ├── frontend/                  # React + TypeScript dApp (Vite)
 ├── sdk/                       # TypeScript SDK for dApp integration
 ├── server/                    # Operational API, expiry jobs, health, and metrics
+├── analytics/                 # On-chain analytics indexer + live dashboard
 ├── scripts/
 │   └── deploy.sh              # Build + deploy all contracts to testnet
 └── docs/
