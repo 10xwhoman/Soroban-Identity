@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Map, String};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Map, String, Vec};
 
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
@@ -80,6 +80,10 @@ pub struct Credential {
     /// Optional auto-renewal policy for recurring credentials. #869
     pub renewal_policy: Option<RenewalPolicy>,
 }
+
+/// Maximum number of prerequisite levels that may be traversed when verifying
+/// a credential's dependency chain. #814
+pub const MAX_DEPENDENCY_DEPTH: u32 = 5;
 
 impl Credential {
     /// Returns `true` when the credential is currently active at `now`.
