@@ -1,225 +1,118 @@
-import { useEffect, useCallback, useRef } from 'react';
+import { useEffect, useRef } from 'react';
 
-export interface KeyboardShortcut {
+export type ShortcutHandler = (event: KeyboardEvent) => void;
+
+export interface ShortcutDefinition {
+  /** Key to match, compared case-insensitively against event.key. */
   key: string;
-  ctrl?: boolean;
+  /** Require Cmd (macOS) or Ctrl (other platforms) to be held. */
   meta?: boolean;
+  /** Require Shift to be held. */
   shift?: boolean;
+  /** Require Alt to be held. */
   alt?: boolean;
-  description: string;
-  category: 'navigation' | 'actions' | 'ui';
-  handler: () => void;
-  preventDefault?: boolean;
-  enabled?: boolean;
+  /** Human readable description used for tooltips and the help modal. */
+  description?: string;
+  /** Handler invoked when the shortcut matches. */
+  handler: ShortcutHandler;
 }
 
-interface UseKeyboardShortcutsOptions {
-  shortcuts: KeyboardShortcut[];
-  enabled?: boolean;
-}
+export type ShortcutMap = Record<string, ShortcutDefinition>;
 
 /**
- * Hook for registering and managing keyboard shortcuts
- * 
- * @param options - Configuration options
- * @param options.shortcuts - Array of keyboard shortcuts to register
- * @param options.enabled - Whether shortcuts are enabled (default: true)
- * 
- * @example
- * ```tsx
- * useKeyboardShortcuts({
- *   shortcuts: [
- *     {
- *       key: 'k',
- *       ctrl: true,
- *       description: 'Open search',
- *       category: 'actions',
- *       handler: () => openSearch(),
- *     },
- *   ],
- * });
- * ```
+ * Default shortcut mappings for power users.
+ * Keys are stable identifiers so callers can reference them (e.g. for tooltips).
  */
-export function useKeyboardShortcuts({
-  shortcuts,
-  enabled = true,
-}: UseKeyboardShortcutsOptions): void {
-  const shortcutsRef = useRef(shortcuts);
+export const DEFAULT_SHORTCUTS: ShortcutMap = {
+  search: {
+    key: 'k',
+    meta: true,
+    description: 'Open search',
+    handler: () => {},
+  },
+  newDid: {
+    key: 'n',
+    meta: true,
+    description: 'Create new DID',
+    handler: () => {},
+  },
+  help: {
+    key: '?',
+    shift: true,
+    description: 'Show keyboard shortcuts',
+    handler: () => {},
+  },
+};
 
-  // Update ref when shortcuts change
-  useEffect(() => {
-    shortcutsRef.current = shortcuts;
-  }, [shortcuts]);
-
-  const handleKeyDown = useCallback((event: KeyboardEvent) => {
-    // Don't trigger shortcuts when typing in form elements
-    const target = event.target as HTMLElement;
-    const tagName = target.tagName.toLowerCase();
-    const isEditable = target.isContentEditable;
-    
-    if (
-      tagName === 'input' ||
-      tagName === 'textarea' ||
-      tagName === 'select' ||
-      isEditable
-    ) {
-      // Exception: Allow Escape key in form elements
-      if (event.key !== 'Escape') {
-        return;
-      }
-    }
-
-    const matchingShortcut = shortcutsRef.current.find((shortcut) => {
-      if (shortcut.enabled === false) return false;
-
-      const keyMatches = event.key.toLowerCase() === shortcut.key.toLowerCase();
-      const ctrlMatches = shortcut.ctrl ? (event.ctrlKey || event.metaKey) : !event.ctrlKey && !event.metaKey;
-      const metaMatches = shortcut.meta ? event.metaKey : !event.metaKey;
-      const shiftMatches = shortcut.shift ? event.shiftKey : !event.shiftKey;
-      const altMatches = shortcut.alt ? event.altKey : !event.altKey;
-
-      return keyMatches && ctrlMatches && metaMatches && shiftMatches && altMatches;
-    });
-
-    if (matchingShortcut) {
-      if (matchingShortcut.preventDefault !== false) {
-        event.preventDefault();
-      }
-      matchingShortcut.handler();
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!enabled) return;
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [enabled, handleKeyDown]);
-}
+const isMac = (): boolean => {
+  if (typeof navigator === 'undefined') return false;
+  const platform =
+    (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ??
+    navigator.platform ??
+    '';
+  return /mac|iphone|ipad|ipod/i.test(platform);
+};
 
 /**
- * Hook for sequential keyboard shortcuts (e.g., "g" then "d")
- * 
- * @param shortcuts - Map of key sequences to handlers
- * @param options - Configuration options
- * 
- * @example
- * ```tsx
- * useSequentialShortcuts({
- *   'g,d': () => goToDIDs(),
- *   'g,c': () => goToCredentials(),
- * });
- * ```
+ * Returns true when the event target is an editable field where shortcuts
+ * should be ignored so typing is not intercepted.
  */
-export function useSequentialShortcuts(
-  shortcuts: Record<string, () => void>,
-  options: { timeout?: number; enabled?: boolean } = {}
+export const isEditableTarget = (target: EventTarget | null): boolean => {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tag = target.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+};
+
+const matches = (event: KeyboardEvent, shortcut: ShortcutDefinition): boolean => {
+  if (event.key.toLowerCase() !== shortcut.key.toLowerCase()) return false;
+
+  const wantsMeta = Boolean(shortcut.meta);
+  const hasMeta = isMac() ? event.metaKey : event.ctrlKey;
+  if (wantsMeta !== hasMeta) return false;
+
+  // On macOS, Ctrl should not accidentally trigger Cmd shortcuts and vice versa.
+  if (isMac() && event.ctrlKey && wantsMeta) return false;
+  if (!isMac() && event.metaKey && wantsMeta) return false;
+
+  if (Boolean(shortcut.shift) !== event.shiftKey) return false;
+  if (Boolean(shortcut.alt) !== event.altKey) return false;
+
+  return true;
+};
+
+/**
+ * Registers global keyboard shortcuts for power users.
+ *
+ * @param shortcuts Map of shortcut definitions keyed by a stable identifier.
+ * @param options.enabled When false, no listeners are attached.
+ */
+export function useKeyboardShortcuts(
+  shortcuts: ShortcutMap = DEFAULT_SHORTCUTS,
+  options: { enabled?: boolean } = {},
 ): void {
-  const { timeout = 1000, enabled = true } = options;
-  const sequenceRef = useRef<string[]>([]);
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
-
-  const resetSequence = useCallback(() => {
-    sequenceRef.current = [];
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
-    }
-  }, []);
-
-  const handleKeyDown = useCallback((event: KeyboardEvent) => {
-    // Don't trigger shortcuts when typing in form elements
-    const target = event.target as HTMLElement;
-    const tagName = target.tagName.toLowerCase();
-    const isEditable = target.isContentEditable;
-    
-    if (
-      tagName === 'input' ||
-      tagName === 'textarea' ||
-      tagName === 'select' ||
-      isEditable
-    ) {
-      return;
-    }
-
-    // Ignore modifier-only keys
-    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) {
-      return;
-    }
-
-    // Add key to sequence
-    sequenceRef.current.push(event.key.toLowerCase());
-
-    // Check for matching shortcut
-    const sequence = sequenceRef.current.join(',');
-    const handler = shortcuts[sequence];
-
-    if (handler) {
-      event.preventDefault();
-      handler();
-      resetSequence();
-      return;
-    }
-
-    // Check if sequence could still match
-    const couldMatch = Object.keys(shortcuts).some((shortcut) =>
-      shortcut.startsWith(sequence)
-    );
-
-    if (!couldMatch) {
-      resetSequence();
-      return;
-    }
-
-    // Clear existing timeout
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-    }
-
-    // Set new timeout to reset sequence
-    timeoutRef.current = setTimeout(resetSequence, timeout);
-  }, [shortcuts, resetSequence, timeout]);
+  const { enabled = true } = options;
+  const shortcutsRef = useRef(shortcuts);
+  shortcutsRef.current = shortcuts;
 
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || typeof window === 'undefined') return;
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (isEditableTarget(event.target)) return;
+
+      for (const shortcut of Object.values(shortcutsRef.current)) {
+        if (matches(event, shortcut)) {
+          event.preventDefault();
+          shortcut.handler(event);
+          return;
+        }
       }
     };
-  }, [enabled, handleKeyDown]);
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [enabled]);
 }
 
-/**
- * Utility to get platform-specific modifier key label
- */
-export function getModifierKey(): 'Ctrl' | 'Cmd' {
-  return navigator.platform.toLowerCase().includes('mac') ? 'Cmd' : 'Ctrl';
-}
-
-/**
- * Format a keyboard shortcut for display
- * 
- * @example
- * formatShortcut({ key: 'k', ctrl: true }) // "Ctrl+K" or "Cmd+K"
- */
-export function formatShortcut(shortcut: Pick<KeyboardShortcut, 'key' | 'ctrl' | 'meta' | 'shift' | 'alt'>): string {
-  const parts: string[] = [];
-  
-  if (shortcut.ctrl || shortcut.meta) {
-    parts.push(getModifierKey());
-  }
-  if (shortcut.shift) {
-    parts.push('Shift');
-  }
-  if (shortcut.alt) {
-    parts.push('Alt');
-  }
-  
-  parts.push(shortcut.key.toUpperCase());
-  
-  return parts.join('+');
-}
+export default useKeyboardShortcuts;
