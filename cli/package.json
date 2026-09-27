@@ -1,0 +1,16 @@
+{
+  "name": "@soroban-identity/cli",
+  "version": "0.1.0",
+  "description": "Command-line tool for Soroban Identity DID and credential operations",
+  "type": "module",
+  "bin": { "soroban-id": "bin/soroban-id.js" },
+  "files": ["bin", "src", "README.md"],
+  "publishConfig": { "access": "public" },
+  "scripts": { "start": "node bin/soroban-id.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@soroban-identity/sdk": "^0.1.0",
+    "@stellar/stellar-sdk": "~12.0.0",
+    "commander": "^12.1.0"
+  }
+}

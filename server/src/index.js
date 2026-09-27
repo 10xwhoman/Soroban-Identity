@@ -5,6 +5,7 @@ import { ensureDataDir } from './storage.js';
 import { ExpiryNotificationJob } from './expiry.js';
 import { MetricsAggregator, MetricsService } from './metrics.js';
 import { SorobanClient } from './soroban.js';
+import { logger, withRequestLogging } from './logger.js';
 
 const config = loadConfig();
 await ensureDataDir(config);
@@ -15,9 +16,9 @@ const expiryJob = new ExpiryNotificationJob(config, soroban);
 
 if (process.env.DISABLE_EXPIRY_JOB !== 'true') expiryJob.start();
 
-const server = http.createServer(createApp({ config, soroban, metrics, metricsAggregator }));
+const server = http.createServer(withRequestLogging(createApp({ config, soroban, metrics, metricsAggregator })));
 server.listen(config.port, () => {
-  console.log(`Soroban Identity server listening on :${config.port}`);
+  logger.info(`Soroban Identity server listening on :${config.port}`);
 });
 
 process.on('SIGTERM', async () => {

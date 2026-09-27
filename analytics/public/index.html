@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Soroban Identity Analytics</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  body{font-family:system-ui,sans-serif;margin:0;padding:24px;background:#f7f7f8;color:#1a1a1a}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+  .tile,.card{background:#fff;border-radius:10px;padding:16px;box-shadow:0 1px 2px #0001}
+  .tile b{display:block;font-size:28px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;margin-top:16px}
+  table{width:100%;border-collapse:collapse}td{padding:4px 0;border-bottom:1px solid #eee}
+  .actions a{margin-right:12px}
+</style>
+</head>
+<body>
+<h1>Soroban Identity Analytics</h1>
+<p class="actions"><a href="/api/export.csv">Export CSV</a><a href="/api/export.pdf">Export PDF</a><span id="live">connecting…</span></p>
+<div class="tiles">
+  <div class="tile">Total DIDs<b id="t-dids">0</b></div>
+  <div class="tile">Credentials issued<b id="t-issued">0</b></div>
+  <div class="tile">Revoked<b id="t-revoked">0</b></div>
+  <div class="tile">Verifications<b id="t-verif">0</b></div>
+</div>
+<div class="grid">
+  <div class="card"><h3>DIDs over time</h3><canvas id="c-dids"></canvas></div>
+  <div class="card"><h3>Daily issuance</h3><canvas id="c-issued"></canvas></div>
+  <div class="card"><h3>Verification frequency</h3><canvas id="c-verif"></canvas></div>
+  <div class="card"><h3>Geographic distribution</h3><canvas id="c-geo"></canvas></div>
+  <div class="card"><h3>Top issuers</h3><table id="issuers"></table></div>
+</div>
+<script>
+const charts = {};
+function chart(id, type, labels, data) {
+  if (charts[id]) { charts[id].data.labels = labels; charts[id].data.datasets[0].data = data; return charts[id].update(); }
+  charts[id] = new Chart(document.getElementById(id), { type, data: { labels, datasets: [{ data, backgroundColor: '#4f6bed', borderColor: '#4f6bed' }] }, options: { plugins: { legend: { display: false } } } });
+}
+function render(s) {
+  document.getElementById('t-dids').textContent = s.totals.dids;
+  document.getElementById('t-issued').textContent = s.totals.credentialsIssued;
+  document.getElementById('t-revoked').textContent = s.totals.credentialsRevoked;
+  document.getElementById('t-verif').textContent = s.totals.verifications;
+  chart('c-dids', 'line', s.didsOverTime.map(p => p.date), s.didsOverTime.map(p => p.count));
+  chart('c-issued', 'bar', s.issuanceRate.map(p => p.date), s.issuanceRate.map(p => p.count));
+  chart('c-verif', 'bar', s.verificationFrequency.map(p => p.date), s.verificationFrequency.map(p => p.count));
+  chart('c-geo', 'bar', s.geography.map(g => g.country), s.geography.map(g => g.count));
+  const t = document.getElementById('issuers');
+  t.replaceChildren(...s.topIssuers.map(i => { const r = t.insertRow(); r.insertCell().textContent = i.issuer.slice(0, 8) + '…' + i.issuer.slice(-4); r.insertCell().textContent = i.count; return r; }));
+}
+const es = new EventSource('/api/stream');
+es.onmessage = (e) => { document.getElementById('live').textContent = '● live'; render(JSON.parse(e.data)); };
+es.onerror = () => { document.getElementById('live').textContent = 'reconnecting…'; };
+</script>
+</body>
+</html>
