@@ -16,6 +16,7 @@ import type {
   CredentialType,
   Page,
   PaginationOptions,
+  RevocationReason,
   RevokedCredential,
   SorobanIdentityConfig,
   SorobanResponse,
@@ -314,10 +315,17 @@ export class CredentialClient extends BaseClient {
 
   /**
    * Revoke a credential that was issued by `issuerKeypair`.
+   *
+   * @param issuerKeypair Registered issuer keypair (must sign the transaction).
+   * @param credentialId  Hex-encoded credential ID.
+   * @param reason        Why the credential is revoked — stored on-chain and
+   *                      emitted with the `revoked` event (#937).
+   * @param options       Per-call options (timeout).
    */
   async revokeCredential(
     issuerKeypair: Keypair,
     credentialId: string,
+    reason: RevocationReason,
     options?: CallOptions
   ): Promise<SorobanResponse<RevokedCredential>> {
     const account = await this.server.getAccount(issuerKeypair.publicKey());
@@ -331,7 +339,11 @@ export class CredentialClient extends BaseClient {
       .addOperation(
         this.contract.call(
           'revoke_credential',
-          ...buildRevokeCredentialArgs({ issuer: issuerKeypair.publicKey(), credentialId: idBytes })
+          ...buildRevokeCredentialArgs({
+            issuer: issuerKeypair.publicKey(),
+            credentialId: idBytes,
+            reason,
+          })
         )
       )
       .setTimeout(timeout)
@@ -354,7 +366,12 @@ export class CredentialClient extends BaseClient {
       const revokedAt = new Date((confirmed as { createdAt: number }).createdAt * 1000).toISOString();
 
       const credential = await this.getCredential(issuerKeypair.publicKey(), credentialId, options);
-      const revokedCredential: RevokedCredential = { ...credential, revokedAt, status: 'revoked' };
+      const revokedCredential: RevokedCredential = {
+        ...credential,
+        revokedAt,
+        status: 'revoked',
+        revocationReason: reason,
+      };
       return { data: revokedCredential, txHash };
     } catch (e) {
       throw wrapError(e);
@@ -438,7 +455,7 @@ export class CredentialClient extends BaseClient {
   async revokeBatch(
     issuerKeypair: Keypair,
     ids: string[],
-    reason: string,
+    reason: RevocationReason,
     options?: CallOptions
   ): Promise<{ txHash: string }> {
     if (ids.length > 50) {

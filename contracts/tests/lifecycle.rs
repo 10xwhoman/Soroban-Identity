@@ -1,5 +1,6 @@
 use credential_manager::{
     ContractError as CredentialError, CredentialManager, CredentialManagerClient, CredentialType,
+    RevocationReason,
 };
 use identity_registry::{ContractError as IdentityError, IdentityRegistry, IdentityRegistryClient};
 use reputation::{ContractError as ReputationError, Reputation, ReputationClient};
@@ -72,7 +73,7 @@ fn did_and_credential_lifecycle() {
     assert_eq!(credential.issuer, issuer);
 
     // Revocation must immediately make the same credential fail verification.
-    credentials.revoke_credential(&issuer, &credential_id);
+    credentials.revoke_credential(&issuer, &credential_id, &RevocationReason::Compromised);
     assert!(!credentials.verify_credential(&credential_id));
 }
 
@@ -236,7 +237,7 @@ fn full_credential_lifecycle_across_contracts() {
     assert!(reputation.get_reputation(&subject).score > 0);
 
     // Revoke: credential verification must fail immediately.
-    credentials.revoke_credential(&issuer, &cred_id);
+    credentials.revoke_credential(&issuer, &cred_id, &RevocationReason::Superseded);
     assert!(!credentials.verify_credential(&cred_id));
 
     // Terminal state is consistent across all three contracts.
@@ -296,11 +297,13 @@ fn cross_contract_authorization_checks() {
         &Bytes::from_array(&env, &[4u8; 64]),
         &0u64,
     );
-    assert!(credentials.try_revoke_credential(&rogue, &cred_id).is_err());
+    assert!(credentials
+        .try_revoke_credential(&rogue, &cred_id, &RevocationReason::AdminRevoked)
+        .is_err());
     assert!(credentials.verify_credential(&cred_id));
 
     // Only the original issuer can revoke successfully.
-    credentials.revoke_credential(&issuer, &cred_id);
+    credentials.revoke_credential(&issuer, &cred_id, &RevocationReason::Superseded);
     assert!(!credentials.verify_credential(&cred_id));
 }
 
@@ -355,7 +358,7 @@ fn reputation_integration_with_credentials() {
     assert!(reputation.passes_sybil_check(&subject, &50, &1));
 
     // Revoking the credential does not silently erase reputation history.
-    credentials.revoke_credential(&issuer, &cred_id);
+    credentials.revoke_credential(&issuer, &cred_id, &RevocationReason::Superseded);
     assert!(!credentials.verify_credential(&cred_id));
     assert_eq!(reputation.get_reputation(&subject).score, 80);
 }
