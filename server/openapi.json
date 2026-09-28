@@ -211,7 +211,11 @@
                 "schema": {
                   "type": "string"
                 }
-              }
+              },
+              "Link": { "$ref": "#/components/headers/PaginationLink" },
+              "X-Total-Count": { "$ref": "#/components/headers/XTotalCount" },
+              "X-Page-Size": { "$ref": "#/components/headers/XPageSize" },
+              "X-Has-More": { "$ref": "#/components/headers/XHasMore" }
             },
             "content": {
               "application/json": {
@@ -927,11 +931,18 @@
         "security": [{ "ApiKeyAuth": ["admin:read"] }],
         "parameters": [
           { "name": "webhookId", "in": "query", "required": false, "schema": { "type": "string" } },
-          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50 } }
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50, "maximum": 200 } },
+          { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Opaque cursor from a previous response's pagination.next_cursor." }
         ],
         "responses": {
           "200": {
-            "description": "Delivery logs",
+            "description": "Delivery logs, newest first",
+            "headers": {
+              "Link": { "$ref": "#/components/headers/PaginationLink" },
+              "X-Total-Count": { "$ref": "#/components/headers/XTotalCount" },
+              "X-Page-Size": { "$ref": "#/components/headers/XPageSize" },
+              "X-Has-More": { "$ref": "#/components/headers/XHasMore" }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -940,7 +951,8 @@
                     "logs": {
                       "type": "array",
                       "items": { "$ref": "#/components/schemas/WebhookLog" }
-                    }
+                    },
+                    "pagination": { "$ref": "#/components/schemas/PaginationMeta" }
                   }
                 }
               }
@@ -1364,7 +1376,28 @@
         "description": "Bearer authorization header token."
       }
     },
+    "headers": {
+      "PaginationLink": {
+        "description": "RFC 8288 links to adjacent pages: rel=\"next\", \"prev\", \"first\" and, on offset-paginated endpoints, \"last\". Paths are relative.",
+        "schema": { "type": "string" }
+      },
+      "XTotalCount": { "description": "Mirrors pagination.total_count.", "schema": { "type": "integer" } },
+      "XPageSize": { "description": "Mirrors pagination.page_size.", "schema": { "type": "integer" } },
+      "XHasMore": { "description": "Mirrors pagination.has_more.", "schema": { "type": "boolean" } }
+    },
     "schemas": {
+      "PaginationMeta": {
+        "type": "object",
+        "description": "Standard pagination metadata on every paginated list response (#958).",
+        "required": ["total_count", "page_size", "has_more", "next_cursor", "previous_cursor"],
+        "properties": {
+          "total_count": { "type": "integer", "nullable": true, "description": "Items matching the query across all pages." },
+          "page_size": { "type": "integer", "description": "Maximum number of items in this page." },
+          "has_more": { "type": "boolean", "description": "Whether another page exists in the direction of travel." },
+          "next_cursor": { "type": "string", "nullable": true, "description": "Opaque cursor for the next page; pass back as ?cursor=." },
+          "previous_cursor": { "type": "string", "nullable": true, "description": "Opaque cursor for the previous page." }
+        }
+      },
       "Credential": {
         "type": "object",
         "required": ["id", "subject", "issuer"],
@@ -1420,7 +1453,9 @@
             "type": "array",
             "items": { "$ref": "#/components/schemas/Credential" }
           },
-          "nextCursor": { "type": ["string", "null"], "example": "cred-050" }
+          "nextCursor": { "type": ["string", "null"], "example": "cred-050" },
+          "previousCursor": { "type": ["string", "null"] },
+          "pagination": { "$ref": "#/components/schemas/PaginationMeta" }
         }
       },
       "Webhook": {
