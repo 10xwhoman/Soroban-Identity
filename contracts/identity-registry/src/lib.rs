@@ -54,6 +54,12 @@ const DID_STELLAR_PREFIX: &[u8] = b"did:stellar:";
 /// ~1 year in ledgers (5-second ledger close time).
 /// Used as the TTL extension on every persistent read/write.
 const TTL_LEDGERS: u32 = 6_312_000;
+/// Extend a persistent entry's TTL only once it has dropped below this many
+/// ledgers (#866). With the threshold equal to the target, every access
+/// re-extended the TTL and paid rent again; now an entry that is read or
+/// written often is extended at most about once every 30 days
+/// (518_400 ledgers at 5 s), while never having less than ~11 months left.
+const TTL_BUMP_THRESHOLD: u32 = TTL_LEDGERS - 518_400;
 
 /// Maximum number of service endpoints allowed on a DID document.
 /// Exceeding this limit returns [`ContractError::MaxServicesReached`].
@@ -309,7 +315,7 @@ impl IdentityRegistry {
         doc.updated_at = env.ledger().timestamp();
         doc.services.push_back(service.clone());
         storage.set(&key, &doc);
-        storage.extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
+        storage.extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
         env.events().publish((IDENTITY, symbol_short!("svc_add")), (EVENT_VERSION, controller, doc.updated_at));
         Ok(())
     }
@@ -330,7 +336,7 @@ impl IdentityRegistry {
         doc.metadata = metadata;
         doc.updated_at = env.ledger().timestamp();
         storage.set(&key, &doc);
-        storage.extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
+        storage.extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
         let mut hash_input = Self::string_to_bytes(&env, &doc.id);
         hash_input.extend_from_array(&doc.updated_at.to_be_bytes());
         let meta_hash: BytesN<32> = env.crypto().sha256(&hash_input).into();
@@ -356,7 +362,7 @@ impl IdentityRegistry {
         doc.active = false;
         doc.updated_at = env.ledger().timestamp();
         storage.set(&key, &doc);
-        storage.extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
+        storage.extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
         let count: u32 = env.storage().instance().get(&DID_COUNT).unwrap_or(0);
         if count > 0 {
             env.storage().instance().set(&DID_COUNT, &(count - 1));
@@ -404,7 +410,7 @@ impl IdentityRegistry {
         doc.updated_at = env.ledger().timestamp();
 
         storage.set(&key, &doc);
-        storage.extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
+        storage.extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
 
         // Increment active DID count
         let count: u32 = env.storage().instance().get(&DID_COUNT).unwrap_or(0);
@@ -419,10 +425,9 @@ impl IdentityRegistry {
 
     pub fn resolve_did(env: Env, controller: Address) -> Result<DidDocument, ContractError> {
         let key = Self::did_key(&env, &controller);
-        if env.storage().persistent().has(&key) {
-            env.storage().persistent().extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
-        }
+        // Read once and extend the TTL only on a hit, instead of has() + get().
         let doc: DidDocument = env.storage().persistent().get(&key).ok_or(ContractError::DidNotFound)?;
+        env.storage().persistent().extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
         if !doc.active {
             return Err(ContractError::DidDeactivated);
         }
@@ -431,11 +436,11 @@ impl IdentityRegistry {
 
     pub fn has_active_did(env: Env, controller: Address) -> bool {
         let key = Self::did_key(&env, &controller);
-        if env.storage().persistent().has(&key) {
-            env.storage().persistent().extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
-        }
         match env.storage().persistent().get::<_, DidDocument>(&key) {
-            Some(doc) => doc.active,
+            Some(doc) => {
+                env.storage().persistent().extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
+                doc.active
+            }
             None => false,
         }
     }
@@ -490,7 +495,7 @@ impl IdentityRegistry {
         doc.services = updated;
         doc.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &doc);
-        env.storage().persistent().extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
+        env.storage().persistent().extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
         env.events().publish((IDENTITY, symbol_short!("svc_rmvd")), (EVENT_VERSION, controller, service_id));
         Ok(())
     }
@@ -560,7 +565,7 @@ impl IdentityRegistry {
             services: Vec::new(env),
         };
         storage.set(&key, &doc);
-        storage.extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
+        storage.extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
         let count: u32 = env.storage().instance().get(&DID_COUNT).unwrap_or(0);
         env.storage().instance().set(&DID_COUNT, &(count + 1));
         let total: u32 = env.storage().instance().get(&TOTAL_DIDS).unwrap_or(0);
@@ -1242,5 +1247,35 @@ mod tests {
         let mut entries = Vec::new(&env);
         entries.push_back((Address::generate(&env), Map::new(&env)));
         assert_eq!(client.try_create_dids_batch(&entries), Err(Ok(ContractError::ContractPaused)));
+    }
+
+    /// #866: an access only extends the TTL once it has dropped below
+    /// `TTL_BUMP_THRESHOLD`, instead of on every call.
+    #[test]
+    fn test_reads_extend_ttl_only_below_threshold() {
+        use soroban_sdk::testutils::{storage::Persistent as _, Ledger as _};
+        let (env, client) = setup();
+        let controller = Address::generate(&env);
+        client.create_did(&controller, &Map::new(&env));
+        let ttl = || {
+            env.as_contract(&client.address, || {
+                let key = IdentityRegistry::did_key(&env, &controller);
+                env.storage().persistent().get_ttl(&key)
+            })
+        };
+        let full = ttl();
+        // Keep the contract instance itself alive across the ledger jumps below.
+        env.as_contract(&client.address, || {
+            env.storage().instance().extend_ttl(6_000_000, 6_000_000)
+        });
+
+        env.ledger().with_mut(|li| li.sequence_number += 1_000);
+        client.resolve_did(&controller);
+        assert!(client.has_active_did(&controller));
+        assert_eq!(ttl(), full - 1_000);
+
+        env.ledger().with_mut(|li| li.sequence_number += 518_400);
+        client.resolve_did(&controller);
+        assert_eq!(ttl(), full);
     }
 }
