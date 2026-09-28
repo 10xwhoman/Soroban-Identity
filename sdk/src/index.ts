@@ -56,16 +56,16 @@ export {
   SimulationError,
   validateConfig,
   RevocationReason,
-  REVOCATION_REASONS,
-  REVOCATION_REASON_LABELS,
-  isRevocationReason,
-  normalizeRevocationReason,
+  revocationReasonName,
 } from './types';
 export type {
   DidDocument,
   ServiceEndpoint,
   Credential,
   RevokedCredential,
+  RevocationRecord,
+  RevocationReasonName,
+  RevokeOptions,
   CredentialType,
   CredentialListOptions,
   VerifyResult,
@@ -170,6 +170,9 @@ export {
   buildGetRevocationsArgs,
   buildCancelActivationArgs,
   buildGetPendingActivationsArgs,
+  buildRevokeCredentialWithReasonArgs,
+  buildGetRevocationRecordArgs,
+  buildGetRevokedByReasonArgs,
 } from './contract-args';
 
 // ── OpenAPI / v1 ──────────────────────────────────────────────────────────────

@@ -1,3 +1,12 @@
+import { URL } from 'node:url';
+import crypto from 'node:crypto';
+import { appendAuditLog, readCredentials } from './storage.js';
+import { findExpiringCredentials, paginate } from './expiry.js';
+import { notFound, readJson, requireAdmin, sendJson, sendText } from './http-utils.js';
+import { requestContextStore } from './request-context.js';
+import { logger } from './logger.js';
+
+export function createApp({ config, soroban, metrics, metricsAggregator }) {
 import { URL } from "node:url";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
@@ -12,7 +21,7 @@ import {
   DuplicateCredentialError,
   ConcurrencyConflictError,
 } from "./storage.js";
-import { findExpiringCredentials, paginate, paginateCursor } from "./expiry.js";
+import { findExpiringCredentials, paginate } from "./expiry.js";
 import {
   createWebhookRecord,
   deleteWebhookRecord,
@@ -65,6 +74,8 @@ function wantsJsonLd(req, url) {
 import { schemas, validateRequest } from "./validation.js";
 import { routeLabel } from "./route-label.js";
 import { requestContextStore } from "./request-context.js";
+import { correlationMiddleware, handleTraceRoutes } from "./middleware/tracing.js";
+import { cursorPage, offsetMeta, offsetPage, pageNumberMeta, setPaginationHeaders } from "./routes/pagination.js";
 import { handleEventsRequest } from "./sse.js";
 import { handleLongPollRequest } from "./long-poll.js";
 import { logger } from "./logger.js";
@@ -214,16 +225,21 @@ export function createApp({
     const isMetricsEndpoint = req.method === "GET" && pathname === "/metrics";
     
     // Generate requestId for all endpoints except metrics
-    const requestId = isMetricsEndpoint ? null : (req.headers["x-request-id"] || crypto.randomUUID());
+    const requestId = isMetricsEndpoint ? null : (req.headers["x-correlation-id"] || req.headers["x-request-id"] || crypto.randomUUID());
     
     if (!isMetricsEndpoint) {
       res.setHeader("X-Request-ID", requestId);
+      res.setHeader("X-Correlation-ID", requestId);
     }
 
     // Resolve tenant context (#800)
     const tenantId = resolveTenantId(req);
     req.tenantId = tenantId;
     res.setHeader("X-Tenant-ID", tenantId);
+
+    // Correlation ID + trace record (#946). Every response, including the
+    // metrics endpoint, carries X-Correlation-ID.
+    const correlationId = correlationMiddleware(req, res, { requestId, path: pathname });
 
     // Distributed Tracing with OpenTelemetry (#801)
     openTelemetryHttpMiddleware()(req, res);
@@ -289,7 +305,7 @@ export function createApp({
       });
     });
 
-    return requestContextStore.run({ requestId }, async () => {
+    return requestContextStore.run({ requestId, correlationId }, async () => {
       try {
         if (req.method === "GET" && url.pathname === "/info") {
           return sendFormatted(req, res, 200, {
@@ -476,7 +492,7 @@ export function createApp({
       }
     }
 
-    return requestContextStore.run({ requestId, tenantId }, async () => {
+    return requestContextStore.run({ ...(requestContextStore.getStore() || {}), requestId, tenantId }, async () => {
       try {
         if (req.method === "GET" && pathname === "/info") {
           return sendJson(res, 200, {
@@ -562,6 +578,9 @@ export function createApp({
           });
         }
 
+        if (req.method === 'GET' && url.pathname === '/metrics') {
+          if (metricsAggregator) await metricsAggregator.refresh().catch((error) => logger.error('metrics refresh failed', error));
+          return sendText(res, 200, metrics.renderPrometheus());
         if (req.method === "GET" && pathname === "/ready") {
           const readiness = await collectReadiness({
             config,
@@ -686,12 +705,13 @@ export function createApp({
           if (!validated.ok) return;
           const limitNum = validated.data.query.limit ?? 50;
           const credentials = await readCredentials(config);
-          const { items, nextCursor, previousCursor } = paginateCursor(credentials, {
+          const { items, nextCursor, previousCursor, pagination } = cursorPage(credentials, {
             limit: limitNum,
             cursor: validated.data.query.cursor ?? null,
             direction: validated.data.query.direction ?? "next",
           });
-          return sendFormatted(req, res, 200, { items, nextCursor });
+          setPaginationHeaders(res, url, pagination);
+          return sendFormatted(req, res, 200, { items, nextCursor, pagination });
 
           if (wantsJsonLd(req, url)) {
             return sendJson(
@@ -701,6 +721,7 @@ export function createApp({
                 items: items.map((item) => vcSerializer.serialize(item)),
                 nextCursor,
                 previousCursor,
+                pagination,
               },
               { "content-type": "application/ld+json; charset=utf-8" },
             );
@@ -741,6 +762,7 @@ export function createApp({
                     hasPreviousPage: Boolean(previousCursor),
                     count: projectedItems.length,
                   },
+                  pagination,
                 },
                 meta: {
                   timestamp: new Date().toISOString(),
@@ -752,7 +774,7 @@ export function createApp({
           return sendJson(
             res,
             200,
-            { items: projectedItems, nextCursor, previousCursor },
+            { items: projectedItems, nextCursor, previousCursor, pagination },
             { ETag: collectionEtag },
           );
         }
@@ -1050,6 +1072,12 @@ export function createApp({
         )
           return;
 
+        // Request traces API and dashboard (#946)
+        if (pathname.startsWith("/admin/traces")) {
+          if (!requireAuth(req, res, config, ['admin:read'])) return;
+          if (handleTraceRoutes(req, res, { pathname, searchParams: url.searchParams }, { sendJson, nonce: req.cspNonce })) return;
+        }
+
         // Analytics Dashboard
         if (req.method === "GET" && url.pathname === "/admin/analytics/dashboard") {
           if (!requireAuth(req, res, config, ['admin:read'])) return;
@@ -1224,8 +1252,15 @@ export function createApp({
         // ── Webhook Endpoints ──────────────────────────────────────────
         if (req.method === "GET" && pathname === "/webhooks") {
           if (!await requireAuth(req, res, config, ['admin:read'])) return;
-          const webhooks = await readWebhooks(config);
-          return sendJson(res, 200, { webhooks });
+          const allWebhooks = await readWebhooks(config);
+          // No `limit` returns the full list, as before (#944).
+          const { items: webhooks, pagination } = offsetPage(allWebhooks, {
+            limit: url.searchParams.get("limit") ?? Math.max(allWebhooks.length, 1),
+            offset: url.searchParams.get("offset"),
+            maxPageSize: Math.max(200, allWebhooks.length),
+          });
+          setPaginationHeaders(res, url, pagination);
+          return sendJson(res, 200, { webhooks, pagination });
         }
 
         if (req.method === "POST" && pathname === "/webhooks") {
@@ -1246,8 +1281,13 @@ export function createApp({
           if (!validated.ok) return;
           const limit = validated.data.query.limit ?? 50;
           const webhookId = validated.data.query.webhookId ?? null;
-          const logs = await readWebhookLogs(config, { webhookId, limit });
-          return sendJson(res, 200, { logs });
+          const allLogs = await readWebhookLogs(config, { webhookId, limit: null });
+          const { items: logs, pagination } = offsetPage(allLogs, {
+            limit,
+            offset: url.searchParams.get("offset"),
+          });
+          setPaginationHeaders(res, url, pagination);
+          return sendJson(res, 200, { logs, pagination });
         }
 
         if (req.method === "GET" && pathname === "/notifications/logs") {
@@ -1256,12 +1296,16 @@ export function createApp({
           if (limit > 200) {
             return sendJson(res, 400, { code: "INVALID_REQUEST", message: "limit must not exceed 200" });
           }
-          const logs = await readNotificationLog(config, {
-            limit,
+          const allLogs = await readNotificationLog(config, {
             credentialId: url.searchParams.get("credentialId") ?? undefined,
             status: url.searchParams.get("status") ?? undefined,
           });
-          return sendJson(res, 200, { logs });
+          // Without `offset`, keep the historical "most recent `limit`" view.
+          const offsetParam = url.searchParams.get("offset");
+          const offset = offsetParam === null ? Math.max(0, allLogs.length - limit) : offsetParam;
+          const { items: logs, pagination } = offsetPage(allLogs, { limit, offset });
+          setPaginationHeaders(res, url, pagination);
+          return sendJson(res, 200, { logs, pagination });
         }
 
         if (req.method === "GET" && pathname === "/cache/stats") {
@@ -1320,8 +1364,13 @@ export function createApp({
           const validated = validateRequest(res, schemas.webhookLogsQuery, { query: url.searchParams });
           if (!validated.ok) return;
           const limit = validated.data.query.limit ?? 50;
-          const logs = await readWebhookLogs(config, { webhookId, limit });
-          return sendJson(res, 200, { logs });
+          const allLogs = await readWebhookLogs(config, { webhookId, limit: null });
+          const { items: logs, pagination } = offsetPage(allLogs, {
+            limit,
+            offset: url.searchParams.get("offset"),
+          });
+          setPaginationHeaders(res, url, pagination);
+          return sendJson(res, 200, { logs, pagination });
         }
 
         const webhookIdMatch = pathname.match(/^\/webhooks\/([^/]+)$/);
@@ -1345,8 +1394,15 @@ export function createApp({
           // Reading issuers requires admin:read or wildcard scope
           if (!await requireAuth(req, res, config, ['admin:read'])) return;
           
-          const issuers = await soroban.getIssuers();
-          return sendFormatted(req, res, 200, { issuers });
+          const allIssuers = await soroban.getIssuers();
+          // No `limit` returns the full list, as before (#944).
+          const { items: issuers, pagination } = offsetPage(allIssuers, {
+            limit: url.searchParams.get("limit") ?? Math.max(allIssuers.length, 1),
+            offset: url.searchParams.get("offset"),
+            maxPageSize: Math.max(200, allIssuers.length),
+          });
+          setPaginationHeaders(res, url, pagination);
+          return sendFormatted(req, res, 200, { issuers, pagination });
         }
 
         if (req.method === "POST" && pathname === "/admin/issuers") {
@@ -1427,15 +1483,13 @@ export function createApp({
             windowDays,
             includeNotified: true,
           });
-          return sendFormatted(
-            req,
-            res,
-            200,
-            paginate(expiring, {
-              page: validated.data.query.page ?? null,
-              pageSize: validated.data.query.pageSize ?? null,
-            }),
-          );
+          const report = paginate(expiring, {
+            page: validated.data.query.page ?? null,
+            pageSize: validated.data.query.pageSize ?? null,
+          });
+          const pagination = pageNumberMeta(report);
+          setPaginationHeaders(res, url, pagination, { offsetParam: "page", limitParam: "pageSize" });
+          return sendFormatted(req, res, 200, { ...report, pagination });
         }
 
         return notFound(res, req);
@@ -1606,7 +1660,9 @@ export function createApp({
 
             const total = entries.length;
             const page = entries.slice(offset, offset + limit);
-            return sendJson(res, 200, { total, limit, offset, entries: page });
+            const pagination = offsetMeta({ totalCount: total, pageSize: limit, offset });
+            setPaginationHeaders(res, url, pagination);
+            return sendJson(res, 200, { total, limit, offset, entries: page, pagination });
           } catch (err) {
             logger.error({ error: err.message, stack: err.stack }, 'Failed to read audit logs');
             return sendJson(res, 500, { error: 'audit_log_read_failed', message: err.message });
@@ -1705,6 +1761,12 @@ export function createApp({
 
         return notFound(res);
       } catch (error) {
+        if (error.name === 'SorobanError') {
+          logger.error(error.internalDetail);
+          return sendJson(res, 500, { error: error.category, message: error.publicMessage });
+        }
+        logger.error(error);
+        return sendJson(res, 500, { error: 'internal_server_error', message: error.message });
         if (error.name === "SorobanError" || error.name === "SorobanUnavailableError") {
           const isUnavailable = error.name === "SorobanUnavailableError" || error.category === "rpc_unavailable";
           const statusCode = isUnavailable ? 503 : 500;

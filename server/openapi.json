@@ -211,7 +211,9 @@
                 "schema": {
                   "type": "string"
                 }
-              }
+              },
+              "Link": { "$ref": "#/components/headers/Link" },
+              "X-Total-Count": { "$ref": "#/components/headers/X-Total-Count" }
             },
             "content": {
               "application/json": {
@@ -782,14 +784,23 @@
       "get": {
         "tags": ["webhooks"],
         "summary": "List registered webhooks",
+        "description": "Returns every webhook unless `limit` is given.",
         "security": [
           {
             "ApiKeyAuth": ["admin:read"]
           }
         ],
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1 } },
+          { "$ref": "#/components/parameters/Offset" }
+        ],
         "responses": {
           "200": {
             "description": "List of webhooks",
+            "headers": {
+              "Link": { "$ref": "#/components/headers/Link" },
+              "X-Total-Count": { "$ref": "#/components/headers/X-Total-Count" }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -800,7 +811,8 @@
                       "items": {
                         "$ref": "#/components/schemas/Webhook"
                       }
-                    }
+                    },
+                    "pagination": { "$ref": "#/components/schemas/Pagination" }
                   }
                 }
               }
@@ -927,11 +939,16 @@
         "security": [{ "ApiKeyAuth": ["admin:read"] }],
         "parameters": [
           { "name": "webhookId", "in": "query", "required": false, "schema": { "type": "string" } },
-          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50 } }
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50 } },
+          { "$ref": "#/components/parameters/Offset" }
         ],
         "responses": {
           "200": {
             "description": "Delivery logs",
+            "headers": {
+              "Link": { "$ref": "#/components/headers/Link" },
+              "X-Total-Count": { "$ref": "#/components/headers/X-Total-Count" }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -940,7 +957,8 @@
                     "logs": {
                       "type": "array",
                       "items": { "$ref": "#/components/schemas/WebhookLog" }
-                    }
+                    },
+                    "pagination": { "$ref": "#/components/schemas/Pagination" }
                   }
                 }
               }
@@ -1364,6 +1382,26 @@
         "description": "Bearer authorization header token."
       }
     },
+    "headers": {
+      "Link": {
+        "description": "RFC 8288 links to adjacent pages: rel=\"next\", \"prev\", \"first\", and \"last\" (offset endpoints).",
+        "schema": { "type": "string" },
+        "example": "</credentials?cursor=eyJpZCI6ImNyZWQtMDUwIn0&limit=50>; rel=\"next\", </credentials?limit=50>; rel=\"first\""
+      },
+      "X-Total-Count": {
+        "description": "Same as pagination.total_count.",
+        "schema": { "type": "integer" }
+      }
+    },
+    "parameters": {
+      "Offset": {
+        "name": "offset",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "integer", "minimum": 0, "default": 0 },
+        "description": "Zero-based offset of the first item to return."
+      }
+    },
     "schemas": {
       "Credential": {
         "type": "object",
@@ -1420,7 +1458,24 @@
             "type": "array",
             "items": { "$ref": "#/components/schemas/Credential" }
           },
-          "nextCursor": { "type": ["string", "null"], "example": "cred-050" }
+          "nextCursor": { "type": ["string", "null"], "example": "cred-050" },
+          "previousCursor": { "type": ["string", "null"] },
+          "pagination": { "$ref": "#/components/schemas/Pagination" }
+        }
+      },
+      "Pagination": {
+        "type": "object",
+        "description": "Standard pagination metadata returned by every list endpoint (#944). Cursor-paginated endpoints fill next_cursor/prev_cursor; offset-paginated endpoints fill offset/page/total_pages.",
+        "required": ["total_count", "page_size", "has_more", "next_cursor"],
+        "properties": {
+          "total_count": { "type": ["integer", "null"], "description": "Items matching the query across all pages.", "example": 137 },
+          "page_size": { "type": "integer", "description": "Effective page size after clamping.", "example": 50 },
+          "has_more": { "type": "boolean", "description": "True when another page exists after this one." },
+          "next_cursor": { "type": ["string", "null"], "description": "Opaque cursor for the next page." },
+          "prev_cursor": { "type": ["string", "null"], "description": "Opaque cursor for the previous page." },
+          "offset": { "type": "integer", "description": "Zero-based offset of this page (offset endpoints)." },
+          "page": { "type": "integer", "description": "One-based page number (offset endpoints)." },
+          "total_pages": { "type": "integer", "description": "Total number of pages (offset endpoints)." }
         }
       },
       "Webhook": {
