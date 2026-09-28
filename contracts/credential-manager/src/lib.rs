@@ -7,6 +7,9 @@ pub use templates::{CredentialTemplate, TemplateRef};
 mod versions;
 pub mod encryption;
 
+mod suspension;
+pub use suspension::{CredentialStatus, SuspensionReason, SuspensionRecord};
+
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short,
@@ -180,6 +183,10 @@ pub enum ContractError {
     InvalidZkProof = 49,
     /// Issue #816: credential version was not found in the amendment history.
     VersionNotFound = 50,
+    /// Issue #856: the credential is temporarily suspended.
+    CredentialSuspended = 51,
+    /// Issue #856: the credential is not suspended, so it cannot be reactivated.
+    CredentialNotSuspended = 52,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -1543,6 +1550,10 @@ impl CredentialManager {
                 if cred.revoked {
                     return Err(ContractError::CredentialRevoked);
                 }
+                // #856: suspended credentials fail verification until reactivated.
+                if suspension::is_suspended(&env, &credential_id) {
+                    return Err(ContractError::CredentialSuspended);
+                }
                 let now = env.ledger().timestamp();
                 // #731: credential must have reached its activation_time.
                 if cred.activation_time != 0 && now < cred.activation_time {
@@ -2007,7 +2018,9 @@ impl CredentialManager {
             .ok_or(ContractError::CredentialNotFound)?;
 
         let now = env.ledger().timestamp();
-        let valid = !cred.revoked && (cred.expires_at == 0 || now <= cred.expires_at);
+        let valid = !cred.revoked
+            && !suspension::is_suspended(&env, &credential_id)
+            && (cred.expires_at == 0 || now <= cred.expires_at);
         let prerequisites = Self::fetch_prereqs(&env, &credential_id);
 
         Ok(DependencyTree {
@@ -2867,7 +2880,7 @@ impl CredentialManager {
         match env.storage().persistent().get::<_, Credential>(&key) {
             None => false,
             Some(cred) => {
-                if cred.revoked {
+                if cred.revoked || suspension::is_suspended(env, id) {
                     return false;
                 }
                 let now = env.ledger().timestamp();
@@ -3532,7 +3545,7 @@ mod tests {
     fn test_storage_key_symbols_are_unique() {
         let keys = [
             ADMIN, ISSUER, CRED, SUBJECT, CRED_CNT, REVOKED_CNT, ISSUER_CREDS, SCHEMA, ISS_NONCE,
-            TYPE_REGISTRY, TYPE_NAMES, DELEGATION,
+            TYPE_REGISTRY, TYPE_NAMES, DELEGATION, suspension::SUSPENDED,
         ];
         for (i, left) in keys.iter().enumerate() {
             for right in keys.iter().skip(i + 1) {
