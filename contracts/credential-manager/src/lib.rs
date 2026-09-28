@@ -182,6 +182,30 @@ pub enum ContractError {
     InvalidZkProof = 49,
     /// Issue #816: credential version was not found in the amendment history.
     VersionNotFound = 32,
+    /// Issue #947: no encryption key registered for the address.
+    EncryptionKeyNotFound = 33,
+    /// Issue #947: the address's encryption key has been revoked.
+    EncryptionKeyRevoked = 34,
+    /// Issue #947: malformed public key or wrapped key.
+    InvalidEncryptionKey = 35,
+    /// Issue #947: credential has no encrypted claims attached.
+    EncryptedClaimsNotFound = 36,
+    /// Issue #947: encrypted claims were already attached to this credential.
+    EncryptedClaimsAlreadyAttached = 37,
+    /// Issue #947: malformed encrypted field, field name, or disclosure.
+    InvalidEncryptedField = 38,
+    /// Issue #947: caller holds no access grant for the encrypted claims.
+    AccessDenied = 39,
+    /// Issue #947: the caller's access grant has expired.
+    AccessGrantExpired = 40,
+    /// Issue #947: a field marked sensitive also appears in plaintext claims.
+    SensitiveClaimInPlaintext = 41,
+    /// Issue #947: zero or more than MAX_ENCRYPTED_FIELDS encrypted fields.
+    TooManyEncryptedFields = 42,
+    /// Issue #947: unsupported key algorithm or encryption scheme.
+    UnsupportedEncryptionScheme = 43,
+    /// Issue #947: credential already has MAX_READERS_PER_CREDENTIAL grants.
+    TooManyClaimReaders = 44,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────

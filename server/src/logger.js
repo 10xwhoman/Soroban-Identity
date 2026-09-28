@@ -22,7 +22,7 @@ function createLogger() {
     timestamp: pino.stdTimeFunctions.isoTime,
     base: undefined, // Remove default pid/hostname
     mixin() {
-      // Inject requestId from AsyncLocalStorage context if available
+      // Inject requestId and correlationId (#946) from the request context
       const store = requestContextStore.getStore();
       if (store && (store.requestId || store.traceId)) {
         return {
