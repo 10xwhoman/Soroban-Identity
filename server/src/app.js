@@ -1,3 +1,12 @@
+import { URL } from 'node:url';
+import crypto from 'node:crypto';
+import { appendAuditLog, readCredentials } from './storage.js';
+import { findExpiringCredentials, paginate } from './expiry.js';
+import { notFound, readJson, requireAdmin, sendJson, sendText } from './http-utils.js';
+import { requestContextStore } from './request-context.js';
+import { logger } from './logger.js';
+
+export function createApp({ config, soroban, metrics, metricsAggregator }) {
 import { URL } from "node:url";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
@@ -569,6 +578,9 @@ export function createApp({
           });
         }
 
+        if (req.method === 'GET' && url.pathname === '/metrics') {
+          if (metricsAggregator) await metricsAggregator.refresh().catch((error) => logger.error('metrics refresh failed', error));
+          return sendText(res, 200, metrics.renderPrometheus());
         if (req.method === "GET" && pathname === "/ready") {
           const readiness = await collectReadiness({
             config,
@@ -1749,6 +1761,12 @@ export function createApp({
 
         return notFound(res);
       } catch (error) {
+        if (error.name === 'SorobanError') {
+          logger.error(error.internalDetail);
+          return sendJson(res, 500, { error: error.category, message: error.publicMessage });
+        }
+        logger.error(error);
+        return sendJson(res, 500, { error: 'internal_server_error', message: error.message });
         if (error.name === "SorobanError" || error.name === "SorobanUnavailableError") {
           const isUnavailable = error.name === "SorobanUnavailableError" || error.category === "rpc_unavailable";
           const statusCode = isUnavailable ? 503 : 500;
