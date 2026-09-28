@@ -148,3 +148,32 @@ impl Credential {
         }
     }
 }
+
+/// Standardized reason a credential was revoked. Loosely follows the
+/// X.509 CRL reason codes (RFC 5280 §5.3.1). Must stay in sync with the
+/// `RevocationReason` exported by the contract in `lib.rs`. #951
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RevocationReason {
+    Unspecified = 0,
+    KeyCompromise = 1,
+    IssuerCompromise = 2,
+    AffiliationChanged = 3,
+    Superseded = 4,
+    CessationOfOperation = 5,
+    PrivilegeWithdrawn = 6,
+    Fraudulent = 7,
+    SubjectRequest = 8,
+    DependencyRevoked = 9,
+}
+
+/// Revocation metadata persisted for each revoked credential. #951
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevocationRecord {
+    pub credential_id: BytesN<32>,
+    pub reason: RevocationReason,
+    pub revoked_by: Address,
+    pub revoked_at: u64,
+}

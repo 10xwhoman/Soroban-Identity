@@ -27,6 +27,18 @@ import CredentialTimeline from "./CredentialTimeline";
 import CredentialShare from "./CredentialShare";
 import TemplateSelector from "../templates/TemplateSelector";
 import { type CredentialTemplate, validateClaimsAgainstTemplate } from "../templates/credentialTemplates";
+import { exportCredentialsAsCSV, downloadExport } from "../utils/exportCredentials";
+import {
+  exportBatch,
+  downloadFile,
+  allTemplates,
+  saveCustomTemplates,
+  type BatchMode,
+  type ExportTemplate,
+} from "../export";
+import TemplateEditor from "../export/TemplateEditor";
+
+type ExportFormat = "json" | "csv" | "xml" | "pdf";
 
 type VerifyState =
   | "idle"
@@ -282,7 +294,12 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
 
   // Import/Export state
   const [showImportModal, setShowImportModal] = useState(false);
-  const [exportFormat, setExportFormat] = useState<"json" | "csv" | "pdf">("json");
+  const [exportFormat, setExportFormat] = useState<ExportFormat>("json");
+  const [exportBatchMode, setExportBatchMode] = useState<BatchMode>("combined");
+  const [exportTemplates, setExportTemplates] = useState<ExportTemplate[]>(allTemplates);
+  const [exportTemplateId, setExportTemplateId] = useState("standard");
+  const [editingExportTemplate, setEditingExportTemplate] = useState(false);
+  const exportTemplate = exportTemplates.find((t) => t.id === exportTemplateId) ?? exportTemplates[0];
   const [isExporting, setIsExporting] = useState(false);
   const [selectedCredentialsForExport, setSelectedCredentialsForExport] = useState<Set<string>>(new Set());
   const [sharingCredential, setSharingCredential] = useState<Credential | null>(null);
@@ -643,7 +660,7 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
     setClaims(updated);
   };
 
-  const handleExport = async (format: "json" | "csv" | "pdf") => {
+  const handleExport = async (format: ExportFormat) => {
     try {
       setIsExporting(true);
       const credentialsToExport =
@@ -656,8 +673,16 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
         return;
       }
 
-      const result = await exportCredentialsWithProgress(credentialsToExport, format);
-      downloadExport(result.content, result.filename, result.mimeType);
+      if (format === "csv") {
+        downloadExport(exportCredentialsAsCSV(credentialsToExport), `credentials_export_${Date.now()}.csv`, "text/csv");
+      } else {
+        const network = getNetworkConfig();
+        const file = await exportBatch(credentialsToExport, format, exportTemplate, exportBatchMode, {
+          network: network.name,
+          contractId: network.credentialManagerId || undefined,
+        });
+        downloadFile(file);
+      }
       toast.success(`Successfully exported ${credentialsToExport.length} credentials as ${format.toUpperCase()}`);
       setSelectedCredentialsForExport(new Set());
     } catch (error) {
@@ -665,6 +690,24 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
     } finally {
       setIsExporting(false);
     }
+  };
+
+  const handleSaveExportTemplate = (saved: ExportTemplate) => {
+    const next = exportTemplates.some((t) => t.id === saved.id)
+      ? exportTemplates.map((t) => (t.id === saved.id ? saved : t))
+      : [...exportTemplates, saved];
+    setExportTemplates(next);
+    saveCustomTemplates(next);
+    setExportTemplateId(saved.id);
+    setEditingExportTemplate(false);
+  };
+
+  const handleDeleteExportTemplate = () => {
+    if (exportTemplate.builtIn) return;
+    const next = exportTemplates.filter((t) => t.id !== exportTemplate.id);
+    setExportTemplates(next);
+    saveCustomTemplates(next);
+    setExportTemplateId("standard");
   };
 
   const handleImportCredentials = (credentials: Credential[]) => {
@@ -867,10 +910,11 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
               📥 Import
             </button>
             {displayCredentials.length > 0 && (
-              <div style={{ display: "flex", gap: "0.25rem" }}>
+              <div style={{ display: "flex", gap: "0.25rem", flexWrap: "wrap" }}>
                 <select
                   value={exportFormat}
-                  onChange={(e) => setExportFormat(e.target.value as "json" | "csv" | "pdf")}
+                  onChange={(e) => setExportFormat(e.target.value as ExportFormat)}
+                  aria-label="Export format"
                   style={{
                     padding: "0.5rem 0.75rem",
                     fontSize: "0.85rem",
@@ -882,8 +926,35 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
                 >
                   <option value="json">JSON</option>
                   <option value="csv">CSV</option>
+                  <option value="xml">XML</option>
                   <option value="pdf">PDF</option>
                 </select>
+                {exportFormat === "pdf" && (
+                  <select
+                    className="export-select"
+                    value={exportTemplate.id}
+                    onChange={(e) => setExportTemplateId(e.target.value)}
+                    aria-label="PDF template"
+                  >
+                    {exportTemplates.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.name}
+                        {t.builtIn ? "" : " (custom)"}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {exportFormat !== "csv" && (selectedCredentialsForExport.size > 1 || (selectedCredentialsForExport.size === 0 && displayCredentials.length > 1)) && (
+                  <select
+                    className="export-select"
+                    value={exportBatchMode}
+                    onChange={(e) => setExportBatchMode(e.target.value as BatchMode)}
+                    aria-label="Batch output"
+                  >
+                    <option value="combined">Single file</option>
+                    <option value="zip">ZIP (one file each)</option>
+                  </select>
+                )}
                 <button
                   onClick={() => handleExport(exportFormat)}
                   disabled={isExporting}
@@ -902,10 +973,34 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
                 >
                   📤 Export {selectedCredentialsForExport.size > 0 ? `(${selectedCredentialsForExport.size})` : ""}
                 </button>
+                {exportFormat === "pdf" && (
+                  <button
+                    type="button"
+                    className="export-secondary"
+                    onClick={() => setEditingExportTemplate((v) => !v)}
+                    aria-expanded={editingExportTemplate}
+                  >
+                    {exportTemplate.builtIn ? "Customize template" : "Edit template"}
+                  </button>
+                )}
+                {exportFormat === "pdf" && !exportTemplate.builtIn && (
+                  <button type="button" className="export-secondary" onClick={handleDeleteExportTemplate}>
+                    Delete template
+                  </button>
+                )}
               </div>
             )}
           </div>
         </div>
+
+        {editingExportTemplate && exportFormat === "pdf" && (
+          <TemplateEditor
+            key={exportTemplate.id}
+            base={exportTemplate}
+            onSave={handleSaveExportTemplate}
+            onCancel={() => setEditingExportTemplate(false)}
+          />
+        )}
 
         {/* Subject search */}
         <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1rem" }}>

@@ -23,7 +23,7 @@ export type { ReputationRecord, ScoreHistoryEntry } from './reputation';
 //   4. Submit the fully-signed transaction:
 //        const { hash } = await client.submitSignedTransaction(signed2);
 export { BaseClient, getOrCreateServer, clearServerCache, SDK_VERSION } from './base-client';
-export type { AccountInfo } from './types';
+export type { AccountInfo, RevocationRecord } from './types';
 
 // ── Presentation ──────────────────────────────────────────────────────────────
 export { PresentationClient } from './presentation';
@@ -55,12 +55,17 @@ export {
   assertCredentialType,
   SimulationError,
   validateConfig,
+  RevocationReason,
+  revocationReasonName,
 } from './types';
 export type {
   DidDocument,
   ServiceEndpoint,
   Credential,
   RevokedCredential,
+  RevocationRecord,
+  RevocationReasonName,
+  RevokeOptions,
   CredentialType,
   CredentialListOptions,
   VerifyResult,
@@ -140,6 +145,7 @@ export {
 
 // ── Contract arg builders ─────────────────────────────────────────────────────
 export {
+  encodeRevocationReason,
   buildCreateDidArgs,
   buildUpdateDidArgs,
   buildResolveDidArgs,
@@ -169,6 +175,9 @@ export {
   buildGetRevocationsArgs,
   buildCancelActivationArgs,
   buildGetPendingActivationsArgs,
+  buildRevokeCredentialWithReasonArgs,
+  buildGetRevocationRecordArgs,
+  buildGetRevokedByReasonArgs,
 } from './contract-args';
 
 // ── OpenAPI / v1 ──────────────────────────────────────────────────────────────

@@ -24,13 +24,16 @@ import type {
   CredentialType,
   Page,
   PaginationOptions,
+  RevocationReason,
   RevokedCredential,
+  RevocationRecord,
+  RevokeOptions,
   SorobanIdentityConfig,
   SorobanResponse,
   VerifyResult,
   WriteResult,
 } from "./types";
-import { validateConfig } from "./types";
+import { validateConfig, RevocationReason } from "./types";
 import { retryWithBackoff, validateStellarAddress, pollTransactionStatus, runConcurrent } from "./utils";
 import { ContractError, SorobanIdentityError, wrapError, ClaimsValidationError } from "./errors";
 import { CREDENTIAL_MANAGER_ERRORS } from "./error-codes";
@@ -38,6 +41,9 @@ import { BaseClient } from "./base-client";
 import {
   buildIssueCredentialArgs,
   buildRevokeCredentialArgs,
+  buildRevokeCredentialWithReasonArgs,
+  buildGetRevocationRecordArgs,
+  buildGetRevokedByReasonArgs,
   buildRevokeBatchArgs,
   buildRenewCredentialArgs,
   buildVerifyCredentialArgs,
@@ -322,12 +328,16 @@ export class CredentialClient extends BaseClient {
 
   /**
    * Revoke a credential that was issued by `issuerKeypair`.
+   *
+   * Pass `options.reason` to record a standardized {@link RevocationReason}
+   * on-chain (#951); without it the contract records `Unspecified`.
    */
   async revokeCredential(
     issuerKeypair: Keypair,
     credentialId: string,
-    options?: CallOptions
+    options?: RevokeOptions
   ): Promise<SorobanResponse<RevokedCredential>> {
+    const reason = options?.reason ?? RevocationReason.Unspecified;
     const account = await this.server.getAccount(issuerKeypair.publicKey());
     const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
     const idBytes = Buffer.from(credentialId, 'hex');
@@ -337,10 +347,19 @@ export class CredentialClient extends BaseClient {
       networkPassphrase: this.config.networkPassphrase,
     })
       .addOperation(
-        this.contract.call(
-          'revoke_credential',
-          ...buildRevokeCredentialArgs({ issuer: issuerKeypair.publicKey(), credentialId: idBytes })
-        )
+        options?.reason === undefined
+          ? this.contract.call(
+              'revoke_credential',
+              ...buildRevokeCredentialArgs({ issuer: issuerKeypair.publicKey(), credentialId: idBytes })
+            )
+          : this.contract.call(
+              'revoke_credential_with_reason',
+              ...buildRevokeCredentialWithReasonArgs({
+                issuer: issuerKeypair.publicKey(),
+                credentialId: idBytes,
+                reason,
+              })
+            )
       )
       .setTimeout(timeout)
       .build();
@@ -362,7 +381,12 @@ export class CredentialClient extends BaseClient {
       const revokedAt = new Date((confirmed as { createdAt: number }).createdAt * 1000).toISOString();
 
       const credential = await this.getCredential(issuerKeypair.publicKey(), credentialId, options);
-      const revokedCredential: RevokedCredential = { ...credential, revokedAt, status: 'revoked' };
+      const revokedCredential: RevokedCredential = {
+        ...credential,
+        revokedAt,
+        status: 'revoked',
+        revocationReason: reason,
+      };
       return { data: revokedCredential, txHash };
     } catch (e) {
       throw wrapError(e);
@@ -446,7 +470,7 @@ export class CredentialClient extends BaseClient {
   async revokeBatch(
     issuerKeypair: Keypair,
     ids: string[],
-    reason: string,
+    reason: RevocationReason,
     options?: CallOptions
   ): Promise<{ txHash: string }> {
     if (ids.length > 50) {
@@ -1157,6 +1181,77 @@ export class CredentialClient extends BaseClient {
       (result as SorobanRpc.Api.SimulateTransactionSuccessResponse).result!.retval
     ) as Uint8Array[];
     return (ids ?? []).map((raw) => Buffer.from(raw).toString('hex'));
+  }
+
+  /**
+   * Get the on-chain revocation record (reason, revoker, timestamp) for a
+   * credential. Resolves to `null` when the credential has not been revoked. #951
+   */
+  async getRevocationRecord(
+    callerAddress: string,
+    credentialId: string,
+    options?: CallOptions
+  ): Promise<RevocationRecord | null> {
+    const raw = await this.simulateRead(
+      callerAddress,
+      'get_revocation_record',
+      buildGetRevocationRecordArgs({ credentialId: Buffer.from(credentialId, 'hex') }),
+      options
+    ) as { credential_id: Uint8Array; reason: number; revoked_by: string; revoked_at: bigint } | null;
+    if (!raw) return null;
+    return {
+      credentialId: Buffer.from(raw.credential_id).toString('hex'),
+      reason: Number(raw.reason) as RevocationReason,
+      revokedBy: raw.revoked_by,
+      revokedAt: Number(raw.revoked_at),
+    };
+  }
+
+  /**
+   * List the IDs of all credentials revoked for a given {@link RevocationReason}. #951
+   */
+  async getRevokedByReason(
+    callerAddress: string,
+    reason: RevocationReason,
+    options?: CallOptions
+  ): Promise<string[]> {
+    const ids = await this.simulateRead(
+      callerAddress,
+      'get_revoked_by_reason',
+      buildGetRevokedByReasonArgs({ reason }),
+      options
+    ) as Uint8Array[] | null;
+    return (ids ?? []).map((id) => Buffer.from(id).toString('hex'));
+  }
+
+  /** Simulate a read-only contract call and return the decoded return value. */
+  private async simulateRead(
+    callerAddress: string,
+    method: string,
+    args: ReturnType<typeof buildGetRevokedByReasonArgs>,
+    options?: CallOptions
+  ): Promise<unknown> {
+    validateStellarAddress(callerAddress);
+    const account = new Account(callerAddress, "0");
+    const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(this.contract.call(method, ...args))
+      .setTimeout(timeout)
+      .build();
+
+    const result = await retryWithBackoff(() => this.server.simulateTransaction(tx));
+    if (SorobanRpc.Api.isSimulationError(result)) {
+      const errMsg = result.error ?? '';
+      const contractErr = ContractError.extract(errMsg, CREDENTIAL_MANAGER_ERRORS);
+      if (contractErr) throw contractErr;
+      throw new SorobanIdentityError(`Simulation failed: ${errMsg}`, 'CONTRACT_ERROR');
+    }
+    return scValToNative(
+      (result as SorobanRpc.Api.SimulateTransactionSuccessResponse).result!.retval
+    );
   }
 
   /**

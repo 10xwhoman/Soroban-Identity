@@ -52,3 +52,7 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
+# #949: strip symbols and debug info so less WASM is uploaded on deployment.
+debug = 0
+debug-assertions = false
+strip = "symbols"
