@@ -3583,42 +3583,42 @@ mod tests {
 
     /// Ring-buffer eviction: when issuer index reaches MAX_ISSUER_CREDS,
     /// issuing the (MAX_ISSUER_CREDS + 1)th credential drops the oldest entry.
+    ///
+    /// The index is seeded directly in storage: issuing 10 000 real
+    /// credentials takes the better part of an hour in the test host.
     #[test]
     fn test_issuer_credentials_ring_buffer_eviction() {
         let (env, _admin, client) = setup();
-        // Issuing MAX_ISSUER_CREDS credentials exceeds the default test budget.
         env.budget().reset_unlimited();
         let issuer = Address::generate(&env);
         client.add_issuer(&issuer);
 
-        let mut first_id = None;
-        for i in 0..MAX_ISSUER_CREDS {
-            let subject = Address::generate(&env);
-            let id = issue_kyc(&env, &client, &issuer, &subject);
-            if i == 0 {
-                first_id = Some(id);
+        let seeded_id = |i: u32| {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&i.to_be_bytes());
+            BytesN::from_array(&env, &bytes)
+        };
+        env.as_contract(&client.address, || {
+            let mut index = Vec::new(&env);
+            for i in 0..MAX_ISSUER_CREDS {
+                index.push_back(seeded_id(i));
             }
-        }
+            env.storage()
+                .persistent()
+                .set(&CredentialManager::issuer_creds_key(&issuer), &index);
+        });
+        assert_eq!(client.get_issuer_credentials(&issuer).len(), MAX_ISSUER_CREDS);
 
-        let creds_before = client.get_issuer_credentials(&issuer);
-        assert_eq!(creds_before.len(), MAX_ISSUER_CREDS as u32);
-
-        let new_subject = Address::generate(&env);
-        let _new_id = issue_kyc(&env, &client, &issuer, &new_subject);
+        let new_id = issue_kyc(&env, &client, &issuer, &Address::generate(&env));
 
         let creds_after = client.get_issuer_credentials(&issuer);
-        assert_eq!(creds_after.len(), MAX_ISSUER_CREDS as u32);
-
-        if let Some(first) = first_id {
-            let mut found = false;
-            for cred_id in creds_after.iter() {
-                if cred_id == first {
-                    found = true;
-                    break;
-                }
-            }
-            assert!(!found, "First credential ID should have been evicted from the index");
-        }
+        assert_eq!(creds_after.len(), MAX_ISSUER_CREDS);
+        assert_eq!(creds_after.get(0).unwrap(), seeded_id(1));
+        assert_eq!(creds_after.last().unwrap(), new_id);
+        assert!(
+            !creds_after.contains(&seeded_id(0)),
+            "First credential ID should have been evicted from the index"
+        );
     }
 
     // ── Credential type registry tests (#656) ───────────────────────────────
