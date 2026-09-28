@@ -1985,6 +1985,18 @@
       }
     },
     "schemas": {
+      "PaginationMeta": {
+        "type": "object",
+        "description": "Standard pagination metadata on every paginated list response (#958).",
+        "required": ["total_count", "page_size", "has_more", "next_cursor", "previous_cursor"],
+        "properties": {
+          "total_count": { "type": "integer", "nullable": true, "description": "Items matching the query across all pages." },
+          "page_size": { "type": "integer", "description": "Maximum number of items in this page." },
+          "has_more": { "type": "boolean", "description": "Whether another page exists in the direction of travel." },
+          "next_cursor": { "type": "string", "nullable": true, "description": "Opaque cursor for the next page; pass back as ?cursor=." },
+          "previous_cursor": { "type": "string", "nullable": true, "description": "Opaque cursor for the previous page." }
+        }
+      },
       "Credential": {
         "type": "object",
         "required": ["id", "subject", "issuer"],

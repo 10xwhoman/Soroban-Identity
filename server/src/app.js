@@ -23,6 +23,13 @@ import {
 } from "./storage.js";
 import { findExpiringCredentials, paginate } from "./expiry.js";
 import {
+  buildPaginationMeta,
+  decodeOffsetCursor,
+  paginateArray,
+  resolvePageSize,
+  setPaginationHeaders,
+} from "./routes/pagination.js";
+import {
   createWebhookRecord,
   deleteWebhookRecord,
   getWebhookRecord,
@@ -80,7 +87,7 @@ import { handleEventsRequest } from "./sse.js";
 import { handleLongPollRequest } from "./long-poll.js";
 import { logger } from "./logger.js";
 import { AnalyticsService, detectCountry } from "./analytics.js";
-import { TieredRateLimiter } from "./rate-limiter.js";
+import { createRateLimiter } from "./middleware/ratelimit.js";
 import { ApiKeyService } from "./api-keys.js";
 import { EmailTransport } from "./email.js";
 import { pickQuotaBinding, QuotaTracker, notifyQuotaThresholdOwner } from "./quota.js";
@@ -140,13 +147,9 @@ export function createApp({
 
   // One limiter per app instance, so its buckets live as long as the server
   // rather than being rebuilt per request.
-  const limiter =
-    rateLimiter ??
-    new TieredRateLimiter({
-      whitelist: config.rateLimitWhitelist ?? [],
-      trustProxy: config.trustProxy ?? false,
-      maxBuckets: config.rateLimitMaxBuckets ?? 10000,
-    });
+  // #956: per-IP, per-user, endpoint and tier budgets with burst allowance
+  // and premium bypass. A caller-supplied limiter only needs a check() method.
+  const limiter = rateLimiter ?? createRateLimiter(config, { metrics });
 
   // One quota tracker per app instance (#748), independent of the rate
   // limiter above: it counts against calendar day/month budgets rather than
@@ -408,7 +411,7 @@ export function createApp({
       const rateResult = limiter.check(req, url.pathname);
 
       if (rateResult.whitelisted) {
-        res.setHeader("X-RateLimit-Bypass", "whitelist");
+        res.setHeader("X-RateLimit-Bypass", rateResult.bypass ?? "whitelist");
       } else {
         // Report whichever budget is closest to exhaustion, so a client sees
         // the limit that will actually stop it first.
@@ -417,8 +420,12 @@ export function createApp({
         res.setHeader("X-RateLimit-Limit", String(reported.limit));
         res.setHeader("X-RateLimit-Remaining", String(reported.remaining));
         res.setHeader("X-RateLimit-Reset", String(reported.resetAt));
-        if (rateResult.scope === "endpoint" || rateResult.endpoint?.rule) {
-          res.setHeader("X-RateLimit-Scope", rateResult.scope === "endpoint" ? "endpoint" : "tier");
+        if (!rateResult.allowed) {
+          res.setHeader("X-RateLimit-Scope", rateResult.scope);
+        } else if (reported.rule === "ip" || reported.rule === "user") {
+          res.setHeader("X-RateLimit-Scope", reported.rule);
+        } else if (rateResult.endpoint?.rule) {
+          res.setHeader("X-RateLimit-Scope", "tier");
         }
       }
 
@@ -428,6 +435,19 @@ export function createApp({
         // An endpoint denial is not a tier problem, so it must not be dressed
         // up as one — upgrading would not raise a per-endpoint limit.
         const isEndpointDenial = rateResult.scope === "endpoint";
+        // Per-IP and per-user denials are abuse controls, not tier limits.
+        const isClientDenial = rateResult.scope === "ip" || rateResult.scope === "user";
+
+        if (isClientDenial) {
+          return sendJson(res, 429, {
+            error: "rate_limit_exceeded",
+            code: "RATE_LIMIT_EXCEEDED",
+            scope: rateResult.scope,
+            message: `Too many requests from this ${rateResult.scope === "ip" ? "IP address" : "account"}. Retry in ${rateResult.retryAfter}s.`,
+            limit: rateResult.limit,
+            retryAfter: rateResult.retryAfter,
+          });
+        }
 
         if (!isEndpointDenial && rateResult.tier === "free") {
           res.setHeader(
@@ -708,7 +728,16 @@ export function createApp({
           const { items, nextCursor, previousCursor, pagination } = cursorPage(credentials, {
             limit: limitNum,
             cursor: validated.data.query.cursor ?? null,
-            direction: validated.data.query.direction ?? "next",
+            direction,
+          });
+          // #958: has_more follows the direction of travel.
+          const pagination = buildPaginationMeta({
+            totalCount: credentials.length,
+            pageSize: Math.min(200, Math.max(1, limitNum)),
+            hasMore: direction === "prev" ? Boolean(previousCursor) : Boolean(nextCursor),
+            nextCursor,
+            previousCursor,
+            extraLinkParams: { prev: { direction: "prev" } },
           });
           setPaginationHeaders(res, url, pagination);
           return sendFormatted(req, res, 200, { items, nextCursor, pagination });
@@ -1279,7 +1308,6 @@ export function createApp({
           if (!await requireAuth(req, res, config, ['admin:read'])) return;
           const validated = validateRequest(res, schemas.webhookLogsQuery, { query: url.searchParams });
           if (!validated.ok) return;
-          const limit = validated.data.query.limit ?? 50;
           const webhookId = validated.data.query.webhookId ?? null;
           const allLogs = await readWebhookLogs(config, { webhookId, limit: null });
           const { items: logs, pagination } = offsetPage(allLogs, {
@@ -1559,7 +1587,12 @@ export function createApp({
         if (req.method === "GET" && url.pathname === "/admin/api-keys") {
           if (!await requireAuth(req, res, config, ['admin:read'])) return;
           const keys = await apiKeyService.listKeys();
-          return sendJson(res, 200, { keys });
+          const page = paginateArray(keys, {
+            pageSize: url.searchParams.get("limit"),
+            cursor: url.searchParams.get("cursor"),
+          });
+          setPaginationHeaders(res, url, page.meta);
+          return sendJson(res, 200, { keys: page.items, pagination: page.meta });
         }
 
         const apiKeyIdMatch = url.pathname.match(/^\/admin\/api-keys\/([^/]+)$/);
