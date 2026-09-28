@@ -245,6 +245,33 @@ export interface RevokeOptions extends CallOptions {
   reason?: RevocationReason;
 }
 
+export type RevocationReason =
+  | "Unspecified"
+  | "Compromised"
+  | "Expired"
+  | "Superseded"
+  | "IssuerRevoked"
+  | "SubjectRequest"
+  | "PolicyViolation";
+
+export const REVOCATION_REASONS: RevocationReason[] = [
+  "Unspecified",
+  "Compromised",
+  "Expired",
+  "Superseded",
+  "IssuerRevoked",
+  "SubjectRequest",
+  "PolicyViolation",
+];
+
+export interface RevocationRecord {
+  credentialId: string; // hex
+  issuer: string;
+  reason: RevocationReason;
+  revokedAt: number;
+}
+
+export type VerifyFailReason = "not_found" | "revoked" | "expired" | "unknown";
 /**
  * Reason a credential is invalid. Returned in {@link VerifyResult}.
  *

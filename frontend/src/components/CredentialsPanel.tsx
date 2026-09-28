@@ -1,3 +1,15 @@
+import { useState } from "react";
+import type { CredentialType, RevocationReason } from "../../../sdk/src/types";
+import { REVOCATION_REASONS } from "../../../sdk/src/types";
+import { exportCredentials, type ExportFormat } from "../export";
+import type { WalletState } from "../hooks/useWallet";
+
+interface Props {
+  wallet: WalletState & {
+    connect: () => void;
+    signTransaction: (xdr: string) => Promise<string>;
+  };
+}
 import { useState, useEffect, useReducer, useRef } from "react";
 import { StrKey, SorobanRpc, TransactionBuilder, BASE_FEE, nativeToScVal, Contract, scValToNative } from '@stellar/stellar-sdk';
 import type { CredentialType, Credential, VerifyResult } from "../../../sdk/src/types";
@@ -268,6 +280,14 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
   const [isIssuer, setIsIssuer] = useState(false);
   const [checkingIssuer, setCheckingIssuer] = useState(false);
 
+  const [revokeId, setRevokeId] = useState("");
+  const [revokeReason, setRevokeReason] = useState<RevocationReason>("Compromised");
+  const [revokeResult, setRevokeResult] = useState<string | null>(null);
+
+  const filteredCredentials =
+    activeFilter === "All"
+      ? MOCK_CREDENTIALS
+      : MOCK_CREDENTIALS.filter((c) => c.credentialType === activeFilter);
   const [searchAddress, setSearchAddress] = useState("");
   const [lastCheckedAt, setLastCheckedAt] = useState<number | null>(null);
   const [verifyCheckedAt, setVerifyCheckedAt] = useState<number | null>(null);
@@ -855,6 +875,17 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
     }
   };
 
+  const handleRevoke = async () => {
+    if (!wallet.connected || !revokeId.trim()) return;
+    // TODO: build tx via CredentialClient.revokeCredential(), sign via wallet.signTransaction(), submit
+    setRevokeResult(`Credential ${revokeId} revoked (reason: ${revokeReason}).`);
+  };
+
+  const handleExport = (format: ExportFormat) =>
+    exportCredentials(filteredCredentials, format).catch((e) =>
+      alert(`Export failed: ${e instanceof Error ? e.message : String(e)}`)
+    );
+
   return (
     <>
       {/* Filter bar */}
@@ -1334,6 +1365,15 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
             ✓ {importedCount} credential{importedCount > 1 ? "s" : ""} imported.
           </p>
         )}
+        {filteredCredentials.length > 0 && (
+          <div style={{ display: "flex", gap: "0.5rem", marginTop: "1rem" }}>
+            {(["pdf", "json", "xml"] as ExportFormat[]).map((f) => (
+              <button key={f} onClick={() => handleExport(f)}>
+                Export {f.toUpperCase()}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="card">
@@ -1498,6 +1538,36 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
         {!issuing && issueResult && <pre className="result">{issueResult}</pre>}
       </div>
 
+      <div className="card">
+        <h2>Revoke Credential</h2>
+        {wallet.connected ? (
+          <>
+            <input
+              placeholder="Credential ID (hex)"
+              value={revokeId}
+              onChange={(e) => setRevokeId(e.target.value)}
+            />
+            <select
+              value={revokeReason}
+              onChange={(e) => setRevokeReason(e.target.value as RevocationReason)}
+            >
+              {REVOCATION_REASONS.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+            <button onClick={handleRevoke} disabled={!revokeId}>
+              Revoke
+            </button>
+          </>
+        ) : (
+          <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
+            Connect your wallet to revoke credentials you issued.
+          </p>
+        )}
+        {revokeResult && <pre className="result">{revokeResult}</pre>}
+      </div>
       {/* Import Modal */}
       {showImportModal && (
         <CredentialImport

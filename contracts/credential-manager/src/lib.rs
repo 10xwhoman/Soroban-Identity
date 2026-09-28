@@ -14,6 +14,10 @@ use soroban_sdk::{
 };
 use versions::{CredentialVersion, MAX_VERSION_HISTORY};
 
+mod types;
+pub use types::{RevocationReason, RevocationRecord};
+
+// ── Storage keys ──────────────────────────────────────────────────────────────
 pub const CONTRACT_VERSION: u32 = 1;
 const EVENT_VERSION: u32 = 1;
 
@@ -1115,6 +1119,14 @@ impl CredentialManager {
         env.storage().persistent().get(&(CRL_ROOT, issuer, period)).unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
     }
 
+    /// Revoke a credential. Only the original issuer can revoke.
+    pub fn revoke_credential(
+        env: Env,
+        issuer: Address,
+        credential_id: BytesN<32>,
+        reason: RevocationReason,
+    ) {
+        issuer.require_auth();
     /// Builds a proof for `credential_id` from the stored leaves in its CRL period.
     pub fn get_revocation_merkle_proof(
         env: Env,
@@ -1214,6 +1226,57 @@ impl CredentialManager {
         cred.revoked = true;
         env.storage().persistent().set(&key, &cred);
         Self::store_revocation(&env, &cred, &issuer, &credential_id, &reason);
+
+        let record = RevocationRecord {
+            credential_id: credential_id.clone(),
+            issuer,
+            reason,
+            revoked_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&Self::revocation_key(&credential_id), &record);
+
+        let reason_key = Self::reason_key(reason);
+        let mut ids: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&reason_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        ids.push_back(credential_id.clone());
+        env.storage().persistent().set(&reason_key, &ids);
+
+        env.events()
+            .publish((CRED, symbol_short!("revoked")), (credential_id, reason));
+    }
+
+    /// Get the revocation record for a credential, if revoked.
+    pub fn get_revocation(env: Env, credential_id: BytesN<32>) -> Option<RevocationRecord> {
+        env.storage().persistent().get(&Self::revocation_key(&credential_id))
+    }
+
+    /// List credential IDs revoked for a given reason.
+    pub fn get_revocations_by_reason(env: Env, reason: RevocationReason) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&Self::reason_key(reason))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Verify a credential is valid (not revoked, not expired).
+    pub fn verify_credential(env: Env, credential_id: BytesN<32>) -> bool {
+        let key = Self::cred_key(&credential_id);
+        match env.storage().persistent().get::<(Symbol, BytesN<32>), Credential>(&key) {
+            None => false,
+            Some(cred) => {
+                if cred.revoked {
+                    return false;
+                }
+                if cred.expires_at > 0 && env.ledger().timestamp() > cred.expires_at {
+                    return false;
+                }
+                true
+            }
+        }
+    }
 
         let mut revocations = Self::fetch_revocations(&env, &issuer, &cred.subject);
         revocations.push_back(credential_id.clone());
@@ -2633,6 +2696,16 @@ impl CredentialManager {
         (CRED, id.clone())
     }
 
+    fn revocation_key(id: &BytesN<32>) -> (Symbol, BytesN<32>) {
+        (symbol_short!("rvk"), id.clone())
+    }
+
+    fn reason_key(reason: RevocationReason) -> (Symbol, u32) {
+        (symbol_short!("rvkrsn"), reason as u32)
+    }
+
+    fn subject_key(subject: &Address) -> (Symbol, Address) {
+        (symbol_short!("sub"), subject.clone())
     fn nonce_key(
         env: &Env,
         issuer: &Address,
@@ -3674,6 +3747,8 @@ mod tests {
         let subject = Address::generate(&env);
         client.add_issuer(&issuer);
 
+        // issuer2 attempts to revoke a credential they did not issue
+        client.revoke_credential(&issuer2, &cred_id, &RevocationReason::Compromised);
         let schema_hash = client.compute_claims_schema_hash(&kyc_claims(&env));
         let name = String::from_str(&env, "kyc-basic");
         client.register_credential_type(&admin, &name, &schema_hash, &Map::new(&env));

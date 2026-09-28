@@ -7,6 +7,14 @@ import {
   nativeToScVal,
   scValToNative,
 } from "@stellar/stellar-sdk";
+import type {
+  Credential,
+  CredentialType,
+  RevocationReason,
+  SorobanIdentityConfig,
+  VerifyResult,
+} from "./types";
+import { REVOCATION_REASONS } from "./types";
 import { createHash } from "node:crypto";
 import type {
   CallOptions,
@@ -569,6 +577,14 @@ export class CredentialClient extends BaseClient {
   }
 
   /**
+   * Revoke a credential with a standardized reason. Only the original issuer can revoke.
+   */
+  async revokeCredential(
+    issuerKeypair: Keypair,
+    credentialId: string,
+    reason: RevocationReason = "Unspecified"
+  ): Promise<void> {
+    const account = await this.server.getAccount(issuerKeypair.publicKey());
    * Return the credential IDs of all pending time-locked credentials for a
    * subject — those whose `activation_time` is set, still in the future, and
    * not yet cancelled. #731
@@ -596,6 +612,27 @@ export class CredentialClient extends BaseClient {
     })
       .addOperation(
         this.contract.call(
+          "revoke_credential",
+          nativeToScVal(issuerKeypair.publicKey(), { type: "address" }),
+          nativeToScVal(Buffer.from(credentialId, "hex"), { type: "bytes" }),
+          nativeToScVal(REVOCATION_REASONS.indexOf(reason), { type: "u32" })
+        )
+      )
+      .setTimeout(this.config.txTimeout ?? 30)
+      .build();
+
+    const prepared = await this.server.prepareTransaction(tx);
+    prepared.sign(issuerKeypair);
+    const result = await this.server.sendTransaction(prepared);
+    if (result.status !== "PENDING") {
+      throw new Error(`Transaction failed: ${result.status}`);
+    }
+    await this.waitForConfirmation(result.hash);
+  }
+
+  /**
+   * Verify a credential is valid (not revoked, not expired).
+   * Returns a typed result so callers can distinguish failure reasons.
           'get_pending_activations',
           ...buildGetPendingActivationsArgs({ subject: subjectAddress })
         )

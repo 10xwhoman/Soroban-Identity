@@ -70,7 +70,12 @@ export type {
   CredentialListOptions,
   VerifyResult,
   VerifyFailReason,
+  RevocationReason,
+  RevocationRecord,
   SorobanIdentityConfig,
+} from "./types";
+export { REVOCATION_REASONS } from "./types";
+export type { ReputationRecord, ScoreHistoryEntry } from "./reputation";
   SorobanIdentityLogger,
   CallOptions,
   IdentityStorageStats,

@@ -32,6 +32,8 @@
     "qrcode.react": "^4.2.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
+    "jspdf": "^2.5.1",
+    "qrcode": "^1.5.3"
     "react-i18next": "^17.0.4",
     "recharts": "^3.8.1"
   },
