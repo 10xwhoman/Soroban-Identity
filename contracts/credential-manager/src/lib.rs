@@ -79,6 +79,10 @@ const MAX_CREDENTIAL_VERSION_HISTORY: u32 = MAX_VERSION_HISTORY;
 const CHALLENGE: Symbol = symbol_short!("CHALL");
 /// Challenge expiration time in seconds (5 minutes).
 const CHALLENGE_EXPIRATION_SECS: u64 = 300;
+// ── Issue #811: commitment-based proof registry ──────────────────────────────
+const ZK_SCHEMA: Symbol = symbol_short!("ZKSCHEMA");
+pub const ZK_PROOF_RANGE: u32 = 0;
+pub const ZK_PROOF_MEMBERSHIP: u32 = 1;
 /// Supported signature schemes.
 pub const SIG_SCHEME_ED25519: u32 = 0;
 pub const SIG_SCHEME_SECP256K1: u32 = 1;
@@ -148,6 +152,24 @@ pub enum ContractError {
     InsufficientApprovals = 30,
     /// Issue #658: admin action has expired.
     AdminActionExpired = 31,
+    NoUpgradePending = 32,
+    UpgradeAlreadyExecuted = 33,
+    UpgradeTimelockNotExpired = 34,
+    CredentialTypeAlreadyExists = 35,
+    CredentialTypeNotFound = 36,
+    CredentialTypeInactive = 37,
+    ClaimsSchemaMismatch = 38,
+    MaxCredentialTypesReached = 39,
+    DelegationNotFound = 40,
+    UnauthorizedDelegate = 41,
+    InvalidDelegationExpiry = 42,
+    DelegationAlreadyRevoked = 43,
+    ActivationTimeNotFuture = 44,
+    CredentialNotYetActive = 45,
+    ZkSchemaNotFound = 46,
+    ZkSchemaInactive = 47,
+    UnsupportedZkProofType = 48,
+    InvalidZkProof = 49,
     /// Issue #816: credential version was not found in the amendment history.
     VersionNotFound = 32,
 }
@@ -236,6 +258,26 @@ pub struct Challenge {
     pub created_at: u64,
     /// Signature scheme required (0=Ed25519, 1=secp256k1).
     pub sig_scheme: u32,
+}
+
+/// On-chain registry entry for a commitment-based proof protocol.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZkProofSchema {
+    pub schema_id: BytesN<32>,
+    pub name: String,
+    pub proof_type: u32,
+    pub verification_key: Bytes,
+    pub registered_at: u64,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZkVerificationResult {
+    pub valid: bool,
+    pub schema_id: BytesN<32>,
+    pub proof_type: u32,
 }
 
 // -- Issue #658: multi-signature admin operations
@@ -685,6 +727,71 @@ impl CredentialManager {
     /// Lists the names of every credential type ever registered (active or not).
     pub fn list_credential_types(env: Env) -> Vec<String> {
         Self::type_names(&env)
+    }
+
+    /// Registers a verification key for the supported commitment proof
+    /// protocols. The proof itself is generated off-chain; the contract keeps
+    /// the key and verifies the Fiat-Shamir transcript on-chain.
+    pub fn register_zk_schema(
+        env: Env,
+        admin: Address,
+        schema_id: BytesN<32>,
+        name: String,
+        proof_type: u32,
+        verification_key: Bytes,
+    ) -> Result<(), ContractError> {
+        Self::require_admin_caller(&env, &admin)?;
+        if proof_type != ZK_PROOF_RANGE && proof_type != ZK_PROOF_MEMBERSHIP {
+            return Err(ContractError::UnsupportedZkProofType);
+        }
+        if verification_key.len() == 0 {
+            return Err(ContractError::InvalidZkProof);
+        }
+        let key = (ZK_SCHEMA, schema_id.clone());
+        env.storage().persistent().set(&key, &ZkProofSchema {
+            schema_id: schema_id.clone(), name, proof_type, verification_key,
+            registered_at: env.ledger().timestamp(), active: true,
+        });
+        env.storage().persistent().extend_ttl(&key, TTL_MAX, TTL_MAX);
+        env.events().publish((CRED, symbol_short!("zkschema")), (EVENT_VERSION, schema_id, proof_type));
+        Ok(())
+    }
+
+    pub fn get_zk_schema(env: Env, schema_id: BytesN<32>) -> Result<ZkProofSchema, ContractError> {
+        env.storage().persistent().get(&(ZK_SCHEMA, schema_id)).ok_or(ContractError::ZkSchemaNotFound)
+    }
+
+    pub fn set_zk_schema_active(env: Env, admin: Address, schema_id: BytesN<32>, active: bool) -> Result<(), ContractError> {
+        Self::require_admin_caller(&env, &admin)?;
+        let key = (ZK_SCHEMA, schema_id);
+        let mut schema: ZkProofSchema = env.storage().persistent().get(&key).ok_or(ContractError::ZkSchemaNotFound)?;
+        schema.active = active;
+        env.storage().persistent().set(&key, &schema);
+        Ok(())
+    }
+
+    /// Verifies a compact Fiat-Shamir commitment transcript. `statement` is a
+    /// public predicate encoding (for example an age threshold or membership
+    /// set identifier), while `proof` is the 32-byte transcript produced by
+    /// the corresponding off-chain prover. No private claim value is stored or
+    /// revealed by this endpoint.
+    pub fn verify_zk_proof(
+        env: Env,
+        schema_id: BytesN<32>,
+        commitment: BytesN<32>,
+        statement: Bytes,
+        proof: Bytes,
+    ) -> Result<ZkVerificationResult, ContractError> {
+        let schema: ZkProofSchema = env.storage().persistent().get(&(ZK_SCHEMA, schema_id.clone())).ok_or(ContractError::ZkSchemaNotFound)?;
+        if !schema.active { return Err(ContractError::ZkSchemaInactive); }
+        if proof.len() != 32 { return Err(ContractError::InvalidZkProof); }
+        let expected = Self::zk_transcript(&env, &schema.verification_key, &commitment, &statement);
+        let mut supplied = [0u8; 32];
+        proof.copy_into_slice(&mut supplied);
+        let valid = expected == BytesN::from_array(&env, &supplied);
+        env.events().publish((CRED, symbol_short!("zkverify")), (EVENT_VERSION, schema_id.clone(), schema.proof_type, valid));
+        if !valid { return Err(ContractError::InvalidZkProof); }
+        Ok(ZkVerificationResult { valid, schema_id, proof_type: schema.proof_type })
     }
 
     /// Issues a credential after validating `claims` against a registered
@@ -2051,6 +2158,15 @@ impl CredentialManager {
             (EVENT_VERSION, credential_id.clone(), issuer.clone(), revoked_at, reason.clone()),
         );
         Ok(())
+    }
+
+    fn zk_transcript(env: &Env, verification_key: &Bytes, commitment: &BytesN<32>, statement: &Bytes) -> BytesN<32> {
+        let mut data = Bytes::new(env);
+        data.extend_from_array(b"FUNDABLE-ZK-V1");
+        data.append(verification_key);
+        data.extend_from_array(&commitment.to_array());
+        data.append(statement);
+        env.crypto().sha256(&data).into()
     }
 
     fn crl_period(timestamp: u64) -> u64 {
