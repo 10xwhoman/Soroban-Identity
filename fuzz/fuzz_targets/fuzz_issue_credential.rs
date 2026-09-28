@@ -12,7 +12,9 @@
 #![no_main]
 
 use arbitrary::Arbitrary;
-use credential_manager::{CredentialManager, CredentialManagerClient, CredentialType};
+use credential_manager::{
+    CredentialManager, CredentialManagerClient, CredentialType, RevocationReason,
+};
 use identity_registry::{IdentityRegistry, IdentityRegistryClient};
 use soroban_sdk::{
     testutils::Address as _,
@@ -115,7 +117,11 @@ libfuzzer_sys::fuzz_target!(|input: IssueCredentialInput| {
 
         // Optionally revoke
         if input.do_revoke {
-            let _ = cred_client.try_revoke_credential(&issuer, &credential_id);
+            let _ = cred_client.try_revoke_credential(
+                &issuer,
+                &credential_id,
+                &RevocationReason::Compromised,
+            );
 
             // After revocation, verify should indicate revoked status
             let verify_result = cred_client.try_verify_credential(&credential_id);

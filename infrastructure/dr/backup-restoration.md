@@ -1,121 +1,112 @@
-# Backup Restoration
+# Backup Restoration Procedures
 
-How to get data back from a backup during a DR event. Backup creation itself is
-covered in [docs/backup-restore.md](../../docs/backup-restore.md).
+This covers each data store: what is backed up, where the backups live, and how to restore them. For the mechanics of the backup scripts themselves, see [docs/backup-restore.md](../../docs/backup-restore.md).
 
-## What gets backed up, and where it goes
+## Backup inventory
 
-`scripts/backup.sh` writes a single `soroban-identity-backup-<UTC>.tar.gz`
-archive with this layout:
+| Store | Backup | Frequency | Location | Retention |
+| --- | --- | --- | --- | --- |
+| Data directory (`DATA_DIR`) plus Redis dump plus env config | `scripts/backup.sh` archive (`soroban-identity-backup-<ts>.tar.gz`) | Hourly (`backup-and-ship.sh`) | `s3://$DR_BACKUP_BUCKET_PRIMARY/archives/`, replicated to `s3://$DR_BACKUP_BUCKET_SECONDARY/archives/` | 30 days local. S3 lifecycle: 35 days |
+| Redis (standalone or self-hosted) | `infrastructure/backup/backup.sh` (`redis-<host>-<ts>.rdb.gz`) | Daily at 02:00 UTC | `s3://$S3_BUCKET/db-backups/` | 30 days |
+| ElastiCache | Automatic snapshots | Daily | AWS-managed, per region | 7 days (`snapshot_retention_limit`) |
+| Terraform state | S3 versioned bucket | Every apply | State bucket | Versioned |
 
-```
-manifest.json      what was captured, when, from which host
-data/              the full DATA_DIR (credentials, webhooks, logs, API keys, audit)
-config/            env files present on the host
-redis-dump.rdb     Redis snapshot (only when --redis-url was given)
-```
+## Before any restore
 
-[`scripts/ship-backup.sh`](scripts/ship-backup.sh) wraps it and uploads the
-archive to the DR bucket:
+1. **Pick the recovery point.** Use the newest archive unless the incident is data corruption. For corruption, pick the last archive taken before it started (check `manifest.json` → `created_at`).
+2. **Stop writers.** Scale the target ECS service to 0, or put the API into maintenance, so nothing writes to the data directory mid-restore.
+3. **Record the time** you started. The RTO measurement starts at the disaster declaration, but log each step's timing as you go.
 
-| Bucket | Region | Purpose |
-| --- | --- | --- |
-| `soroban-identity-dr-backups-us-east-1` | us-east-1 | Primary: every archive is uploaded here |
-| `soroban-identity-dr-backups-us-west-2` | us-west-2 | Replica: S3 Replication Time Control, 15-min SLA |
-
-Both buckets have versioning on, encryption with KMS, all public access
-blocked, and a 90-day expiry for noncurrent versions. The replica also has
-Object Lock (governance mode, 30 days), so a compromised primary account cannot
-delete it. They are defined in [terraform/backups.tf](terraform/backups.tf).
-
-Schedule: hourly, from a scheduled ECS task or the host crontab:
-
-```cron
-0 * * * *  /opt/soroban-identity/infrastructure/dr/scripts/ship-backup.sh >> /var/log/dr-backup.log 2>&1
-```
-
-## Choosing a backup
+## 1. Fetch the archive
 
 ```bash
-# Latest archive in the region you are restoring into
-aws s3api list-objects-v2 --bucket soroban-identity-dr-backups-us-west-2 \
-  --prefix archives/ --query 'sort_by(Contents,&LastModified)[-1].Key' --output text
-
-# Everything from the last 24 h, when you need to go back to before a corruption
-aws s3api list-objects-v2 --bucket soroban-identity-dr-backups-us-west-2 --prefix archives/ \
-  --query "Contents[?LastModified>='$(date -u -d '-24 hours' +%Y-%m-%dT%H:%M:%S)'].[Key,LastModified]" --output table
+export AWS_REGION=us-west-2                      # region you are restoring INTO
+BUCKET="$DR_BACKUP_BUCKET_SECONDARY"             # or _PRIMARY if the primary region is healthy
+LATEST=$(aws s3 ls "s3://$BUCKET/archives/" | awk '{print $4}' | grep '\.tar\.gz$' | sort | tail -n1)
+aws s3 cp "s3://$BUCKET/archives/$LATEST" /tmp/restore/
+aws s3 cp "s3://$BUCKET/archives/$LATEST.sha256" - | (cd /tmp/restore && sha256sum -c -)
+mkdir -p /tmp/restore/staging && tar -xzf "/tmp/restore/$LATEST" -C /tmp/restore/staging   # inspect manifest.json
 ```
 
-For **data corruption**, pick the newest archive taken *before* the corrupting
-event. Use the audit log (`GET /admin/audit-logs`) or the `manifest.json`
-timestamps to find that point. Always run a dry-run first:
+## 2. Restore the data directory
+
+Run this from an ops host (or a one-off ECS task) that has the target region's data volume mounted at `$DR_DATA_DIR`:
 
 ```bash
-aws s3 cp s3://soroban-identity-dr-backups-us-west-2/archives/<key> /tmp/restore.tar.gz
-scripts/restore.sh /tmp/restore.tar.gz --dry-run
+scripts/restore.sh "/tmp/restore/$LATEST" --data-dir "$DR_DATA_DIR" --dry-run   # inspect first
+scripts/restore.sh "/tmp/restore/$LATEST" --data-dir "$DR_DATA_DIR" --force --config-dir /tmp/restore/config
 ```
 
-## Restoring the data directory
+`--force` moves the existing contents aside to `<data-dir>.pre-restore-<ts>` instead of deleting them. Keep that directory until the recovery is verified.
 
-Automated path, which also brings the service up:
+**Verify:** each JSON file under `$DR_DATA_DIR` parses (`find "$DR_DATA_DIR" -name '*.json' -exec jq empty {} +`). Record the credential count (`jq length "$DR_DATA_DIR/credentials.json"`); step 5 checks it again through the API.
+
+## 3. Restore Redis
+
+Redis holds caches, counters, and queues. It can be rebuilt, so **skip this step when meeting the RTO is at risk.** The service starts with a cold cache and empty queues. Replay any jobs that were lost from the webhook and notification logs.
+
+**ElastiCache in the same region** (for example, after data corruption): recreate the replication group from the latest automatic snapshot.
 
 ```bash
-infrastructure/dr/scripts/recover.sh --region us-west-2 --data-dir /mnt/soroban-data
+SNAP=$(aws elasticache describe-snapshots --region "$AWS_REGION" \
+  --replication-group-id soroban-identity-production --query 'Snapshots[-1].SnapshotName' --output text)
+aws elasticache create-replication-group --region "$AWS_REGION" \
+  --replication-group-id soroban-identity-production-restored \
+  --replication-group-description "restored from $SNAP" --snapshot-name "$SNAP" \
+  --cache-node-type cache.r7g.large --engine redis --transit-encryption-enabled --at-rest-encryption-enabled
 ```
 
-Manual path:
-
-1. Stop writers. Scale the ECS service to 0, or stop the server process, so
-   nothing writes while you restore.
-2. Download the archive (see above) and verify it:
-   `gzip -t /tmp/restore.tar.gz && tar -tzf /tmp/restore.tar.gz manifest.json`.
-3. Restore:
-   `scripts/restore.sh /tmp/restore.tar.gz --data-dir "$DATA_DIR" --force`.
-   `--force` moves the existing directory to `<data-dir>.pre-restore-<ts>`.
-   Nothing is deleted, so a mistaken restore can itself be undone.
-4. Start the service and verify it (see [Verification](#verification)).
-
-## Restoring Redis
-
-Redis is a cache, so the default is to **not restore it**. Start the service
-against an empty Redis and let the caches warm. Restore Redis only when you
-need to recover queued jobs from the backed-up snapshot.
-
-| Situation | Action |
-| --- | --- |
-| Primary node failure | None. ElastiCache fails over automatically (multi-AZ in production) |
-| Cluster lost, same region | `aws elasticache create-replication-group --snapshot-name <latest-auto-snapshot> ...`, or `terraform apply` for a fresh empty cluster |
-| Region lost | Use the standby cluster in the secondary region, which starts empty |
-| Need queued jobs back | `scripts/restore.sh <archive> --redis-url <url>` on a host that can write the Redis data dir. This does **not** work against ElastiCache. Instead, replay the jobs from `redis-dump.rdb` with `rdb --command json` |
-
-## Restoring secrets and config
-
-The archive's `config/` directory holds env files as they were on the host.
-In ECS, the secret manager is the source of truth, not these files. Use them
-only to diff against what is currently configured:
+**ElastiCache in the secondary region:** ElastiCache does not accept `CONFIG`/`DEBUG RELOAD`, so `scripts/restore.sh --redis-url` cannot load a dump into it. Seed a new replication group from the archive's `redis-dump.rdb` instead:
 
 ```bash
-tar -xzf /tmp/restore.tar.gz -C /tmp/restore config/
-diff <(sort /tmp/restore/config/server/.env) <(aws ssm get-parameters-by-path ... | to-env | sort)
+aws s3 cp /tmp/restore/staging/redis-dump.rdb "s3://$DR_BACKUP_BUCKET_SECONDARY/redis-seed/redis-dump.rdb"
+aws elasticache create-replication-group --region us-west-2 \
+  --replication-group-id soroban-identity-dr-seeded --replication-group-description "DR seed" \
+  --snapshot-arns "arn:aws:s3:::$DR_BACKUP_BUCKET_SECONDARY/redis-seed/redis-dump.rdb" \
+  --cache-node-type cache.r7g.large --engine redis --transit-encryption-enabled --at-rest-encryption-enabled
 ```
 
-If you suspect the secrets are compromised, rotate them. Do not restore them.
-See the runbook scenario *Credential or key compromise*.
+The bucket policy must grant `elasticache.amazonaws.com` read access to that object. After seeding, point `REDIS_URL` at the new group.
 
-## Verification
-
-A restore is complete only when every check passes:
+**Self-hosted Redis:** `scripts/restore.sh --redis-url "$REDIS_URL"` loads the archive's `redis-dump.rdb`. To restore a daily `infrastructure/backup` dump by hand instead:
 
 ```bash
-BASE=https://<origin>
-curl -fsS "$BASE/health"                        # 200, status ok
-curl -fsS "$BASE/ready"                         # 200: Redis and RPC reachable
-curl -fsS -H "x-api-key: $ADMIN_KEY" "$BASE/admin/api-keys?limit=1" | jq '.pagination.total_count'
-curl -fsS "$BASE/credentials?limit=1" | jq '.pagination.total_count'
-curl -fsS -H "x-api-key: $ADMIN_KEY" "$BASE/admin/audit-logs?limit=1" | jq '.entries[0].timestamp'
+redis-cli -u "$REDIS_URL" SHUTDOWN NOSAVE    # or systemctl stop redis
+gunzip -c redis-<host>-<ts>.rdb.gz > /var/lib/redis/dump.rdb
+chown redis:redis /var/lib/redis/dump.rdb
+systemctl start redis
+redis-cli -u "$REDIS_URL" DBSIZE
 ```
 
-Compare the counts against the `manifest.json` of the restored archive, and
-confirm that the newest audit entry falls within RPO of the incident start.
-Record the achieved RPO (incident start − newest restored entry) in the
-incident log.
+## 4. Restore config and secrets
+
+Canonical secrets live in the secret manager for the target region. Treat the `config/` directory in the archive as a **reference only**:
+
+- Diff it against the target task definition's environment.
+- Copy across any values that are missing.
+- Never commit it.
+- Shred it when done: `shred -u /tmp/restore/config/*`.
+
+Values that differ between regions and must be set for the secondary:
+
+- `REDIS_URL`
+- `DATA_DIR`
+- `CORS_ALLOWED_ORIGINS` if origins are region-specific
+- webhook signing secrets (the same values; confirm they are replicated)
+
+## 5. Verify
+
+```bash
+infrastructure/dr/scripts/verify-recovery.sh --url "https://$DR_ORIGIN" \
+  --expect-credentials "$(jq length "$DR_DATA_DIR/credentials.json")"
+```
+
+It checks `/health`, `/ready`, `/live`, and `/info`, that the credential total (`pagination.total_count`) is at least the expected count, and that responses carry `X-Correlation-ID`.
+
+## Point-in-time recovery for corruption
+
+For data that is corrupted rather than lost:
+
+1. Find the first bad write in the audit logs (`/admin/audit-logs`) or by correlation ID (see [docs/request-tracing.md](../../docs/request-tracing.md)).
+2. Restore the newest archive older than that write.
+3. Replay legitimate writes made after it from the audit log. Credential issuance and revocation are also on-chain, so the credential index can be rebuilt from contract events: set `EXPIRY_EVENTS_START_LEDGER` to the ledger at the recovery point.

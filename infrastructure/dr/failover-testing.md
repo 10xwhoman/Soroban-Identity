@@ -1,92 +1,61 @@
-# Quarterly Failover Testing
+# Failover Testing
 
-A DR plan that has never been exercised doesn't count as a plan. Once a
-quarter, we run a failover drill that measures real RTO and RPO against
-[rpo-rto.md](rpo-rto.md).
+A DR plan that has never been exercised is a guess. We run a drill every quarter and record the measured RPO and RTO against the targets in [README.md](README.md).
 
 ## Schedule
 
-| Quarter | Week | Drill | Environment |
-| --- | --- | --- | --- |
-| Q1 | 2nd week of February | Full region failover and failback | staging |
-| Q2 | 2nd week of May | Data corruption restore (scenario 5) | staging |
-| Q3 | 2nd week of August | Full region failover and failback | staging |
-| Q4 | 2nd week of November | Game day: an unannounced scenario, picked by the IC | staging, plus a read-only production restore check |
+| Quarter | Window | Drill type |
+| --- | --- | --- |
+| Q1 | First Tuesday of January, 14:00 UTC | **Full regional failover** in staging, then failback |
+| Q2 | First Tuesday of April | Restore drill (automated) plus scenario C (Redis loss) tabletop |
+| Q3 | First Tuesday of July | **Full regional failover** in staging, then failback |
+| Q4 | First Tuesday of October | Restore drill (automated) plus scenario D (data corruption) live in staging |
 
-Drills run on a Tuesday or Wednesday, during working hours, never during a
-release freeze or within 48 h of a major release. Put them in the team calendar
-at the start of each quarter.
+The automated restore drill (`scripts/dr-drill.sh`) also runs from [crontab](crontab) at 06:00 UTC on the first day of each quarter. It posts results to `ALERT_WEBHOOK`.
 
-## Roles
-
-- **Drill lead:** runs the scripts and keeps the timeline.
-- **Observer:** times each step independently and notes every point where the
-  runbook was unclear or wrong.
-- **IC stand-in:** makes the go/no-go calls as they would be made in a real
-  event.
-
-## Procedure
+## Automated restore drill
 
 ```bash
-# 1. Announce in #eng and on the staging status page.
-# 2. Run the drill. It times each phase and writes a report.
-infrastructure/dr/scripts/failover-drill.sh --env staging --scenario region
-#    or: --scenario restore
-# 3. Fail back (the region scenario does this automatically unless --no-failback).
-# 4. Commit the generated report.
-git add infrastructure/dr/drills/ && git commit -m "docs(dr): <quarter> failover drill"
+infrastructure/dr/scripts/dr-drill.sh                     # restore-only drill (safe, no traffic change)
+infrastructure/dr/scripts/dr-drill.sh --full --env staging  # full failover of staging + verification
 ```
 
-The drill script:
+The drill:
 
-1. Seeds a marker record, a webhook named `dr-drill-<timestamp>`, so RPO can be
-   measured end to end.
-2. Ships a backup, then records the time it lands in the replica bucket, which
-   is the replication lag.
-3. Runs `failover.sh` against the staging stacks and times each phase.
-4. Checks that the marker record exists after the restore.
-5. Fails back, unless `--no-failback` is given.
-6. Writes `drills/<YYYY>-Q<N>-<scenario>.md` with the timings and the outcome.
+1. Measures **achieved RPO**: the age of the newest archive in the secondary bucket.
+2. Downloads it, verifies the checksum, and restores it with `scripts/restore.sh` into a scratch directory.
+3. Validates the restored data: every JSON file parses and the credentials file is present.
+4. With `--full`, runs `failover.sh --execute` against staging, then `verify-recovery.sh`, and measures **achieved RTO**.
+5. Appends a row to `drill-log.md`, next to this file, and exits non-zero if either target was missed.
 
-## Pass criteria
+## Full failover drill checklist (staging)
 
-| Check | Pass |
-| --- | --- |
-| Measured RTO (declare → verified in secondary) | ≤ 1 h |
-| Measured RPO (marker time → newest restored data) | ≤ 1 h |
-| Marker record present after restore | Yes |
-| All [verification checks](backup-restoration.md#verification) | Pass |
-| Failback completed with data from the secondary intact | Yes |
-| Runbook steps needing improvisation | 0, or each one filed as an issue |
+Before:
 
-A failed drill opens an issue labelled `dr` and `priority:high`. The next
-quarter's drill repeats the failed scenario.
+- [ ] Announce the drill window in the engineering channel 48 h ahead
+- [ ] Confirm the staging secondary is provisioned (`terraform plan` in `infrastructure/dr/terraform` shows no drift)
+- [ ] Confirm the newest backup is less than 1 h old
+- [ ] Assign roles: IC, operator, scribe (timestamps everything)
 
-## Report template
+During:
 
-`failover-drill.sh` generates this automatically. Fill in the last two sections
-by hand.
+- [ ] T0: IC declares a simulated region loss. The scribe starts the clock
+- [ ] Operator follows [runbook.md § E](runbook.md#e-region-failover) as written, with no improvising. Every deviation is a finding
+- [ ] Record the timestamp of each numbered step
+- [ ] Run `verify-recovery.sh` against the public staging URL
+- [ ] T1: service verified. **RTO = T1 − T0**
 
-```markdown
-# DR drill — 2026-Q4 — region
+After:
 
-- Date: 2026-11-10
-- Environment: staging
-- Drill lead / observer:
+- [ ] Fail back using [runbook.md § Failback](runbook.md#failback)
+- [ ] Add a row to the drill log below
+- [ ] File issues for every gap found. RTO or RPO misses are sev-2
+- [ ] Update the runbook in the same week
 
-| Phase | Started | Duration |
-| --- | --- | --- |
-| backup shipped | ... | ... |
-| replication | ... | ... |
-| restore | ... | ... |
-| scale-up | ... | ... |
-| traffic switch | ... | ... |
-| **total RTO** | | ... |
+## Drill log
 
-- Measured RPO: ...
-- Marker present: yes/no
-- Result: PASS/FAIL
+Automated drills append to `drill-log.md`. Manual drills add a row here.
 
-## What went wrong
-## Follow-up issues
-```
+| Date | Type | Env | Achieved RPO | Achieved RTO | Targets met | Findings / issues |
+| --- | --- | --- | --- | --- | --- | --- |
+| _next: Q1 drill_ | Full failover | staging | | | | |

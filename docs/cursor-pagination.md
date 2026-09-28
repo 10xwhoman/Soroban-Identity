@@ -44,56 +44,61 @@ Every response includes both `nextCursor` and `previousCursor`, so a client can 
 
 `GET /admin/expiry-report` continues to use classic `page`/`pageSize` offset pagination (`{ page, pageSize, totalItems, totalPages, hasNextPage, items }`) — cursor pagination is additive and does not replace it. Use whichever fits the caller: offset pagination supports jumping to an arbitrary page number; cursor pagination stays correct under concurrent writes.
 
-## Pagination metadata (#958)
+## Standard pagination metadata
 
-Every paginated list endpoint returns a standard `pagination` block next to its existing fields, and mirrors it in response headers. Existing fields (`nextCursor`, `logs`, `entries`, `page`/`totalItems`, …) are unchanged, so current clients keep working.
-
-| Field | Header | Meaning |
-|---|---|---|
-| `total_count` | `X-Total-Count` | Items matching the query across all pages. |
-| `page_size` | `X-Page-Size` | Maximum items in this page (the clamped `limit`/`pageSize`). |
-| `has_more` | `X-Has-More` | Whether another page exists in the direction of travel. |
-| `next_cursor` | `Link: rel="next"` | Opaque cursor for the next page, or `null`. |
-| `previous_cursor` | `Link: rel="prev"` | Opaque cursor for the previous page, or `null`. |
+Issue #944. Every list endpoint returns a `pagination` object and pagination headers. It is built by [`server/src/routes/pagination.js`](../server/src/routes/pagination.js). The older top-level fields (`nextCursor`, `previousCursor`, `total`, `page`, and so on) are unchanged, so existing clients keep working.
 
 ```json
 {
-  "logs": [ ... ],
+  "items": [ ... ],
+  "nextCursor": "eyJpZCI6ImNyZWQtMDI0In0",
+  "previousCursor": null,
   "pagination": {
     "total_count": 137,
-    "page_size": 50,
+    "page_size": 25,
     "has_more": true,
-    "next_cursor": "eyJvIjo1MH0",
-    "previous_cursor": null
+    "next_cursor": "eyJpZCI6ImNyZWQtMDI0In0",
+    "prev_cursor": null
   }
 }
 ```
 
+| Field | Meaning |
+| --- | --- |
+| `total_count` | Number of items matching the query across all pages. Also sent as the `X-Total-Count` header. |
+| `page_size` | The page size actually used, after clamping to 1–200 (1–500 for audit logs). |
+| `has_more` | `true` when another page follows this one. |
+| `next_cursor` / `prev_cursor` | Opaque cursors on cursor-paginated endpoints. `null` on offset-paginated endpoints. |
+| `offset`, `page`, `total_pages` | Present only on offset-paginated endpoints. |
+
+### Link header
+
+Responses include an RFC 8288 `Link` header whose URLs are relative and keep every other query parameter:
+
 ```
-Link: </webhooks/logs?limit=50&cursor=eyJvIjo1MH0>; rel="next", </webhooks/logs?limit=50&cursor=eyJvIjoxMDB9>; rel="last"
-X-Total-Count: 137
-X-Page-Size: 50
-X-Has-More: true
+Link: </credentials?cursor=eyJpZCI6ImNyZWQtMDI0In0&limit=25>; rel="next", </credentials?limit=25>; rel="first"
 ```
 
-`Link` follows RFC 8288. Targets are path-relative (so they survive a proxy rewriting the host) and keep every non-positional query parameter, such as `webhookId` or `action`, from the original request. `rel="first"` appears on every page except the first; `rel="last"` appears only on offset-backed endpoints, because an id-anchored cursor cannot address the last page directly.
+- Cursor endpoints emit `next`, `prev`, and `first`.
+- Offset endpoints emit `first`, `prev`, `next`, and `last`.
+- Each link is omitted when there is no such page.
 
 ### Endpoints
 
-| Endpoint | Cursor kind | Notes |
-|---|---|---|
-| `GET /credentials` | id-anchored (see above) | `has_more` follows `direction`; the `prev` link carries `direction=prev`. |
-| `GET /webhooks/logs`, `GET /webhooks/{id}/logs` | offset | Newest first. |
-| `GET /notifications/logs` | offset | Newest first (previously oldest-first within the returned tail). |
-| `GET /admin/audit-logs` | offset | `limit` up to 500; `offset` still accepted, `cursor` wins if both are sent. |
-| `GET /admin/expiry-report` | offset | `page`/`pageSize` still accepted; `cursor` selects the page when sent. |
-| `GET /admin/api-keys` | offset | Now paginated: default 50, max 200 per page. |
-
-Offset cursors are base64url `{"o": <offset>}`, but treat them as opaque like any other cursor. A malformed cursor falls back to the first page rather than erroring.
+| Endpoint | Style | Params |
+| --- | --- | --- |
+| `GET /credentials` | cursor | `limit`, `cursor`, `direction` |
+| `GET /webhooks` | offset | `limit` (omit to get the full list), `offset` |
+| `GET /webhooks/logs`, `GET /webhooks/:id/logs` | offset | `limit`, `offset` (newest first) |
+| `GET /notifications/logs` | offset | `limit`, `offset`. Without `offset`, returns the most recent `limit` entries. |
+| `GET /admin/issuers` | offset | `limit` (omit to get the full list), `offset` |
+| `GET /admin/expiry-report` | page | `page`, `pageSize` |
+| `GET /admin/audit-logs` | offset | `limit`, `offset` |
+| `GET /admin/traces` | limit | `limit` |
 
 ### Edge cases
 
-- **Empty result**: `total_count: 0`, `has_more: false`, both cursors `null`, no `Link` header.
-- **Exact multiple of the page size**: the last full page reports `has_more: false` and no `next_cursor`; there is never an empty trailing page.
-- **Cursor past the end**: returns an empty page with `has_more: false` and a `previous_cursor` back into range.
-- **Out-of-range `limit`**: clamped to the endpoint maximum; non-numeric or `< 1` falls back to the default.
+- `limit` values that are zero, negative, or not a number fall back to the default page size of 50. Values above the maximum are clamped to it.
+- An `offset` past the end returns an empty page with `has_more: false`, and `total_count` still reports the full count.
+- An empty collection returns `total_count: 0`, `has_more: false`, and `total_pages: 1`.
+- An unknown or deleted cursor restarts from the first page, or from the last page when `direction=prev`, as described above.

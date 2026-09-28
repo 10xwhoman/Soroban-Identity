@@ -122,6 +122,7 @@ export const DEFAULT_CORS_ALLOWED_HEADERS = [
   "Authorization",
   "X-API-Key",
   "X-Request-ID",
+  "X-Correlation-ID",
   "X-Actor",
   "X-User-Tier",
   "X-API-Version",
@@ -129,6 +130,7 @@ export const DEFAULT_CORS_ALLOWED_HEADERS = [
 
 export const DEFAULT_CORS_EXPOSED_HEADERS = [
   "X-Request-ID",
+  "X-Correlation-ID",
   "Content-Type",
   "X-RateLimit-Limit",
   "X-RateLimit-Remaining",

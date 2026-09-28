@@ -1,163 +1,149 @@
+import { paginateCursor } from "../expiry.js";
+
 /**
- * Standard pagination metadata for list endpoints (#958)
+ * Standard pagination metadata for list endpoints (#944).
  *
- * Every paginated list response carries a `pagination` object alongside its
- * existing fields:
+ * Every list response carries a `pagination` object:
  *
  *   {
- *     "pagination": {
- *       "total_count": 137,
- *       "page_size": 50,
- *       "has_more": true,
- *       "next_cursor": "eyJvIjo1MH0",
- *       "previous_cursor": null
- *     }
+ *     total_count,  // items matching the query across all pages (null if unknown)
+ *     page_size,    // effective page size after clamping
+ *     has_more,     // true when another page exists after this one
+ *     next_cursor,  // opaque cursor for the next page (cursor endpoints), else null
+ *     prev_cursor,  // opaque cursor for the previous page (cursor endpoints), else null
+ *     // offset endpoints only:
+ *     offset, page, total_pages
  *   }
  *
- * and the same information as headers:
- *
- *   Link: <https://api/...?cursor=...>; rel="next", <...>; rel="first"
- *   X-Total-Count: 137
- *   X-Page-Size: 50
- *   X-Has-More: true
- *
- * Cursors are opaque. Endpoints backed by an in-memory array use offset
- * cursors (base64url `{"o": <offset>}`); `/credentials` keeps its id-anchored
- * cursors from #746. Clients should always pass back exactly the string a
- * previous response gave them.
+ * plus an RFC 8288 `Link` header with `next` / `prev` (and `first` / `last`
+ * for offset pagination). Existing response fields are kept for backwards
+ * compatibility. See docs/cursor-pagination.md.
  */
 
 export const DEFAULT_PAGE_SIZE = 50;
 export const MAX_PAGE_SIZE = 200;
 
-/**
- * Clamp a requested page size into `[1, max]`, falling back to the default for
- * anything missing or unparsable.
- */
-export function resolvePageSize(value, { fallback = DEFAULT_PAGE_SIZE, max = MAX_PAGE_SIZE } = {}) {
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
-  return Math.min(parsed, max);
+export function clampPageSize(value, { fallback = DEFAULT_PAGE_SIZE, max = MAX_PAGE_SIZE } = {}) {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(n, max);
 }
 
-export function encodeOffsetCursor(offset) {
-  return Buffer.from(JSON.stringify({ o: offset }), 'utf8').toString('base64url');
+export function clampOffset(value) {
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-/**
- * Decode an offset cursor. Returns null for a missing or malformed cursor so
- * the caller can fall back to the first page rather than erroring.
- */
-export function decodeOffsetCursor(cursor) {
-  if (!cursor) return null;
-  try {
-    const decoded = JSON.parse(Buffer.from(String(cursor), 'base64url').toString('utf8'));
-    if (decoded && Number.isSafeInteger(decoded.o) && decoded.o >= 0) return decoded.o;
-  } catch {
-    // fall through
-  }
-  return null;
-}
-
-/**
- * Slice one page out of an array.
- *
- * `cursor` wins over `offset` when both are given, so a client following
- * `next_cursor` is never thrown off by a stale `offset` left in the URL.
- */
-export function paginateArray(items, { pageSize, cursor = null, offset = 0, maxPageSize = MAX_PAGE_SIZE } = {}) {
-  const size = resolvePageSize(pageSize, { max: maxPageSize });
-  const total = items.length;
-  const fromCursor = decodeOffsetCursor(cursor);
-  const start = Math.min(fromCursor ?? Math.max(0, Number.parseInt(offset, 10) || 0), total);
-  const end = Math.min(start + size, total);
-  const hasMore = end < total;
-
+/** Cursor pagination over an in-memory list, with standard metadata. */
+export function cursorPage(items, { limit, cursor = null, direction = "next" } = {}) {
+  const pageSize = clampPageSize(limit);
+  const { items: page, nextCursor, previousCursor } = paginateCursor(items, {
+    limit: pageSize,
+    cursor,
+    direction,
+  });
   return {
-    items: items.slice(start, end),
-    offset: start,
-    meta: buildPaginationMeta({
-      totalCount: total,
-      pageSize: size,
-      hasMore,
-      nextCursor: hasMore ? encodeOffsetCursor(end) : null,
-      previousCursor: start > 0 ? encodeOffsetCursor(Math.max(0, start - size)) : null,
-      firstCursor: start > 0 ? encodeOffsetCursor(0) : null,
-      lastCursor: hasMore ? encodeOffsetCursor(Math.floor((total - 1) / size) * size) : null,
-    }),
+    items: page,
+    nextCursor,
+    previousCursor,
+    pagination: {
+      total_count: items.length,
+      page_size: pageSize,
+      has_more: Boolean(nextCursor),
+      next_cursor: nextCursor,
+      prev_cursor: previousCursor,
+    },
   };
 }
 
-/**
- * Build the `pagination` block. `totalCount` may be null when the backing
- * store cannot count cheaply; the field is still present so clients can rely
- * on the shape.
- */
-export function buildPaginationMeta({
-  totalCount = null,
-  pageSize,
-  hasMore,
-  nextCursor = null,
-  previousCursor = null,
-  firstCursor = null,
-  lastCursor = null,
-  extraLinkParams = {},
-}) {
-  const meta = {
+/** Offset/limit pagination over an in-memory list, with standard metadata. */
+export function offsetPage(items, { limit, offset = 0, maxPageSize = MAX_PAGE_SIZE } = {}) {
+  const pageSize = clampPageSize(limit, { max: maxPageSize });
+  const start = clampOffset(offset);
+  const page = items.slice(start, start + pageSize);
+  return {
+    items: page,
+    pagination: offsetMeta({ totalCount: items.length, pageSize, offset: start }),
+  };
+}
+
+/** Metadata for an offset page when the caller already sliced the data. */
+export function offsetMeta({ totalCount, pageSize, offset }) {
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  return {
     total_count: totalCount,
     page_size: pageSize,
-    has_more: Boolean(hasMore),
-    next_cursor: nextCursor,
-    previous_cursor: previousCursor,
+    has_more: offset + pageSize < totalCount,
+    next_cursor: null,
+    prev_cursor: null,
+    offset,
+    page: Math.floor(offset / pageSize) + 1,
+    total_pages: totalPages,
   };
-  // Link-only details are kept off the enumerable body.
-  Object.defineProperty(meta, 'links', {
-    value: { firstCursor, lastCursor, extraLinkParams },
-    enumerable: false,
-  });
-  return meta;
 }
 
-/** Params that describe a position and must not leak into generated links. */
-const POSITION_PARAMS = ['cursor', 'offset', 'page', 'direction'];
-
-function linkFor(url, cursor, pageSize, extra = {}) {
-  const target = new URL(url);
-  for (const param of POSITION_PARAMS) target.searchParams.delete(param);
-  if (cursor) target.searchParams.set('cursor', cursor);
-  target.searchParams.set('limit', String(pageSize));
-  for (const [key, value] of Object.entries(extra)) target.searchParams.set(key, value);
-  return target;
+/** Adapt the result of expiry.js `paginate()` (1-based page numbers). */
+export function pageNumberMeta({ page, pageSize, totalItems, totalPages, hasNextPage }) {
+  return {
+    total_count: totalItems,
+    page_size: pageSize,
+    has_more: hasNextPage,
+    next_cursor: null,
+    prev_cursor: null,
+    offset: (page - 1) * pageSize,
+    page,
+    total_pages: totalPages,
+  };
 }
 
-/**
- * RFC 8288 `Link` header value for a page, or null when there is nowhere to
- * go. `rel="first"` is omitted on the first page itself.
- */
-export function buildLinkHeader(url, meta) {
-  const { firstCursor, lastCursor, extraLinkParams = {} } = meta.links ?? {};
-  const links = [];
-  const add = (rel, target) => links.push(`<${target.pathname}${target.search}>; rel="${rel}"`);
-
-  if (meta.next_cursor) add('next', linkFor(url, meta.next_cursor, meta.page_size, extraLinkParams.next));
-  if (meta.previous_cursor) add('prev', linkFor(url, meta.previous_cursor, meta.page_size, extraLinkParams.prev));
-  if (meta.previous_cursor || firstCursor) add('first', linkFor(url, null, meta.page_size));
-  if (lastCursor) add('last', linkFor(url, lastCursor, meta.page_size));
-
-  return links.length > 0 ? links.join(', ') : null;
-}
-
-/**
- * Set `Link`, `X-Total-Count`, `X-Page-Size` and `X-Has-More` on the response.
- * Links are path-relative so they stay correct behind a proxy that rewrites
- * the host.
- */
-export function setPaginationHeaders(res, url, meta) {
-  const link = buildLinkHeader(url, meta);
-  if (link) res.setHeader('Link', link);
-  if (meta.total_count !== null && meta.total_count !== undefined) {
-    res.setHeader('X-Total-Count', String(meta.total_count));
+function withParams(url, params) {
+  const u = new URL(url.pathname + url.search, "http://placeholder");
+  for (const [k, v] of Object.entries(params)) {
+    if (v === null || v === undefined) u.searchParams.delete(k);
+    else u.searchParams.set(k, String(v));
   }
-  res.setHeader('X-Page-Size', String(meta.page_size));
-  res.setHeader('X-Has-More', String(meta.has_more));
+  return `${u.pathname}${u.search}`;
+}
+
+/**
+ * Build the `Link` header value for a page. Relative URLs keep the header
+ * correct behind proxies and path-versioning rewrites.
+ *
+ * Offset endpoints use `offsetParam` ("offset" or "page") to decide how the
+ * page position is expressed in the links.
+ */
+export function buildLinkHeader(url, pagination, { offsetParam = "offset", limitParam = "limit" } = {}) {
+  const links = [];
+  const add = (rel, params) => links.push(`<${withParams(url, params)}>; rel="${rel}"`);
+  const size = pagination.page_size;
+
+  if (pagination.next_cursor || pagination.prev_cursor) {
+    if (pagination.next_cursor) add("next", { cursor: pagination.next_cursor, direction: null, [limitParam]: size });
+    if (pagination.prev_cursor) add("prev", { cursor: pagination.prev_cursor, direction: "prev", [limitParam]: size });
+    add("first", { cursor: null, direction: null, [limitParam]: size });
+    return links.join(", ");
+  }
+
+  if (pagination.offset === undefined) return links.join(", ");
+
+  const pos = (offset) =>
+    offsetParam === "page"
+      ? { page: Math.floor(offset / size) + 1, [limitParam]: size }
+      : { offset, [limitParam]: size };
+  const lastOffset = (pagination.total_pages - 1) * size;
+
+  add("first", pos(0));
+  if (pagination.offset > 0) add("prev", pos(Math.max(0, pagination.offset - size)));
+  if (pagination.has_more) add("next", pos(pagination.offset + size));
+  add("last", pos(lastOffset));
+  return links.join(", ");
+}
+
+/** Set `Link` (when non-empty) and `X-Total-Count` headers. */
+export function setPaginationHeaders(res, url, pagination, options) {
+  const link = buildLinkHeader(url, pagination, options);
+  if (link) res.setHeader("Link", link);
+  if (pagination.total_count !== null && pagination.total_count !== undefined) {
+    res.setHeader("X-Total-Count", String(pagination.total_count));
+  }
 }
