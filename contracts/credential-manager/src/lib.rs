@@ -58,6 +58,12 @@ const CRL_LEAVES: Symbol = symbol_short!("CRLLEAF");
 const CRL_ROOT: Symbol = symbol_short!("CRLROOT");
 const CRL_PERIOD_SECS: u64 = 86_400;
 
+// ── Issue #951: standardized revocation reasons ──────────────────────────────
+/// Maps a credential ID to its [`RevocationRecord`].
+const REVOKE_REASON: Symbol = symbol_short!("REVRSN");
+/// Maps a [`RevocationReason`] to the list of credential IDs revoked for it.
+const REVOKED_BY_REASON: Symbol = symbol_short!("REVBYRSN");
+
 // ── Issue #732: credential dependency chain storage keys ──────────────────────
 /// Maps a credential ID to its list of prerequisite credential IDs.
 const CRED_DEPS: Symbol = symbol_short!("CREDDEPS");
@@ -206,6 +212,45 @@ pub enum CredentialType {
     Reputation,
     Achievement,
     Custom,
+}
+
+/// Standardized reason a credential was revoked. Loosely follows the
+/// X.509 CRL reason codes (RFC 5280 §5.3.1) so that off-chain systems can
+/// map them directly. Stored as a `u32` on-chain. See #951.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RevocationReason {
+    /// No reason given. Used by legacy callers of `revoke_credential`.
+    Unspecified = 0,
+    /// The subject's signing key was compromised.
+    KeyCompromise = 1,
+    /// The issuer's signing key was compromised.
+    IssuerCompromise = 2,
+    /// The subject's affiliation with the issuer changed.
+    AffiliationChanged = 3,
+    /// The credential was replaced by a newer one.
+    Superseded = 4,
+    /// The issuer no longer operates the credential program.
+    CessationOfOperation = 5,
+    /// The privilege granted by the credential was withdrawn.
+    PrivilegeWithdrawn = 6,
+    /// The credential was obtained with false or fraudulent information.
+    Fraudulent = 7,
+    /// The subject asked for the credential to be revoked.
+    SubjectRequest = 8,
+    /// A prerequisite credential was revoked (cascade revocation, #732).
+    DependencyRevoked = 9,
+}
+
+/// Revocation metadata persisted for each revoked credential. See #951.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevocationRecord {
+    pub credential_id: BytesN<32>,
+    pub reason: RevocationReason,
+    pub revoked_by: Address,
+    pub revoked_at: u64,
 }
 
 #[contracttype]
@@ -1097,10 +1142,28 @@ impl CredentialManager {
         current == expected
     }
 
+    /// Revoke a credential without a specific reason. Equivalent to
+    /// [`Self::revoke_credential_with_reason`] with
+    /// [`RevocationReason::Unspecified`]; kept for backwards compatibility.
     pub fn revoke_credential(
         env: Env,
         issuer: Address,
         credential_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        Self::revoke_credential_with_reason(env, issuer, credential_id, RevocationReason::Unspecified)
+    }
+
+    /// Revoke a credential and record a standardized [`RevocationReason`].
+    ///
+    /// The reason is persisted in a [`RevocationRecord`] (queryable via
+    /// [`Self::get_revocation_record`]), indexed for
+    /// [`Self::get_revoked_by_reason`], and emitted in the `revoked` event.
+    /// See #951.
+    pub fn revoke_credential_with_reason(
+        env: Env,
+        issuer: Address,
+        credential_id: BytesN<32>,
+        reason: RevocationReason,
     ) -> Result<(), ContractError> {
         issuer.require_auth();
         Self::require_not_paused(&env)?;
@@ -1155,9 +1218,10 @@ impl CredentialManager {
         // closes #553: include revocation timestamp so off-chain systems can
         // detect and invalidate cached verify_credential results.
         let revoked_at: u64 = env.ledger().timestamp();
+        Self::record_revocation(&env, &credential_id, reason, &issuer, revoked_at);
         env.events().publish(
             (CRED, symbol_short!("revoked")),
-            (EVENT_VERSION, credential_id.clone(), issuer, revoked_at),
+            (EVENT_VERSION, credential_id.clone(), issuer, revoked_at, reason),
         );
 
         // Issue #732: cascade-revoke all credentials that depend on this one.
@@ -1552,6 +1616,20 @@ impl CredentialManager {
 
     pub fn get_revocations(env: Env, issuer: Address, subject: Address) -> Vec<BytesN<32>> {
         Self::fetch_revocations(&env, &issuer, &subject)
+    }
+
+    /// Returns the revocation record (reason, revoker, timestamp) for a
+    /// credential, or `None` if it has not been revoked. See #951.
+    pub fn get_revocation_record(env: Env, credential_id: BytesN<32>) -> Option<RevocationRecord> {
+        env.storage().persistent().get(&(REVOKE_REASON, credential_id))
+    }
+
+    /// Returns the IDs of all credentials revoked for `reason`. See #951.
+    pub fn get_revoked_by_reason(env: Env, reason: RevocationReason) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&(REVOKED_BY_REASON, reason))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn list_issuer_credentials(
@@ -2154,6 +2232,9 @@ impl CredentialManager {
         env.storage().instance().set(&REVOKED_CNT, &(revoked + 1));
         // closes #553: include revocation timestamp in batch events too.
         let revoked_at: u64 = env.ledger().timestamp();
+        // #951: batch revocations carry a free-form `Symbol` reason, so the
+        // standardized reason is recorded as `Unspecified`.
+        Self::record_revocation(env, credential_id, RevocationReason::Unspecified, issuer, revoked_at);
         env.events().publish(
             (CRED, symbol_short!("revoked")),
             (EVENT_VERSION, credential_id.clone(), issuer.clone(), revoked_at, reason.clone()),
@@ -2401,6 +2482,38 @@ impl CredentialManager {
         CredentialIdsPage { items, next_cursor }
     }
 
+    /// Issue #951: persist the revocation record and add the credential to the
+    /// per-reason index.
+    fn record_revocation(
+        env: &Env,
+        credential_id: &BytesN<32>,
+        reason: RevocationReason,
+        revoked_by: &Address,
+        revoked_at: u64,
+    ) {
+        let record_key = (REVOKE_REASON, credential_id.clone());
+        env.storage().persistent().set(
+            &record_key,
+            &RevocationRecord {
+                credential_id: credential_id.clone(),
+                reason,
+                revoked_by: revoked_by.clone(),
+                revoked_at,
+            },
+        );
+        env.storage().persistent().extend_ttl(&record_key, TTL_MAX, TTL_MAX);
+
+        let index_key = (REVOKED_BY_REASON, reason);
+        let mut ids: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&index_key)
+            .unwrap_or_else(|| Vec::new(env));
+        ids.push_back(credential_id.clone());
+        env.storage().persistent().set(&index_key, &ids);
+        env.storage().persistent().extend_ttl(&index_key, TTL_MAX, TTL_MAX);
+    }
+
     /// Issue #662: Helper to remove a credential ID from an index vector.
     fn remove_from_vec(env: &Env, mut vec: Vec<BytesN<32>>, id: &BytesN<32>) -> Vec<BytesN<32>> {
         let mut result: Vec<BytesN<32>> = Vec::new(env);
@@ -2645,9 +2758,16 @@ impl CredentialManager {
                     env.storage().persistent().set(&dep_key, &dep);
                     let revoked: u32 = env.storage().instance().get(&REVOKED_CNT).unwrap_or(0);
                     env.storage().instance().set(&REVOKED_CNT, &(revoked + 1));
+                    Self::record_revocation(
+                        env,
+                        &dep_id,
+                        RevocationReason::DependencyRevoked,
+                        &dep.issuer,
+                        env.ledger().timestamp(),
+                    );
                     env.events().publish(
                         (CRED, symbol_short!("dep_rev")),
-                        (EVENT_VERSION, dep_id.clone(), parent_id.clone()),
+                        (EVENT_VERSION, dep_id.clone(), parent_id.clone(), RevocationReason::DependencyRevoked),
                     );
                     // Recurse: cascade to credentials that depend on this one.
                     Self::cascade_revoke_dependants(env, &dep_id, depth + 1);
