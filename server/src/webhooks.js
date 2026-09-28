@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { logger } from './logger.js';
+import { correlationHeaders } from './middleware/tracing.js';
 import { writeAtomic, ensureDataDir } from './storage.js';
 
 /**
@@ -151,6 +152,8 @@ export async function readWebhookLogs(config, { webhookId = null, limit = 50 } =
     }
 
     filtered.reverse(); // Newest first
+    // `limit: null` returns every entry so callers can paginate (#944).
+    if (limit === null) return filtered;
     return filtered.slice(0, Math.min(limit, 200));
   } catch (error) {
     if (error.code === 'ENOENT') return [];
@@ -250,6 +253,7 @@ export class WebhookDeliveryService {
       'x-webhook-delivery': deliveryId,
       'x-webhook-timestamp': String(timestamp),
       'x-webhook-signature': `sha256=${signature}`,
+      ...correlationHeaders(),
     };
 
     if (webhook.authToken) {
@@ -360,6 +364,7 @@ export class WebhookDeliveryService {
       'x-webhook-delivery': deliveryId,
       'x-webhook-timestamp': String(timestamp),
       'x-webhook-signature': `sha256=${signature}`,
+      ...correlationHeaders(),
     };
 
     if (webhook.authToken) {
