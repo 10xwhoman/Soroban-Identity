@@ -81,6 +81,9 @@ if [[ "$NETWORK" == "mainnet" ]]; then
 fi
 
 SOURCE_ACCOUNT="$STELLAR_SECRET_KEY"
+# Soroban uses deployer-derived deterministic IDs (salt), rather than Ethereum CREATE2.
+# Keep salts stable so retries do not create duplicate contract instances.
+SALT_PREFIX="${SOROBAN_DEPLOY_SALT_PREFIX:-soroban-identity}"
 
 # Retry configuration with exponential backoff
 MAX_RETRIES="${MAX_RETRIES:-3}"
@@ -115,6 +118,7 @@ echo "  Network:  $STELLAR_NETWORK"
 echo "  RPC URL:  $STELLAR_RPC_URL"
 echo "  Max Retries:  $MAX_RETRIES"
 echo "  Initial Retry Delay:  ${RETRY_DELAY}s"
+echo "  Deterministic salt:    ${SALT_PREFIX}:<contract>"
 echo "========================================"
 echo ""
 
@@ -169,10 +173,41 @@ for wasm_file in "$REGISTRY_WASM" "$CREDENTIAL_WASM" "$REPUTATION_WASM"; do
   fi
 done
 
-# #949: fee-optimized deployment — optimize WASM, upload each code hash
-# once, deploy with deterministic salts, and skip work already on-chain.
-# shellcheck source=../contracts/deployment/lib.sh
-source "$(dirname "$0")/../contracts/deployment/lib.sh"
+echo "==> Deploying identity-registry..."
+if ! REGISTRY_ID=$(retry_command stellar contract deploy \
+  --wasm "$REGISTRY_WASM" \
+  --source "$SOURCE_ACCOUNT" \
+  --network "$STELLAR_NETWORK" \
+  --rpc-url "$STELLAR_RPC_URL" \
+  --salt "$(printf '%s' "${SALT_PREFIX}:identity-registry" | sha256sum | cut -c1-64)"); then
+  echo "Error: Failed to deploy identity-registry contract"
+  exit 1
+fi
+echo "identity-registry: $REGISTRY_ID"
+
+echo "==> Deploying credential-manager..."
+if ! CREDENTIAL_ID=$(retry_command stellar contract deploy \
+  --wasm "$CREDENTIAL_WASM" \
+  --source "$SOURCE_ACCOUNT" \
+  --network "$STELLAR_NETWORK" \
+  --rpc-url "$STELLAR_RPC_URL" \
+  --salt "$(printf '%s' "${SALT_PREFIX}:credential-manager" | sha256sum | cut -c1-64)"); then
+  echo "Error: Failed to deploy credential-manager contract"
+  exit 1
+fi
+echo "credential-manager: $CREDENTIAL_ID"
+
+echo "==> Deploying reputation..."
+if ! REPUTATION_ID=$(retry_command stellar contract deploy \
+  --wasm "$REPUTATION_WASM" \
+  --source "$SOURCE_ACCOUNT" \
+  --network "$STELLAR_NETWORK" \
+  --rpc-url "$STELLAR_RPC_URL" \
+  --salt "$(printf '%s' "${SALT_PREFIX}:reputation" | sha256sum | cut -c1-64)"); then
+  echo "Error: Failed to deploy reputation contract"
+  exit 1
+fi
+echo "reputation: $REPUTATION_ID"
 
 if ! ADMIN_ADDRESS=$(stellar keys address "$SOURCE_ACCOUNT" --network "$STELLAR_NETWORK"); then
   echo "Error: Failed to get admin address from source account"
