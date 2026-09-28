@@ -240,7 +240,9 @@
                 "schema": {
                   "type": "string"
                 }
-              }
+              },
+              "Link": { "$ref": "#/components/headers/Link" },
+              "X-Total-Count": { "$ref": "#/components/headers/X-Total-Count" }
             },
             "content": {
               "application/json": {
@@ -1029,6 +1031,7 @@
           "webhooks"
         ],
         "summary": "List registered webhooks",
+        "description": "Returns every webhook unless `limit` is given.",
         "security": [
           {
             "ApiKeyAuth": [
@@ -1036,9 +1039,17 @@
             ]
           }
         ],
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1 } },
+          { "$ref": "#/components/parameters/Offset" }
+        ],
         "responses": {
           "200": {
             "description": "List of webhooks",
+            "headers": {
+              "Link": { "$ref": "#/components/headers/Link" },
+              "X-Total-Count": { "$ref": "#/components/headers/X-Total-Count" }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1049,7 +1060,8 @@
                       "items": {
                         "$ref": "#/components/schemas/Webhook"
                       }
-                    }
+                    },
+                    "pagination": { "$ref": "#/components/schemas/Pagination" }
                   }
                 }
               }
@@ -1231,27 +1243,17 @@
           }
         ],
         "parameters": [
-          {
-            "name": "webhookId",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 50
-            }
-          }
+          { "name": "webhookId", "in": "query", "required": false, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50 } },
+          { "$ref": "#/components/parameters/Offset" }
         ],
         "responses": {
           "200": {
             "description": "Delivery logs",
+            "headers": {
+              "Link": { "$ref": "#/components/headers/Link" },
+              "X-Total-Count": { "$ref": "#/components/headers/X-Total-Count" }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1259,10 +1261,9 @@
                   "properties": {
                     "logs": {
                       "type": "array",
-                      "items": {
-                        "$ref": "#/components/schemas/WebhookLog"
-                      }
-                    }
+                      "items": { "$ref": "#/components/schemas/WebhookLog" }
+                    },
+                    "pagination": { "$ref": "#/components/schemas/Pagination" }
                   }
                 }
               }
@@ -1945,8 +1946,205 @@
               }
             }
           }
-        },
-        "operationId": "oauthRevoke"
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key",
+        "description": "API Key token (e.g. `secret_key:credentials:read,credentials:write` or admin key)."
+      },
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Bearer authorization header token."
+      }
+    },
+    "headers": {
+      "Link": {
+        "description": "RFC 8288 links to adjacent pages: rel=\"next\", \"prev\", \"first\", and \"last\" (offset endpoints).",
+        "schema": { "type": "string" },
+        "example": "</credentials?cursor=eyJpZCI6ImNyZWQtMDUwIn0&limit=50>; rel=\"next\", </credentials?limit=50>; rel=\"first\""
+      },
+      "X-Total-Count": {
+        "description": "Same as pagination.total_count.",
+        "schema": { "type": "integer" }
+      }
+    },
+    "parameters": {
+      "Offset": {
+        "name": "offset",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "integer", "minimum": 0, "default": 0 },
+        "description": "Zero-based offset of the first item to return."
+      }
+    },
+    "schemas": {
+      "Credential": {
+        "type": "object",
+        "required": ["id", "subject", "issuer"],
+        "properties": {
+          "id": { "type": "string", "example": "cred-kyc-2026-001" },
+          "subject": { "type": "string", "example": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" },
+          "issuer": { "type": "string", "example": "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBWHF" },
+          "expiresAt": { "type": "number", "example": 1893456000 },
+          "expires_at": { "type": "number", "example": 1893456000 },
+          "revoked": { "type": "boolean", "example": false },
+          "revokedAt": { "type": "string", "format": "date-time" },
+          "schema": { "type": "string", "example": "https://schema.org/KYCCredential" },
+          "claims": { "type": "object" },
+          "source": { "type": "string", "example": "http" },
+          "expiry_notified_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "IssueCredentialRequest": {
+        "type": "object",
+        "required": ["id", "subject", "issuer"],
+        "properties": {
+          "id": { "type": "string", "description": "Unique identifier for the credential" },
+          "subject": { "type": "string", "description": "Stellar public address of the credential subject" },
+          "issuer": { "type": "string", "description": "Stellar public address of the credential issuer" },
+          "expiresAt": { "type": "number", "description": "Unix timestamp in seconds (0 = no expiry)" },
+          "expires_at": { "type": "number", "description": "Alternative key for expiresAt" },
+          "schema": { "type": "string", "description": "Schema URI" },
+          "claims": { "type": "object", "description": "Arbitrary claim dictionary" }
+        }
+      },
+      "CredentialVerifyResponse": {
+        "type": "object",
+        "required": ["verified"],
+        "properties": {
+          "verified": { "type": "boolean", "description": "True if valid, active, and unexpired" },
+          "reason": { "type": "string", "enum": ["not_found", "revoked", "expired", null] },
+          "credential": { "$ref": "#/components/schemas/Credential" }
+        }
+      },
+      "CredentialRevokeResponse": {
+        "type": "object",
+        "required": ["revoked", "credential"],
+        "properties": {
+          "revoked": { "type": "boolean", "example": true },
+          "credential": { "$ref": "#/components/schemas/Credential" }
+        }
+      },
+      "PaginatedCredentials": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Credential" }
+          },
+          "nextCursor": { "type": ["string", "null"], "example": "cred-050" },
+          "previousCursor": { "type": ["string", "null"] },
+          "pagination": { "$ref": "#/components/schemas/Pagination" }
+        }
+      },
+      "Pagination": {
+        "type": "object",
+        "description": "Standard pagination metadata returned by every list endpoint (#944). Cursor-paginated endpoints fill next_cursor/prev_cursor; offset-paginated endpoints fill offset/page/total_pages.",
+        "required": ["total_count", "page_size", "has_more", "next_cursor"],
+        "properties": {
+          "total_count": { "type": ["integer", "null"], "description": "Items matching the query across all pages.", "example": 137 },
+          "page_size": { "type": "integer", "description": "Effective page size after clamping.", "example": 50 },
+          "has_more": { "type": "boolean", "description": "True when another page exists after this one." },
+          "next_cursor": { "type": ["string", "null"], "description": "Opaque cursor for the next page." },
+          "prev_cursor": { "type": ["string", "null"], "description": "Opaque cursor for the previous page." },
+          "offset": { "type": "integer", "description": "Zero-based offset of this page (offset endpoints)." },
+          "page": { "type": "integer", "description": "One-based page number (offset endpoints)." },
+          "total_pages": { "type": "integer", "description": "Total number of pages (offset endpoints)." }
+        }
+      },
+      "Webhook": {
+        "type": "object",
+        "required": ["id", "url", "events", "active"],
+        "properties": {
+          "id": { "type": "string", "example": "whk_a1b2c3d4" },
+          "url": { "type": "string", "format": "uri", "example": "https://example.com/webhooks" },
+          "events": { "type": "array", "items": { "type": "string" }, "example": ["credential.issued", "credential.revoked"] },
+          "secret": { "type": "string" },
+          "authToken": { "type": ["string", "null"] },
+          "active": { "type": "boolean", "example": true },
+          "description": { "type": "string" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "RegisterWebhookRequest": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "url": { "type": "string", "format": "uri" },
+          "events": { "type": "array", "items": { "type": "string" }, "default": ["*"] },
+          "secret": { "type": "string" },
+          "authToken": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      },
+      "WebhookLog": {
+        "type": "object",
+        "required": ["deliveryId", "webhookId", "event", "success"],
+        "properties": {
+          "deliveryId": { "type": "string", "example": "del_123" },
+          "webhookId": { "type": "string", "example": "whk_456" },
+          "url": { "type": "string" },
+          "event": { "type": "string", "example": "credential.issued" },
+          "statusCode": { "type": "integer", "example": 200 },
+          "success": { "type": "boolean", "example": true },
+          "attempt": { "type": "integer", "example": 1 },
+          "durationMs": { "type": "integer", "example": 45 },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "error": { "type": ["string", "null"] }
+        }
+      },
+      "ServerInfo": {
+        "type": "object",
+        "required": ["version", "features", "minSdkVersion"],
+        "properties": {
+          "version": { "type": "string", "example": "0.1.0" },
+          "apiVersion": { "type": "string", "example": "v1" },
+          "supportedVersions": { "type": "array", "items": { "type": "string" } },
+          "features": { "type": "array", "items": { "type": "string" } },
+          "minSdkVersion": { "type": "string", "example": "0.1.0" }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": ["status", "contracts", "circuitBreaker"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "degraded"] },
+          "apiVersion": { "type": "string" },
+          "supportedVersions": { "type": "array", "items": { "type": "string" } },
+          "deprecatedVersions": { "type": "array", "items": { "type": "string" } },
+          "defaultVersion": { "type": "string" },
+          "contracts": { "type": "object", "additionalProperties": { "type": "boolean" } },
+          "circuitBreaker": { "type": "object" }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string", "example": "INVALID_REQUEST" },
+          "error": { "type": "string", "example": "unauthorized" },
+          "message": { "type": "string", "example": "Request body must include a credential id." },
+          "requiredScopes": { "type": "array", "items": { "type": "string" } },
+          "missingScopes": { "type": "array", "items": { "type": "string" } },
+          "details": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "field": { "type": "string" },
+                "value": { "type": "string" }
+              }
+            }
+          }
+        }
       }
     },
     "/credentials/verify/batch": {

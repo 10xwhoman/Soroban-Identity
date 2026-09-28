@@ -3,6 +3,13 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { buildSecurityHeaders, emitSecurityHeaders } from "./csp.config";
 
+export default defineConfig({
+  // Serve built assets from the CDN when CDN_BASE_URL is set (see infrastructure/cdn)
+  base: process.env.CDN_BASE_URL || "/",
+  plugins: [react()],
+  define: {
+    global: "globalThis",
+  },
 // The production policy ships with the bundle as a `_headers` file (Netlify /
 // Cloudflare Pages format) — see `emitSecurityHeaders`. Hosts using a
 // different mechanism (Vercel's `vercel.json`, an nginx `add_header` block)

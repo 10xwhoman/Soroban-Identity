@@ -1,3 +1,27 @@
+use soroban_sdk::{contracttype, Address, BytesN};
+
+/// Standardized reasons for revoking a credential.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum RevocationReason {
+    Unspecified = 0,
+    Compromised = 1,
+    Expired = 2,
+    Superseded = 3,
+    IssuerRevoked = 4,
+    SubjectRequest = 5,
+    PolicyViolation = 6,
+}
+
+/// Record stored when a credential is revoked.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RevocationRecord {
+    pub credential_id: BytesN<32>,
+    pub issuer: Address,
+    pub reason: RevocationReason,
+    pub revoked_at: u64,
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Map, String, Vec};
 
 #[contracttype]
@@ -123,4 +147,33 @@ impl Credential {
             None => false,
         }
     }
+}
+
+/// Standardized reason a credential was revoked. Loosely follows the
+/// X.509 CRL reason codes (RFC 5280 §5.3.1). Must stay in sync with the
+/// `RevocationReason` exported by the contract in `lib.rs`. #951
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RevocationReason {
+    Unspecified = 0,
+    KeyCompromise = 1,
+    IssuerCompromise = 2,
+    AffiliationChanged = 3,
+    Superseded = 4,
+    CessationOfOperation = 5,
+    PrivilegeWithdrawn = 6,
+    Fraudulent = 7,
+    SubjectRequest = 8,
+    DependencyRevoked = 9,
+}
+
+/// Revocation metadata persisted for each revoked credential. #951
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevocationRecord {
+    pub credential_id: BytesN<32>,
+    pub reason: RevocationReason,
+    pub revoked_by: Address,
+    pub revoked_at: u64,
 }
