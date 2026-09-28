@@ -3,6 +3,7 @@
 use credential_manager::{
     Credential, CredentialIdsPage, CredentialManager, CredentialStorageStats,
     CredentialTypeDescriptor, CredentialType, ContractError, IssuersPage,
+    RevocationReason, RevocationRecord,
 };
 use soroban_sdk::{Address, Bytes, BytesN, Env, Map, String, Vec};
 
@@ -107,7 +108,15 @@ pub trait CredentialManagerInterface {
         env: Env,
         issuer: Address,
         credential_id: BytesN<32>,
+        reason: RevocationReason,
     ) -> Result<(), ContractError>;
+
+    /// The stored revocation record, or `CredentialNotFound` if the credential
+    /// was never revoked. #937
+    fn get_revocation(
+        env: Env,
+        credential_id: BytesN<32>,
+    ) -> Result<RevocationRecord, ContractError>;
 
     fn expire_credential(
         env: Env,
@@ -290,8 +299,16 @@ impl CredentialManagerInterface for CredentialManager {
         env: Env,
         issuer: Address,
         credential_id: BytesN<32>,
+        reason: RevocationReason,
     ) -> Result<(), ContractError> {
-        Self::revoke_credential(env, issuer, credential_id)
+        Self::revoke_credential(env, issuer, credential_id, reason)
+    }
+
+    fn get_revocation(
+        env: Env,
+        credential_id: BytesN<32>,
+    ) -> Result<RevocationRecord, ContractError> {
+        Self::get_revocation(env, credential_id)
     }
 
     fn expire_credential(

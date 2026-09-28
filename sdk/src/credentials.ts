@@ -16,6 +16,7 @@ import type {
   CredentialType,
   Page,
   PaginationOptions,
+  RevocationReason,
   RevokedCredential,
   RevocationRecord,
   RevokeOptions,
@@ -461,7 +462,7 @@ export class CredentialClient extends BaseClient {
   async revokeBatch(
     issuerKeypair: Keypair,
     ids: string[],
-    reason: string,
+    reason: RevocationReason,
     options?: CallOptions
   ): Promise<{ txHash: string }> {
     if (ids.length > 50) {

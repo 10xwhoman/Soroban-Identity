@@ -11,6 +11,12 @@
 
 import { nativeToScVal, xdr } from '@stellar/stellar-sdk';
 import type { CredentialType } from './types';
+import {
+  REVOCATION_REASONS,
+  isRevocationReason,
+  type RevocationReason,
+} from './types';
+import { SorobanIdentityError } from './errors';
 import { encodeI64, encodeU64 } from './codec';
 
 // ── identity-registry ────────────────────────────────────────────────────────
@@ -146,19 +152,40 @@ export function buildIssueCredentialArgs(params: {
 }
 
 /**
- * Build args for `revoke_credential(issuer, credential_id)`.
+ * Encode a {@link RevocationReason} the way the contract decodes it.
+ *
+ * `#[contracttype]` unit-variant enums travel as a one-element vector holding
+ * the variant name as a symbol — `Vector[Symbol("Superseded")]`. Sending a bare
+ * symbol (what this SDK did before #937) is rejected by the host, which is why
+ * `revoke_credentials_batch` could not be called with a reason before.
+ */
+export function encodeRevocationReason(reason: RevocationReason): xdr.ScVal {
+  if (!isRevocationReason(reason)) {
+    throw new SorobanIdentityError(
+      `Unknown revocation reason ${String(reason)} — expected one of ${REVOCATION_REASONS.join(', ')}`,
+      'INVALID_ARGUMENT'
+    );
+  }
+  return xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(reason)]);
+}
+
+/**
+ * Build args for `revoke_credential(issuer, credential_id, reason)`.
  *
  * @param params.issuer       Registered issuer address (must sign the tx).
  * @param params.credentialId 32-byte credential ID buffer.
+ * @param params.reason       Why the credential is revoked (#937).
  * @returns ScVal array ready for `contract.call('revoke_credential', ...)`.
  */
 export function buildRevokeCredentialArgs(params: {
   issuer: string;
   credentialId: Buffer;
+  reason: RevocationReason;
 }): xdr.ScVal[] {
   return [
     nativeToScVal(params.issuer, { type: 'address' }),
     nativeToScVal(params.credentialId, { type: 'bytes' }),
+    encodeRevocationReason(params.reason),
   ];
 }
 
@@ -194,18 +221,19 @@ export function buildGetRevokedByReasonArgs(params: { reason: number }): xdr.ScV
  *
  * @param params.issuer        Registered issuer address (must sign the tx).
  * @param params.credentialIds Array of 32-byte credential ID buffers to revoke.
- * @param params.reason        Short symbol string describing the revocation reason.
+ * @param params.reason        Why the credentials are revoked — the same enum the
+ *                             single-credential path takes since #937.
  * @returns ScVal array ready for `contract.call('revoke_credentials_batch', ...)`.
  */
 export function buildRevokeBatchArgs(params: {
   issuer: string;
   credentialIds: Buffer[];
-  reason: string;
+  reason: RevocationReason;
 }): xdr.ScVal[] {
   return [
     nativeToScVal(params.issuer, { type: 'address' }),
     xdr.ScVal.scvVec(params.credentialIds.map((id) => nativeToScVal(id, { type: 'bytes' }))),
-    nativeToScVal(params.reason, { type: 'symbol' }),
+    encodeRevocationReason(params.reason),
   ];
 }
 
