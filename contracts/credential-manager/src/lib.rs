@@ -1,6 +1,9 @@
 #![no_std]
 #![deny(clippy::all)]
 
+mod templates;
+pub use templates::{CredentialTemplate, TemplateRef};
+
 mod versions;
 pub mod encryption;
 
