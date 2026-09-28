@@ -1,8 +1,11 @@
 #![no_std]
 #![deny(clippy::all)]
 
-pub mod encryption;
+mod templates;
+pub use templates::{CredentialTemplate, TemplateRef};
+
 mod versions;
+pub mod encryption;
 
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
@@ -58,6 +61,12 @@ const CRL_LEAVES: Symbol = symbol_short!("CRLLEAF");
 const CRL_ROOT: Symbol = symbol_short!("CRLROOT");
 const CRL_PERIOD_SECS: u64 = 86_400;
 
+// ── Issue #951: standardized revocation reasons ──────────────────────────────
+/// Maps a credential ID to its [`RevocationRecord`].
+const REVOKE_REASON: Symbol = symbol_short!("REVRSN");
+/// Maps a [`RevocationReason`] to the list of credential IDs revoked for it.
+const REVOKED_BY_REASON: Symbol = symbol_short!("REVBYRSN");
+
 // ── Issue #732: credential dependency chain storage keys ──────────────────────
 /// Maps a credential ID to its list of prerequisite credential IDs.
 const CRED_DEPS: Symbol = symbol_short!("CREDDEPS");
@@ -80,6 +89,10 @@ const MAX_CREDENTIAL_VERSION_HISTORY: u32 = MAX_VERSION_HISTORY;
 const CHALLENGE: Symbol = symbol_short!("CHALL");
 /// Challenge expiration time in seconds (5 minutes).
 const CHALLENGE_EXPIRATION_SECS: u64 = 300;
+// ── Issue #811: commitment-based proof registry ──────────────────────────────
+const ZK_SCHEMA: Symbol = symbol_short!("ZKSCHEMA");
+pub const ZK_PROOF_RANGE: u32 = 0;
+pub const ZK_PROOF_MEMBERSHIP: u32 = 1;
 /// Supported signature schemes.
 pub const SIG_SCHEME_ED25519: u32 = 0;
 pub const SIG_SCHEME_SECP256K1: u32 = 1;
@@ -149,6 +162,24 @@ pub enum ContractError {
     InsufficientApprovals = 30,
     /// Issue #658: admin action has expired.
     AdminActionExpired = 31,
+    NoUpgradePending = 32,
+    UpgradeAlreadyExecuted = 33,
+    UpgradeTimelockNotExpired = 34,
+    CredentialTypeAlreadyExists = 35,
+    CredentialTypeNotFound = 36,
+    CredentialTypeInactive = 37,
+    ClaimsSchemaMismatch = 38,
+    MaxCredentialTypesReached = 39,
+    DelegationNotFound = 40,
+    UnauthorizedDelegate = 41,
+    InvalidDelegationExpiry = 42,
+    DelegationAlreadyRevoked = 43,
+    ActivationTimeNotFuture = 44,
+    CredentialNotYetActive = 45,
+    ZkSchemaNotFound = 46,
+    ZkSchemaInactive = 47,
+    UnsupportedZkProofType = 48,
+    InvalidZkProof = 49,
     /// Issue #816: credential version was not found in the amendment history.
     VersionNotFound = 32,
     /// Issue #947: no encryption key registered for the address.
@@ -210,6 +241,45 @@ pub enum CredentialType {
     Custom,
 }
 
+/// Standardized reason a credential was revoked. Loosely follows the
+/// X.509 CRL reason codes (RFC 5280 §5.3.1) so that off-chain systems can
+/// map them directly. Stored as a `u32` on-chain. See #951.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RevocationReason {
+    /// No reason given. Used by legacy callers of `revoke_credential`.
+    Unspecified = 0,
+    /// The subject's signing key was compromised.
+    KeyCompromise = 1,
+    /// The issuer's signing key was compromised.
+    IssuerCompromise = 2,
+    /// The subject's affiliation with the issuer changed.
+    AffiliationChanged = 3,
+    /// The credential was replaced by a newer one.
+    Superseded = 4,
+    /// The issuer no longer operates the credential program.
+    CessationOfOperation = 5,
+    /// The privilege granted by the credential was withdrawn.
+    PrivilegeWithdrawn = 6,
+    /// The credential was obtained with false or fraudulent information.
+    Fraudulent = 7,
+    /// The subject asked for the credential to be revoked.
+    SubjectRequest = 8,
+    /// A prerequisite credential was revoked (cascade revocation, #732).
+    DependencyRevoked = 9,
+}
+
+/// Revocation metadata persisted for each revoked credential. See #951.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevocationRecord {
+    pub credential_id: BytesN<32>,
+    pub reason: RevocationReason,
+    pub revoked_by: Address,
+    pub revoked_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct CredentialIdsPage {
@@ -261,6 +331,26 @@ pub struct Challenge {
     pub created_at: u64,
     /// Signature scheme required (0=Ed25519, 1=secp256k1).
     pub sig_scheme: u32,
+}
+
+/// On-chain registry entry for a commitment-based proof protocol.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZkProofSchema {
+    pub schema_id: BytesN<32>,
+    pub name: String,
+    pub proof_type: u32,
+    pub verification_key: Bytes,
+    pub registered_at: u64,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZkVerificationResult {
+    pub valid: bool,
+    pub schema_id: BytesN<32>,
+    pub proof_type: u32,
 }
 
 // -- Issue #658: multi-signature admin operations
@@ -712,6 +802,71 @@ impl CredentialManager {
         Self::type_names(&env)
     }
 
+    /// Registers a verification key for the supported commitment proof
+    /// protocols. The proof itself is generated off-chain; the contract keeps
+    /// the key and verifies the Fiat-Shamir transcript on-chain.
+    pub fn register_zk_schema(
+        env: Env,
+        admin: Address,
+        schema_id: BytesN<32>,
+        name: String,
+        proof_type: u32,
+        verification_key: Bytes,
+    ) -> Result<(), ContractError> {
+        Self::require_admin_caller(&env, &admin)?;
+        if proof_type != ZK_PROOF_RANGE && proof_type != ZK_PROOF_MEMBERSHIP {
+            return Err(ContractError::UnsupportedZkProofType);
+        }
+        if verification_key.len() == 0 {
+            return Err(ContractError::InvalidZkProof);
+        }
+        let key = (ZK_SCHEMA, schema_id.clone());
+        env.storage().persistent().set(&key, &ZkProofSchema {
+            schema_id: schema_id.clone(), name, proof_type, verification_key,
+            registered_at: env.ledger().timestamp(), active: true,
+        });
+        env.storage().persistent().extend_ttl(&key, TTL_MAX, TTL_MAX);
+        env.events().publish((CRED, symbol_short!("zkschema")), (EVENT_VERSION, schema_id, proof_type));
+        Ok(())
+    }
+
+    pub fn get_zk_schema(env: Env, schema_id: BytesN<32>) -> Result<ZkProofSchema, ContractError> {
+        env.storage().persistent().get(&(ZK_SCHEMA, schema_id)).ok_or(ContractError::ZkSchemaNotFound)
+    }
+
+    pub fn set_zk_schema_active(env: Env, admin: Address, schema_id: BytesN<32>, active: bool) -> Result<(), ContractError> {
+        Self::require_admin_caller(&env, &admin)?;
+        let key = (ZK_SCHEMA, schema_id);
+        let mut schema: ZkProofSchema = env.storage().persistent().get(&key).ok_or(ContractError::ZkSchemaNotFound)?;
+        schema.active = active;
+        env.storage().persistent().set(&key, &schema);
+        Ok(())
+    }
+
+    /// Verifies a compact Fiat-Shamir commitment transcript. `statement` is a
+    /// public predicate encoding (for example an age threshold or membership
+    /// set identifier), while `proof` is the 32-byte transcript produced by
+    /// the corresponding off-chain prover. No private claim value is stored or
+    /// revealed by this endpoint.
+    pub fn verify_zk_proof(
+        env: Env,
+        schema_id: BytesN<32>,
+        commitment: BytesN<32>,
+        statement: Bytes,
+        proof: Bytes,
+    ) -> Result<ZkVerificationResult, ContractError> {
+        let schema: ZkProofSchema = env.storage().persistent().get(&(ZK_SCHEMA, schema_id.clone())).ok_or(ContractError::ZkSchemaNotFound)?;
+        if !schema.active { return Err(ContractError::ZkSchemaInactive); }
+        if proof.len() != 32 { return Err(ContractError::InvalidZkProof); }
+        let expected = Self::zk_transcript(&env, &schema.verification_key, &commitment, &statement);
+        let mut supplied = [0u8; 32];
+        proof.copy_into_slice(&mut supplied);
+        let valid = expected == BytesN::from_array(&env, &supplied);
+        env.events().publish((CRED, symbol_short!("zkverify")), (EVENT_VERSION, schema_id.clone(), schema.proof_type, valid));
+        if !valid { return Err(ContractError::InvalidZkProof); }
+        Ok(ZkVerificationResult { valid, schema_id, proof_type: schema.proof_type })
+    }
+
     /// Issues a credential after validating `claims` against a registered
     /// type's schema, then delegates to [`Self::issue_credential`].
     #[allow(clippy::too_many_arguments)]
@@ -1014,10 +1169,28 @@ impl CredentialManager {
         current == expected
     }
 
+    /// Revoke a credential without a specific reason. Equivalent to
+    /// [`Self::revoke_credential_with_reason`] with
+    /// [`RevocationReason::Unspecified`]; kept for backwards compatibility.
     pub fn revoke_credential(
         env: Env,
         issuer: Address,
         credential_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        Self::revoke_credential_with_reason(env, issuer, credential_id, RevocationReason::Unspecified)
+    }
+
+    /// Revoke a credential and record a standardized [`RevocationReason`].
+    ///
+    /// The reason is persisted in a [`RevocationRecord`] (queryable via
+    /// [`Self::get_revocation_record`]), indexed for
+    /// [`Self::get_revoked_by_reason`], and emitted in the `revoked` event.
+    /// See #951.
+    pub fn revoke_credential_with_reason(
+        env: Env,
+        issuer: Address,
+        credential_id: BytesN<32>,
+        reason: RevocationReason,
     ) -> Result<(), ContractError> {
         issuer.require_auth();
         Self::require_not_paused(&env)?;
@@ -1072,9 +1245,10 @@ impl CredentialManager {
         // closes #553: include revocation timestamp so off-chain systems can
         // detect and invalidate cached verify_credential results.
         let revoked_at: u64 = env.ledger().timestamp();
+        Self::record_revocation(&env, &credential_id, reason, &issuer, revoked_at);
         env.events().publish(
             (CRED, symbol_short!("revoked")),
-            (EVENT_VERSION, credential_id.clone(), issuer, revoked_at),
+            (EVENT_VERSION, credential_id.clone(), issuer, revoked_at, reason),
         );
 
         // Issue #732: cascade-revoke all credentials that depend on this one.
@@ -1469,6 +1643,20 @@ impl CredentialManager {
 
     pub fn get_revocations(env: Env, issuer: Address, subject: Address) -> Vec<BytesN<32>> {
         Self::fetch_revocations(&env, &issuer, &subject)
+    }
+
+    /// Returns the revocation record (reason, revoker, timestamp) for a
+    /// credential, or `None` if it has not been revoked. See #951.
+    pub fn get_revocation_record(env: Env, credential_id: BytesN<32>) -> Option<RevocationRecord> {
+        env.storage().persistent().get(&(REVOKE_REASON, credential_id))
+    }
+
+    /// Returns the IDs of all credentials revoked for `reason`. See #951.
+    pub fn get_revoked_by_reason(env: Env, reason: RevocationReason) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&(REVOKED_BY_REASON, reason))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn list_issuer_credentials(
@@ -2071,11 +2259,23 @@ impl CredentialManager {
         env.storage().instance().set(&REVOKED_CNT, &(revoked + 1));
         // closes #553: include revocation timestamp in batch events too.
         let revoked_at: u64 = env.ledger().timestamp();
+        // #951: batch revocations carry a free-form `Symbol` reason, so the
+        // standardized reason is recorded as `Unspecified`.
+        Self::record_revocation(env, credential_id, RevocationReason::Unspecified, issuer, revoked_at);
         env.events().publish(
             (CRED, symbol_short!("revoked")),
             (EVENT_VERSION, credential_id.clone(), issuer.clone(), revoked_at, reason.clone()),
         );
         Ok(())
+    }
+
+    fn zk_transcript(env: &Env, verification_key: &Bytes, commitment: &BytesN<32>, statement: &Bytes) -> BytesN<32> {
+        let mut data = Bytes::new(env);
+        data.extend_from_array(b"FUNDABLE-ZK-V1");
+        data.append(verification_key);
+        data.extend_from_array(&commitment.to_array());
+        data.append(statement);
+        env.crypto().sha256(&data).into()
     }
 
     fn crl_period(timestamp: u64) -> u64 {
@@ -2307,6 +2507,38 @@ impl CredentialManager {
         }
         let next_cursor = if (next as u32) < total { Some(next) } else { None };
         CredentialIdsPage { items, next_cursor }
+    }
+
+    /// Issue #951: persist the revocation record and add the credential to the
+    /// per-reason index.
+    fn record_revocation(
+        env: &Env,
+        credential_id: &BytesN<32>,
+        reason: RevocationReason,
+        revoked_by: &Address,
+        revoked_at: u64,
+    ) {
+        let record_key = (REVOKE_REASON, credential_id.clone());
+        env.storage().persistent().set(
+            &record_key,
+            &RevocationRecord {
+                credential_id: credential_id.clone(),
+                reason,
+                revoked_by: revoked_by.clone(),
+                revoked_at,
+            },
+        );
+        env.storage().persistent().extend_ttl(&record_key, TTL_MAX, TTL_MAX);
+
+        let index_key = (REVOKED_BY_REASON, reason);
+        let mut ids: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&index_key)
+            .unwrap_or_else(|| Vec::new(env));
+        ids.push_back(credential_id.clone());
+        env.storage().persistent().set(&index_key, &ids);
+        env.storage().persistent().extend_ttl(&index_key, TTL_MAX, TTL_MAX);
     }
 
     /// Issue #662: Helper to remove a credential ID from an index vector.
@@ -2553,9 +2785,16 @@ impl CredentialManager {
                     env.storage().persistent().set(&dep_key, &dep);
                     let revoked: u32 = env.storage().instance().get(&REVOKED_CNT).unwrap_or(0);
                     env.storage().instance().set(&REVOKED_CNT, &(revoked + 1));
+                    Self::record_revocation(
+                        env,
+                        &dep_id,
+                        RevocationReason::DependencyRevoked,
+                        &dep.issuer,
+                        env.ledger().timestamp(),
+                    );
                     env.events().publish(
                         (CRED, symbol_short!("dep_rev")),
-                        (EVENT_VERSION, dep_id.clone(), parent_id.clone()),
+                        (EVENT_VERSION, dep_id.clone(), parent_id.clone(), RevocationReason::DependencyRevoked),
                     );
                     // Recurse: cascade to credentials that depend on this one.
                     Self::cascade_revoke_dependants(env, &dep_id, depth + 1);

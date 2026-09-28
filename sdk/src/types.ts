@@ -121,6 +121,52 @@ export interface RevokedCredential extends Credential {
   /** ISO-8601 timestamp of the ledger that included the revocation transaction. */
   revokedAt: string;
   status: 'revoked';
+  /** Standardized reason recorded on-chain for the revocation. #951 */
+  revocationReason?: RevocationReason;
+}
+
+/**
+ * Standardized revocation reasons, mirroring the contract's
+ * `RevocationReason` enum (stored on-chain as a `u32`). #951
+ */
+export const RevocationReason = {
+  Unspecified: 0,
+  KeyCompromise: 1,
+  IssuerCompromise: 2,
+  AffiliationChanged: 3,
+  Superseded: 4,
+  CessationOfOperation: 5,
+  PrivilegeWithdrawn: 6,
+  Fraudulent: 7,
+  SubjectRequest: 8,
+  DependencyRevoked: 9,
+} as const;
+
+export type RevocationReason = (typeof RevocationReason)[keyof typeof RevocationReason];
+
+/** Human-readable name of a {@link RevocationReason} value. */
+export type RevocationReasonName = keyof typeof RevocationReason;
+
+/** Returns the name of a {@link RevocationReason} value, or `undefined` if unknown. */
+export function revocationReasonName(reason: number): RevocationReasonName | undefined {
+  return (Object.keys(RevocationReason) as RevocationReasonName[]).find(
+    (name) => RevocationReason[name] === reason
+  );
+}
+
+/** Revocation metadata returned by {@link CredentialClient.getRevocationRecord}. #951 */
+export interface RevocationRecord {
+  credentialId: string;
+  reason: RevocationReason;
+  revokedBy: string;
+  /** Unix timestamp (seconds) of the revocation. */
+  revokedAt: number;
+}
+
+/** Options for {@link CredentialClient.revokeCredential}. */
+export interface RevokeOptions extends CallOptions {
+  /** Standardized revocation reason. Defaults to `RevocationReason.Unspecified`. */
+  reason?: RevocationReason;
 }
 
 /**

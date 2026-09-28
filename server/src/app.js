@@ -216,10 +216,11 @@ export function createApp({
     const isMetricsEndpoint = req.method === "GET" && pathname === "/metrics";
     
     // Generate requestId for all endpoints except metrics
-    const requestId = isMetricsEndpoint ? null : (req.headers["x-request-id"] || crypto.randomUUID());
+    const requestId = isMetricsEndpoint ? null : (req.headers["x-correlation-id"] || req.headers["x-request-id"] || crypto.randomUUID());
     
     if (!isMetricsEndpoint) {
       res.setHeader("X-Request-ID", requestId);
+      res.setHeader("X-Correlation-ID", requestId);
     }
 
     // Resolve tenant context (#800)
@@ -482,7 +483,7 @@ export function createApp({
       }
     }
 
-    return requestContextStore.run({ requestId, tenantId, correlationId }, async () => {
+    return requestContextStore.run({ ...(requestContextStore.getStore() || {}), requestId, tenantId }, async () => {
       try {
         if (req.method === "GET" && pathname === "/info") {
           return sendJson(res, 200, {

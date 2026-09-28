@@ -24,11 +24,14 @@ function createLogger() {
     mixin() {
       // Inject requestId and correlationId (#946) from the request context
       const store = requestContextStore.getStore();
-      if (!store) return {};
-      const fields = {};
-      if (store.requestId) fields.requestId = store.requestId;
-      if (store.correlationId) fields.correlationId = store.correlationId;
-      return fields;
+      if (store && (store.requestId || store.traceId)) {
+        return {
+          ...(store.requestId ? { requestId: store.requestId } : {}),
+          ...(store.traceId ? { traceId: store.traceId } : {}),
+          ...(store.spanId ? { spanId: store.spanId } : {}),
+        };
+      }
+      return {};
     },
   });
 }

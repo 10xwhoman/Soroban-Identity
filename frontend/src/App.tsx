@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useCallback, useRef } from "react";
+import { lazy, Suspense, useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { SorobanRpc } from "@stellar/stellar-sdk";
 import LoadingFallback from "./components/LoadingFallback";
@@ -33,6 +33,8 @@ import {
 } from "./network";
 import { checkConnection, IdentityClient, CredentialClient, ReputationClient } from "../../sdk/src/index";
 import { setLocale } from "./i18n";
+import { useOpenGraphMeta } from "./hooks/useOpenGraphMeta";
+import { SHARE_DESCRIPTION, SHARE_TITLE, buildVerificationUrl } from "./utils/socialShare";
 import type { Credential } from "../../sdk/src/types";
 
 const SUPPORTED_LOCALES: { code: string; label: string }[] = [
@@ -93,6 +95,13 @@ export default function App() {
       setTab(Tab.Credentials);
     }
   }, []);
+
+  // #948: link preview metadata for shared `?verify=<id>` links.
+  const verifyMeta = useMemo(
+    () => (verifyId ? { title: SHARE_TITLE, description: SHARE_DESCRIPTION, url: buildVerificationUrl(verifyId) } : null),
+    [verifyId]
+  );
+  useOpenGraphMeta(verifyMeta);
 
   const onMainnet = isMainnet(activeNetwork);
 
