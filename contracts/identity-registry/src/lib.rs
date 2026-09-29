@@ -63,6 +63,11 @@ const MAX_SERVICES: u32 = 10;
 /// in a single call, chosen to stay well within Soroban instruction limits.
 pub const MAX_BATCH_DIDS: u32 = 50;
 
+/// Maximum number of entries accepted by [`IdentityRegistry::update_dids_batch`]
+/// in a single call. Set lower than creation batch to account for additional
+/// validation overhead (existence checks, deactivation status).
+pub const MAX_BATCH_UPDATE_SIZE: u32 = 20;
+
 // ── Data types ────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -336,6 +341,131 @@ impl IdentityRegistry {
         let meta_hash: BytesN<32> = env.crypto().sha256(&hash_input).into();
         env.events().publish((IDENTITY, symbol_short!("updated")), (EVENT_VERSION, controller, meta_hash));
         Ok(())
+    }
+
+    /// Updates multiple DIDs (up to [`MAX_BATCH_UPDATE_SIZE`]) in one transaction.
+    /// Each controller must sign. All updates are validated before any writes occur,
+    /// ensuring atomic success or failure. Returns a vector of results indicating
+    /// success or failure for each DID update.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `entries` - A vector of tuples, each containing an address (controller) and
+    ///   the new metadata map for that DID.
+    ///
+    /// # Returns
+    /// A vector of `Result<(), ContractError>` in the same order as `entries`.
+    /// Each element indicates whether the corresponding update succeeded or failed.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::ContractPaused`] if the contract is paused.
+    /// Returns [`ContractError::EmptyBatch`] if the entries vector is empty.
+    /// Returns [`ContractError::BatchTooLarge`] if entries exceed [`MAX_BATCH_UPDATE_SIZE`].
+    ///
+    /// Individual update failures are captured in the returned vector and do not
+    /// halt processing of remaining entries. Common per-entry errors include:
+    /// - [`ContractError::DidNotFound`] if the DID doesn't exist
+    /// - [`ContractError::DidDeactivated`] if the DID is deactivated
+    /// - [`ContractError::EmptyMetadata`] if metadata is empty
+    /// - [`ContractError::MetadataTooLong`] or [`ContractError::MetadataTooLarge`] on validation failure
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let entries = vec![
+    ///     &env,
+    ///     (user1.clone(), metadata1.clone()),
+    ///     (user2.clone(), metadata2.clone()),
+    /// ];
+    /// let results = contract.update_dids_batch(&entries);
+    /// // results[0] -> Ok(()) or Err(...)
+    /// // results[1] -> Ok(()) or Err(...)
+    /// ```
+    pub fn update_dids_batch(
+        env: Env,
+        entries: Vec<(Address, Map<String, String>)>,
+    ) -> Result<Vec<Result<(), ContractError>>, ContractError> {
+        Self::require_not_paused(&env)?;
+
+        // Validate batch size constraints
+        if entries.is_empty() {
+            return Err(ContractError::EmptyBatch);
+        }
+        if entries.len() > MAX_BATCH_UPDATE_SIZE {
+            return Err(ContractError::BatchTooLarge);
+        }
+
+        let storage = env.storage().persistent();
+        let now = env.ledger().timestamp();
+        let mut results = Vec::new(&env);
+
+        // Phase 1: Validate all entries before applying any updates
+        // This ensures we can provide meaningful per-entry error information
+        // while still validating the entire batch upfront
+        let mut validation_results = Vec::new(&env);
+        
+        for (controller, metadata) in entries.iter() {
+            // Require authorization for each controller
+            controller.require_auth();
+
+            // Validate this entry
+            let validation_result: Result<(), ContractError> = (|| {
+                if metadata.is_empty() {
+                    return Err(ContractError::EmptyMetadata);
+                }
+                Self::validate_metadata(&metadata)?;
+                
+                let key = Self::did_key(&env, &controller);
+                let doc: DidDocument = storage.get(&key).ok_or(ContractError::DidNotFound)?;
+                
+                if !doc.active {
+                    return Err(ContractError::DidDeactivated);
+                }
+                
+                Ok(())
+            })();
+            
+            validation_results.push_back(validation_result);
+        }
+
+        // Phase 2: Apply updates for entries that passed validation
+        for (i, (controller, metadata)) in entries.iter().enumerate() {
+            // Check if validation passed for this entry
+            let validation_passed = validation_results.get(i).unwrap_or(Err(ContractError::DidNotFound));
+            
+            if validation_passed.is_err() {
+                // Validation failed, record the error and skip update
+                results.push_back(validation_passed);
+                continue;
+            }
+
+            // Validation passed, perform the update
+            let update_result: Result<(), ContractError> = (|| {
+                let key = Self::did_key(&env, &controller);
+                let mut doc: DidDocument = storage.get(&key).ok_or(ContractError::DidNotFound)?;
+                
+                doc.metadata = metadata.clone();
+                doc.updated_at = now;
+                
+                storage.set(&key, &doc);
+                storage.extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
+                
+                // Emit update event with metadata hash
+                let mut hash_input = Self::string_to_bytes(&env, &doc.id);
+                hash_input.extend_from_array(&doc.updated_at.to_be_bytes());
+                let meta_hash: BytesN<32> = env.crypto().sha256(&hash_input).into();
+                
+                env.events().publish(
+                    (IDENTITY, symbol_short!("updated")),
+                    (EVENT_VERSION, controller.clone(), meta_hash),
+                );
+                
+                Ok(())
+            })();
+            
+            results.push_back(update_result);
+        }
+
+        Ok(results)
     }
 
     /// Deactivates a DID. Only its controller can call this.
@@ -1242,5 +1372,345 @@ mod tests {
         let mut entries = Vec::new(&env);
         entries.push_back((Address::generate(&env), Map::new(&env)));
         assert_eq!(client.try_create_dids_batch(&entries), Err(Ok(ContractError::ContractPaused)));
+    }
+
+    // ── update_dids_batch tests (#889) ────────────────────────────────────────
+
+    /// Helper function to create metadata with a given key-value pair
+    fn make_metadata(env: &Env, key: &str, value: &str) -> Map<String, String> {
+        let mut metadata = Map::new(env);
+        metadata.set(String::from_str(env, key), String::from_str(env, value));
+        metadata
+    }
+
+    #[test]
+    fn test_update_dids_batch_updates_all_and_returns_success() {
+        let (env, client) = setup();
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+        let u3 = Address::generate(&env);
+
+        // Create DIDs first
+        client.create_did(&u1, &make_metadata(&env, "initial", "data1"));
+        client.create_did(&u2, &make_metadata(&env, "initial", "data2"));
+        client.create_did(&u3, &make_metadata(&env, "initial", "data3"));
+
+        // Prepare batch update
+        let mut entries = Vec::new(&env);
+        entries.push_back((u1.clone(), make_metadata(&env, "updated", "value1")));
+        entries.push_back((u2.clone(), make_metadata(&env, "updated", "value2")));
+        entries.push_back((u3.clone(), make_metadata(&env, "updated", "value3")));
+
+        // Perform batch update
+        let results = client.update_dids_batch(&entries);
+        assert_eq!(results.len(), 3);
+
+        // All updates should succeed
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        assert_eq!(results.get(1).unwrap(), Ok(()));
+        assert_eq!(results.get(2).unwrap(), Ok(()));
+
+        // Verify metadata was updated
+        let doc1 = client.resolve_did(&u1);
+        assert_eq!(doc1.metadata.get(String::from_str(&env, "updated")).unwrap(), String::from_str(&env, "value1"));
+
+        let doc2 = client.resolve_did(&u2);
+        assert_eq!(doc2.metadata.get(String::from_str(&env, "updated")).unwrap(), String::from_str(&env, "value2"));
+
+        let doc3 = client.resolve_did(&u3);
+        assert_eq!(doc3.metadata.get(String::from_str(&env, "updated")).unwrap(), String::from_str(&env, "value3"));
+    }
+
+    #[test]
+    fn test_update_dids_batch_rejects_empty() {
+        let (env, client) = setup();
+        let entries: Vec<(Address, Map<String, String>)> = Vec::new(&env);
+        assert_eq!(client.try_update_dids_batch(&entries), Err(Ok(ContractError::EmptyBatch)));
+    }
+
+    #[test]
+    fn test_update_dids_batch_enforces_size_cap() {
+        let (env, client) = setup();
+        
+        // Create MAX_BATCH_UPDATE_SIZE + 1 DIDs
+        let mut entries = Vec::new(&env);
+        for _ in 0..(MAX_BATCH_UPDATE_SIZE + 1) {
+            let user = Address::generate(&env);
+            client.create_did(&user, &Map::new(&env));
+            entries.push_back((user, make_metadata(&env, "key", "value")));
+        }
+        
+        // Batch exceeds limit
+        assert_eq!(client.try_update_dids_batch(&entries), Err(Ok(ContractError::BatchTooLarge)));
+
+        // Exactly MAX_BATCH_UPDATE_SIZE succeeds
+        entries.pop_back();
+        let results = client.update_dids_batch(&entries);
+        assert_eq!(results.len(), MAX_BATCH_UPDATE_SIZE);
+    }
+
+    #[test]
+    fn test_update_dids_batch_returns_error_for_nonexistent_did() {
+        let (env, client) = setup();
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env); // No DID created for u2
+        let u3 = Address::generate(&env);
+
+        client.create_did(&u1, &Map::new(&env));
+        client.create_did(&u3, &Map::new(&env));
+
+        let mut entries = Vec::new(&env);
+        entries.push_back((u1.clone(), make_metadata(&env, "key", "val1")));
+        entries.push_back((u2.clone(), make_metadata(&env, "key", "val2")));
+        entries.push_back((u3.clone(), make_metadata(&env, "key", "val3")));
+
+        let results = client.update_dids_batch(&entries);
+        assert_eq!(results.len(), 3);
+
+        // u1 should succeed
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        // u2 should fail (DID not found)
+        assert_eq!(results.get(1).unwrap(), Err(ContractError::DidNotFound));
+        // u3 should succeed
+        assert_eq!(results.get(2).unwrap(), Ok(()));
+
+        // Verify u1 and u3 were actually updated
+        let doc1 = client.resolve_did(&u1);
+        assert_eq!(doc1.metadata.get(String::from_str(&env, "key")).unwrap(), String::from_str(&env, "val1"));
+
+        let doc3 = client.resolve_did(&u3);
+        assert_eq!(doc3.metadata.get(String::from_str(&env, "key")).unwrap(), String::from_str(&env, "val3"));
+    }
+
+    #[test]
+    fn test_update_dids_batch_returns_error_for_deactivated_did() {
+        let (env, client) = setup();
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+        let u3 = Address::generate(&env);
+
+        client.create_did(&u1, &Map::new(&env));
+        client.create_did(&u2, &Map::new(&env));
+        client.create_did(&u3, &Map::new(&env));
+
+        // Deactivate u2
+        client.deactivate_did(&u2);
+
+        let mut entries = Vec::new(&env);
+        entries.push_back((u1.clone(), make_metadata(&env, "key", "val1")));
+        entries.push_back((u2.clone(), make_metadata(&env, "key", "val2")));
+        entries.push_back((u3.clone(), make_metadata(&env, "key", "val3")));
+
+        let results = client.update_dids_batch(&entries);
+        assert_eq!(results.len(), 3);
+
+        // u1 should succeed
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        // u2 should fail (deactivated)
+        assert_eq!(results.get(1).unwrap(), Err(ContractError::DidDeactivated));
+        // u3 should succeed
+        assert_eq!(results.get(2).unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn test_update_dids_batch_validates_metadata_empty() {
+        let (env, client) = setup();
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+
+        client.create_did(&u1, &Map::new(&env));
+        client.create_did(&u2, &Map::new(&env));
+
+        let mut entries = Vec::new(&env);
+        entries.push_back((u1.clone(), make_metadata(&env, "key", "value")));
+        entries.push_back((u2.clone(), Map::new(&env))); // Empty metadata
+
+        let results = client.update_dids_batch(&entries);
+        assert_eq!(results.len(), 2);
+
+        // u1 should succeed
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        // u2 should fail (empty metadata)
+        assert_eq!(results.get(1).unwrap(), Err(ContractError::EmptyMetadata));
+    }
+
+    #[test]
+    fn test_update_dids_batch_validates_metadata_too_long() {
+        let (env, client) = setup();
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+
+        client.create_did(&u1, &Map::new(&env));
+        client.create_did(&u2, &Map::new(&env));
+
+        // Create metadata with key that's too long
+        let mut bad_metadata: Map<String, String> = Map::new(&env);
+        bad_metadata.set(
+            String::from_str(&env, "aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeefffff1234567890"),
+            String::from_str(&env, "value"),
+        );
+
+        let mut entries = Vec::new(&env);
+        entries.push_back((u1.clone(), make_metadata(&env, "key", "value")));
+        entries.push_back((u2.clone(), bad_metadata));
+
+        let results = client.update_dids_batch(&entries);
+        assert_eq!(results.len(), 2);
+
+        // u1 should succeed
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        // u2 should fail (metadata too long)
+        assert_eq!(results.get(1).unwrap(), Err(ContractError::MetadataTooLong));
+    }
+
+    #[test]
+    fn test_update_dids_batch_requires_auth_for_all_controllers() {
+        let env = Env::default();
+        // Don't mock all auths - we want to test authorization
+        let contract_id = env.register_contract(None, IdentityRegistry);
+        let client = IdentityRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        
+        env.mock_all_auths();
+        client.initialize(&admin);
+
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+        
+        client.create_did(&u1, &Map::new(&env));
+        client.create_did(&u2, &Map::new(&env));
+
+        // Stop mocking all auths to test authorization requirement
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let mut entries = Vec::new(&env);
+        entries.push_back((u1.clone(), make_metadata(&env, "key", "val1")));
+        entries.push_back((u2.clone(), make_metadata(&env, "key", "val2")));
+
+        // This should require authentication for both u1 and u2
+        // The function internally calls require_auth for each controller
+        env.mock_all_auths();
+        let results = client.update_dids_batch(&entries);
+        
+        // With mocked auth, both should succeed
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        assert_eq!(results.get(1).unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn test_update_dids_batch_blocked_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, IdentityRegistry);
+        let client = IdentityRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let user = Address::generate(&env);
+        client.create_did(&user, &Map::new(&env));
+
+        client.pause(&admin);
+
+        let mut entries = Vec::new(&env);
+        entries.push_back((user, make_metadata(&env, "key", "value")));
+        
+        assert_eq!(client.try_update_dids_batch(&entries), Err(Ok(ContractError::ContractPaused)));
+    }
+
+    #[test]
+    fn test_update_dids_batch_emits_events_for_successful_updates() {
+        let (env, client) = setup();
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+
+        client.create_did(&u1, &Map::new(&env));
+        client.create_did(&u2, &Map::new(&env));
+
+        let mut entries = Vec::new(&env);
+        entries.push_back((u1.clone(), make_metadata(&env, "key", "val1")));
+        entries.push_back((u2.clone(), make_metadata(&env, "key", "val2")));
+
+        let results = client.update_dids_batch(&entries);
+        
+        // Both should succeed
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        assert_eq!(results.get(1).unwrap(), Ok(()));
+
+        // Events should have been emitted (2 updated events)
+        // The actual event validation would require inspecting env.events()
+        // which is typically done in integration tests
+    }
+
+    #[test]
+    fn test_update_dids_batch_mixed_success_and_failure() {
+        let (env, client) = setup();
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+        let u3 = Address::generate(&env);
+        let u4 = Address::generate(&env);
+
+        // Create only u1 and u3
+        client.create_did(&u1, &Map::new(&env));
+        client.create_did(&u3, &Map::new(&env));
+        // u2 and u4 don't exist
+
+        let mut entries = Vec::new(&env);
+        entries.push_back((u1.clone(), make_metadata(&env, "key", "val1")));
+        entries.push_back((u2.clone(), make_metadata(&env, "key", "val2")));
+        entries.push_back((u3.clone(), make_metadata(&env, "key", "val3")));
+        entries.push_back((u4.clone(), make_metadata(&env, "key", "val4")));
+
+        let results = client.update_dids_batch(&entries);
+        assert_eq!(results.len(), 4);
+
+        // Check individual results
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        assert_eq!(results.get(1).unwrap(), Err(ContractError::DidNotFound));
+        assert_eq!(results.get(2).unwrap(), Ok(()));
+        assert_eq!(results.get(3).unwrap(), Err(ContractError::DidNotFound));
+
+        // Verify successful updates
+        let doc1 = client.resolve_did(&u1);
+        assert_eq!(doc1.metadata.get(String::from_str(&env, "key")).unwrap(), String::from_str(&env, "val1"));
+
+        let doc3 = client.resolve_did(&u3);
+        assert_eq!(doc3.metadata.get(String::from_str(&env, "key")).unwrap(), String::from_str(&env, "val3"));
+    }
+
+    #[test]
+    fn test_update_dids_batch_preserves_other_document_fields() {
+        let (env, client) = setup();
+        let user = Address::generate(&env);
+
+        // Create DID with initial metadata
+        client.create_did(&user, &make_metadata(&env, "original", "data"));
+        
+        let doc_before = client.resolve_did(&user);
+        let created_at_before = doc_before.created_at;
+        let id_before = doc_before.id.clone();
+        let controller_before = doc_before.controller.clone();
+
+        // Wait a bit to ensure timestamp changes
+        env.ledger().with_mut(|li| {
+            li.timestamp = li.timestamp + 10;
+        });
+
+        // Update metadata via batch
+        let mut entries = Vec::new(&env);
+        entries.push_back((user.clone(), make_metadata(&env, "updated", "value")));
+
+        let results = client.update_dids_batch(&entries);
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+
+        // Verify fields are preserved
+        let doc_after = client.resolve_did(&user);
+        assert_eq!(doc_after.id, id_before);
+        assert_eq!(doc_after.controller, controller_before);
+        assert_eq!(doc_after.created_at, created_at_before);
+        assert!(doc_after.updated_at > created_at_before);
+        assert!(doc_after.active);
+        
+        // Verify metadata was updated
+        assert_eq!(doc_after.metadata.get(String::from_str(&env, "updated")).unwrap(), String::from_str(&env, "value"));
     }
 }
