@@ -6,6 +6,7 @@ pub use templates::{CredentialTemplate, TemplateRef};
 
 mod versions;
 pub mod encryption;
+mod events;
 
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
