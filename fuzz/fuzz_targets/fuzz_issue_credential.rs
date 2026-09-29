@@ -103,6 +103,8 @@ libfuzzer_sys::fuzz_target!(|input: IssueCredentialInput| {
         &claims_hash,
         &signature,
         &input.expires_at,
+        &0u64, // activation_time: 0 = immediately active
+        &None,
         &None,
     );
 
