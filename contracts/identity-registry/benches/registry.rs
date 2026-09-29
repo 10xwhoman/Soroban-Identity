@@ -110,5 +110,96 @@ fn bench_identity_registry(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_identity_registry);
+fn bench_recovery(c: &mut Criterion) {
+    let mut g = c.benchmark_group("identity_registry_recovery");
+
+    g.bench_function("set_recovery_address", |b| {
+        b.iter_batched(
+            || {
+                let (env, client, admin) = setup();
+                let controller = Address::generate(&env);
+                client.create_did(&controller, &metadata(&env));
+                let recovery = Address::generate(&env);
+                (env, client, admin, controller, recovery)
+            },
+            |(_, client, _, controller, recovery)| {
+                black_box(client.set_recovery_address(&controller, &recovery))
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    g.bench_function("initiate_recovery", |b| {
+        b.iter_batched(
+            || {
+                let (env, client, admin) = setup();
+                let controller = Address::generate(&env);
+                client.create_did(&controller, &metadata(&env));
+                let recovery = Address::generate(&env);
+                client.set_recovery_address(&controller, &recovery);
+                let new_controller = Address::generate(&env);
+                (env, client, admin, controller, recovery, new_controller)
+            },
+            |(_, client, _, controller, recovery, new_controller)| {
+                black_box(client.initiate_recovery(&recovery, &controller, &new_controller))
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    g.bench_function("recover_did", |b| {
+        b.iter_batched(
+            || {
+                let (env, client, admin) = setup();
+                let controller = Address::generate(&env);
+                client.create_did(&controller, &metadata(&env));
+                let recovery = Address::generate(&env);
+                client.set_recovery_address(&controller, &recovery);
+                let new_controller = Address::generate(&env);
+                client.initiate_recovery(&recovery, &controller, &new_controller);
+                use soroban_sdk::testutils::Ledger as _;
+                env.ledger().with_mut(|li| {
+                    li.sequence_number += identity_registry::recovery::RECOVERY_TIMELOCK_LEDGERS + 1;
+                });
+                (env, client, admin, controller, recovery)
+            },
+            |(_, client, _, controller, recovery)| {
+                black_box(client.recover_did(&recovery, &controller))
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    g.finish();
+
+    report_budget("set_recovery_address", |env, client| {
+        let controller = Address::generate(env);
+        client.create_did(&controller, &metadata(env));
+        let recovery = Address::generate(env);
+        client.set_recovery_address(&controller, &recovery);
+    });
+    report_budget("initiate_recovery", |env, client| {
+        let controller = Address::generate(env);
+        client.create_did(&controller, &metadata(env));
+        let recovery = Address::generate(env);
+        client.set_recovery_address(&controller, &recovery);
+        let new_controller = Address::generate(env);
+        client.initiate_recovery(&recovery, &controller, &new_controller);
+    });
+    report_budget("recover_did", |env, client| {
+        let controller = Address::generate(env);
+        client.create_did(&controller, &metadata(env));
+        let recovery = Address::generate(env);
+        client.set_recovery_address(&controller, &recovery);
+        let new_controller = Address::generate(env);
+        client.initiate_recovery(&recovery, &controller, &new_controller);
+        use soroban_sdk::testutils::Ledger as _;
+        env.ledger().with_mut(|li| {
+            li.sequence_number += identity_registry::recovery::RECOVERY_TIMELOCK_LEDGERS + 1;
+        });
+        client.recover_did(&recovery, &controller);
+    });
+}
+
+criterion_group!(benches, bench_identity_registry, bench_recovery);
 criterion_main!(benches);
