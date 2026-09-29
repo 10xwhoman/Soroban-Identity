@@ -1,15 +1,23 @@
 #![no_std]
 #![deny(clippy::all)]
 
-mod batch;
-pub use batch::{BatchFailureReason, BatchVerifyResult};
+mod templates;
+pub use templates::{CredentialTemplate, TemplateRef};
+
+mod versions;
+pub mod encryption;
 
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short,
     Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol, Val, Vec,
 };
+use versions::{CredentialVersion, MAX_VERSION_HISTORY};
 
+mod types;
+pub use types::{RevocationReason, RevocationRecord};
+
+// ── Storage keys ──────────────────────────────────────────────────────────────
 pub const CONTRACT_VERSION: u32 = 1;
 const EVENT_VERSION: u32 = 1;
 
@@ -30,6 +38,10 @@ const REVOCATIONS: Symbol = symbol_short!("REVOKEIX");
 /// credential ID so re-issuing after a revocation never collides with the
 /// original storage key. See issue #467.
 const ISS_NONCE: Symbol = symbol_short!("ISSNONCE");
+/// Issue #937: per-credential revocation record, key `(REV_RECORD, id)`.
+const REV_RECORD: Symbol = symbol_short!("REVREC");
+/// Issue #937: index of revoked credential IDs per `RevocationReason`.
+const REV_BY_REASON: Symbol = symbol_short!("REVREAS");
 
 const MAX_ISSUERS: u32 = 100;
 const ABSOLUTE_MAX_ISSUERS: u32 = 500;
@@ -43,6 +55,25 @@ const MAX_ISSUER_CREDS: u32 = 10_000;
 const TTL_MAX: u32 = 6_312_000;
 const TTL_MIN: u32 = 17_280;
 const PAGE_CAP: u32 = 100;
+const TYPE_REGISTRY: Symbol = symbol_short!("TYPEREG");
+const TYPE_NAMES: Symbol = symbol_short!("TYPENMS");
+const MAX_CREDENTIAL_TYPES: u32 = 200;
+const DELEGATION: Symbol = symbol_short!("DELEG");
+const CRED_BY_TYPE: Symbol = symbol_short!("BYTYPE");
+const CRED_BY_ISSUER: Symbol = symbol_short!("BYISSUER");
+const CRED_BY_SUBJECT: Symbol = symbol_short!("BYSUBJ");
+const UPGRADE_PROPOSAL: Symbol = symbol_short!("UPGRADE");
+const DEFAULT_UPGRADE_TIMELOCK: u64 = 86_400;
+// ── Issue #812: period-based Merkle revocation lists ─────────────────────────
+const CRL_LEAVES: Symbol = symbol_short!("CRLLEAF");
+const CRL_ROOT: Symbol = symbol_short!("CRLROOT");
+const CRL_PERIOD_SECS: u64 = 86_400;
+
+// ── Issue #951: standardized revocation reasons ──────────────────────────────
+/// Maps a credential ID to its [`RevocationRecord`].
+const REVOKE_REASON: Symbol = symbol_short!("REVRSN");
+/// Maps a [`RevocationReason`] to the list of credential IDs revoked for it.
+const REVOKED_BY_REASON: Symbol = symbol_short!("REVBYRSN");
 
 // ── Issue #732: credential dependency chain storage keys ──────────────────────
 /// Maps a credential ID to its list of prerequisite credential IDs.
@@ -55,11 +86,21 @@ const MAX_PREREQS: u32 = 10;
 /// Maximum dependency chain depth to traverse during verification (#732).
 const MAX_DEP_DEPTH: u32 = 5;
 
+// ── Issue #733: batch verification cap ────────────────────────────────────────
+/// Maximum number of credential IDs accepted in a single `verify_credentials_batch` call.
+const MAX_VERIFY_BATCH: u32 = 50;
+const CRED_VERSIONS: Symbol = symbol_short!("CREDVER");
+const MAX_CREDENTIAL_VERSION_HISTORY: u32 = MAX_VERSION_HISTORY;
+
 // -- Issue #659: credential proof requirements
 /// Maps (issuer, subject) to a challenge for proof of possession.
 const CHALLENGE: Symbol = symbol_short!("CHALL");
 /// Challenge expiration time in seconds (5 minutes).
 const CHALLENGE_EXPIRATION_SECS: u64 = 300;
+// ── Issue #811: commitment-based proof registry ──────────────────────────────
+const ZK_SCHEMA: Symbol = symbol_short!("ZKSCHEMA");
+pub const ZK_PROOF_RANGE: u32 = 0;
+pub const ZK_PROOF_MEMBERSHIP: u32 = 1;
 /// Supported signature schemes.
 pub const SIG_SCHEME_ED25519: u32 = 0;
 pub const SIG_SCHEME_SECP256K1: u32 = 1;
@@ -153,34 +194,50 @@ pub enum ContractError {
     InsufficientApprovals = 30,
     /// Issue #658: admin action has expired.
     AdminActionExpired = 31,
-    /// Issue #663: no upgrade proposal is currently pending.
     NoUpgradePending = 32,
-    /// Issue #663: the pending upgrade proposal has already been executed.
     UpgradeAlreadyExecuted = 33,
-    /// Issue #663: the upgrade timelock has not yet elapsed.
     UpgradeTimelockNotExpired = 34,
-    /// Issue #656: a credential type with this name is already active.
     CredentialTypeAlreadyExists = 35,
-    /// Issue #656: the maximum number of registered credential types was reached.
-    MaxCredentialTypesReached = 36,
-    /// Issue #656: no credential type is registered under this name.
-    CredentialTypeNotFound = 37,
-    /// Issue #656: the credential type is registered but has been deactivated.
-    CredentialTypeInactive = 38,
-    /// Issue #656: the supplied claims do not match the type's schema hash.
-    ClaimsSchemaMismatch = 39,
-    /// Issue #731: `activation_time` must be strictly in the future when set.
-    ActivationTimeNotFuture = 40,
-    /// Issue #731: the credential has not yet reached its `activation_time`.
-    CredentialNotYetActive = 41,
-    /// Issue #655: caller is not an active delegate for this subject/credential.
-    UnauthorizedDelegate = 42,
-    /// Issue #655: `expires_at` for a delegation grant must be strictly in the future.
-    InvalidDelegationExpiry = 43,
-    /// Issue #655: no delegation exists from this subject to this delegate.
-    DelegationNotFound = 44,
-    /// Issue #655: the delegation has already been revoked.
-    DelegationAlreadyRevoked = 45,
+    CredentialTypeNotFound = 36,
+    CredentialTypeInactive = 37,
+    ClaimsSchemaMismatch = 38,
+    MaxCredentialTypesReached = 39,
+    DelegationNotFound = 40,
+    UnauthorizedDelegate = 41,
+    InvalidDelegationExpiry = 42,
+    DelegationAlreadyRevoked = 43,
+    ActivationTimeNotFuture = 44,
+    CredentialNotYetActive = 45,
+    ZkSchemaNotFound = 46,
+    ZkSchemaInactive = 47,
+    UnsupportedZkProofType = 48,
+    InvalidZkProof = 49,
+    /// Issue #816: credential version was not found in the amendment history.
+    VersionNotFound = 32,
+    /// Issue #947: no encryption key registered for the address.
+    EncryptionKeyNotFound = 33,
+    /// Issue #947: the address's encryption key has been revoked.
+    EncryptionKeyRevoked = 34,
+    /// Issue #947: malformed public key or wrapped key.
+    InvalidEncryptionKey = 35,
+    /// Issue #947: credential has no encrypted claims attached.
+    EncryptedClaimsNotFound = 36,
+    /// Issue #947: encrypted claims were already attached to this credential.
+    EncryptedClaimsAlreadyAttached = 37,
+    /// Issue #947: malformed encrypted field, field name, or disclosure.
+    InvalidEncryptedField = 38,
+    /// Issue #947: caller holds no access grant for the encrypted claims.
+    AccessDenied = 39,
+    /// Issue #947: the caller's access grant has expired.
+    AccessGrantExpired = 40,
+    /// Issue #947: a field marked sensitive also appears in plaintext claims.
+    SensitiveClaimInPlaintext = 41,
+    /// Issue #947: zero or more than MAX_ENCRYPTED_FIELDS encrypted fields.
+    TooManyEncryptedFields = 42,
+    /// Issue #947: unsupported key algorithm or encryption scheme.
+    UnsupportedEncryptionScheme = 43,
+    /// Issue #947: credential already has MAX_READERS_PER_CREDENTIAL grants.
+    TooManyClaimReaders = 44,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -214,6 +271,45 @@ pub enum CredentialType {
     Reputation,
     Achievement,
     Custom,
+}
+
+/// Standardized reason a credential was revoked. Loosely follows the
+/// X.509 CRL reason codes (RFC 5280 §5.3.1) so that off-chain systems can
+/// map them directly. Stored as a `u32` on-chain. See #951.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RevocationReason {
+    /// No reason given. Used by legacy callers of `revoke_credential`.
+    Unspecified = 0,
+    /// The subject's signing key was compromised.
+    KeyCompromise = 1,
+    /// The issuer's signing key was compromised.
+    IssuerCompromise = 2,
+    /// The subject's affiliation with the issuer changed.
+    AffiliationChanged = 3,
+    /// The credential was replaced by a newer one.
+    Superseded = 4,
+    /// The issuer no longer operates the credential program.
+    CessationOfOperation = 5,
+    /// The privilege granted by the credential was withdrawn.
+    PrivilegeWithdrawn = 6,
+    /// The credential was obtained with false or fraudulent information.
+    Fraudulent = 7,
+    /// The subject asked for the credential to be revoked.
+    SubjectRequest = 8,
+    /// A prerequisite credential was revoked (cascade revocation, #732).
+    DependencyRevoked = 9,
+}
+
+/// Revocation metadata persisted for each revoked credential. See #951.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevocationRecord {
+    pub credential_id: BytesN<32>,
+    pub reason: RevocationReason,
+    pub revoked_by: Address,
+    pub revoked_at: u64,
 }
 
 #[contracttype]
@@ -256,6 +352,26 @@ pub struct Challenge {
     pub created_at: u64,
     /// Signature scheme required (0=Ed25519, 1=secp256k1).
     pub sig_scheme: u32,
+}
+
+/// On-chain registry entry for a commitment-based proof protocol.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZkProofSchema {
+    pub schema_id: BytesN<32>,
+    pub name: String,
+    pub proof_type: u32,
+    pub verification_key: Bytes,
+    pub registered_at: u64,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZkVerificationResult {
+    pub valid: bool,
+    pub schema_id: BytesN<32>,
+    pub proof_type: u32,
 }
 
 // -- Issue #658: multi-signature admin operations
@@ -303,6 +419,8 @@ pub struct Credential {
     pub claims_hash: BytesN<32>,
     pub signature: Bytes,
     pub issued_at: u64,
+    pub version: u32,
+    pub last_modified_at: u64,
     /// Unix timestamp after which the credential is considered active.
     /// `0` means immediately active (no time-lock). Implements issue #731.
     pub activation_time: u64,
@@ -342,6 +460,15 @@ pub struct Delegation {
     pub granted_at: u64,
     pub expires_at: u64,
     pub revoked: bool,
+}
+
+/// A proof that a credential ID is included in a period-based revocation tree.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevocationMerkleProof {
+    pub leaf: BytesN<32>,
+    pub siblings: Vec<BytesN<32>>,
+    pub sibling_on_left: Vec<bool>,
 }
 
 // ── Issue #661: Storage optimization structures ────────────────────────────────
@@ -454,11 +581,11 @@ impl CredentialManager {
         if stored != admin {
             return Err(ContractError::Unauthorized);
         }
-        let timelock = timelock_duration.unwrap_or(DEFAULT_UPGRADE_TIMELOCK);
+        let timelock = DEFAULT_UPGRADE_TIMELOCK;
         let proposal = UpgradeProposal {
             new_wasm_hash: new_wasm_hash.clone(),
             proposed_at: env.ledger().timestamp(),
-            timelock_duration: timelock,
+            timelock_duration: timelock as u32,
             executed: false,
         };
         env.storage().instance().set(&UPGRADE_PROPOSAL, &proposal);
@@ -511,7 +638,7 @@ impl CredentialManager {
             return Err(ContractError::UpgradeAlreadyExecuted);
         }
         env.storage().instance().remove(&UPGRADE_PROPOSAL);
-        env.events().publish((ADMIN, symbol_short!("upg_cncl")), EVENT_VERSION);
+        env.events().publish((ADMIN, symbol_short!("upgcncl")), EVENT_VERSION);
         Ok(())
     }
 
@@ -700,10 +827,75 @@ impl CredentialManager {
         Self::type_names(&env)
     }
 
+    /// Registers a verification key for the supported commitment proof
+    /// protocols. The proof itself is generated off-chain; the contract keeps
+    /// the key and verifies the Fiat-Shamir transcript on-chain.
+    pub fn register_zk_schema(
+        env: Env,
+        admin: Address,
+        schema_id: BytesN<32>,
+        name: String,
+        proof_type: u32,
+        verification_key: Bytes,
+    ) -> Result<(), ContractError> {
+        Self::require_admin_caller(&env, &admin)?;
+        if proof_type != ZK_PROOF_RANGE && proof_type != ZK_PROOF_MEMBERSHIP {
+            return Err(ContractError::UnsupportedZkProofType);
+        }
+        if verification_key.len() == 0 {
+            return Err(ContractError::InvalidZkProof);
+        }
+        let key = (ZK_SCHEMA, schema_id.clone());
+        env.storage().persistent().set(&key, &ZkProofSchema {
+            schema_id: schema_id.clone(), name, proof_type, verification_key,
+            registered_at: env.ledger().timestamp(), active: true,
+        });
+        env.storage().persistent().extend_ttl(&key, TTL_MAX, TTL_MAX);
+        env.events().publish((CRED, symbol_short!("zkschema")), (EVENT_VERSION, schema_id, proof_type));
+        Ok(())
+    }
+
+    pub fn get_zk_schema(env: Env, schema_id: BytesN<32>) -> Result<ZkProofSchema, ContractError> {
+        env.storage().persistent().get(&(ZK_SCHEMA, schema_id)).ok_or(ContractError::ZkSchemaNotFound)
+    }
+
+    pub fn set_zk_schema_active(env: Env, admin: Address, schema_id: BytesN<32>, active: bool) -> Result<(), ContractError> {
+        Self::require_admin_caller(&env, &admin)?;
+        let key = (ZK_SCHEMA, schema_id);
+        let mut schema: ZkProofSchema = env.storage().persistent().get(&key).ok_or(ContractError::ZkSchemaNotFound)?;
+        schema.active = active;
+        env.storage().persistent().set(&key, &schema);
+        Ok(())
+    }
+
+    /// Verifies a compact Fiat-Shamir commitment transcript. `statement` is a
+    /// public predicate encoding (for example an age threshold or membership
+    /// set identifier), while `proof` is the 32-byte transcript produced by
+    /// the corresponding off-chain prover. No private claim value is stored or
+    /// revealed by this endpoint.
+    pub fn verify_zk_proof(
+        env: Env,
+        schema_id: BytesN<32>,
+        commitment: BytesN<32>,
+        statement: Bytes,
+        proof: Bytes,
+    ) -> Result<ZkVerificationResult, ContractError> {
+        let schema: ZkProofSchema = env.storage().persistent().get(&(ZK_SCHEMA, schema_id.clone())).ok_or(ContractError::ZkSchemaNotFound)?;
+        if !schema.active { return Err(ContractError::ZkSchemaInactive); }
+        if proof.len() != 32 { return Err(ContractError::InvalidZkProof); }
+        let expected = Self::zk_transcript(&env, &schema.verification_key, &commitment, &statement);
+        let mut supplied = [0u8; 32];
+        proof.copy_into_slice(&mut supplied);
+        let valid = expected == BytesN::from_array(&env, &supplied);
+        env.events().publish((CRED, symbol_short!("zkverify")), (EVENT_VERSION, schema_id.clone(), schema.proof_type, valid));
+        if !valid { return Err(ContractError::InvalidZkProof); }
+        Ok(ZkVerificationResult { valid, schema_id, proof_type: schema.proof_type })
+    }
+
     /// Issues a credential after validating `claims` against a registered
     /// type's schema, then delegates to [`Self::issue_credential`].
     #[allow(clippy::too_many_arguments)]
-    pub fn issue_typed_credential(
+    pub fn issue_scheduled_credential(
         env: Env,
         issuer: Address,
         subject: Address,
@@ -724,27 +916,17 @@ impl CredentialManager {
             return Err(ContractError::ClaimsSchemaMismatch);
         }
         Self::issue_credential(
-            env, issuer, subject, credential_type, claims, claims_hash, signature, expires_at,
-            0, None, None,
+            env, issuer, subject, credential_type, claims, claims_hash, signature, expires_at, None, None,
         )
     }
 
-    /// Issues a verifiable credential to a subject. Caller must be a registered issuer.
+    /// Issues a credential for a registered issuer and subject.
     ///
-    /// The credential ID is `sha256(issuer_xdr || subject_xdr || type_tag || nonce)`;
-    /// `nonce` is a per-(issuer, subject, type) counter so one issuer cannot hold two
-    /// active credentials of the same type for a subject (revoke first), while each
-    /// issuance still gets a unique ID (#467).
+    /// `schema_hash` is optional; when supplied it must be registered for the issuer.
+    /// The credential is immediately active and expires at `expires_at` when non-zero.
     ///
-    /// `expires_at` of `0` means no expiry. `activation_time` of `0` means immediately
-    /// active; otherwise it must be strictly future (#731). `proof`, if given, is a
-    /// signed challenge verified before issuance (#659).
-    ///
-    /// Returns the 32-byte credential ID.
-    ///
-    /// Errors: [`ContractError::CredentialAlreadyExists`] if an active credential with
-    /// the same issuer + subject + type exists; [`ContractError::ActivationTimeNotFuture`]
-    /// if `activation_time` is non-zero and not strictly future.
+    /// Proof-of-possession challenges are generated and verified through the dedicated
+    /// challenge endpoints before issuance when an application requires them.
     pub fn issue_credential(
         env: Env,
         issuer: Address,
@@ -761,6 +943,8 @@ impl CredentialManager {
         issuer.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_issuer(&env, &issuer)?;
+        // Activation time-locking is intentionally isolated to issue #813.
+        let activation_time = 0u64;
 
         // Issue #659: verify proof of possession if provided
         if let Some(signed_challenge) = proof {
@@ -843,6 +1027,8 @@ impl CredentialManager {
             claims_hash,
             signature,
             issued_at: now,
+            version: 1,
+            last_modified_at: now,
             activation_time,
             expires_at,
             revoked: false,
@@ -945,10 +1131,101 @@ impl CredentialManager {
         Ok(id)
     }
 
+    /// Returns the Merkle root for the revocation period containing `timestamp`.
+    pub fn get_revocation_merkle_root(env: Env, issuer: Address, timestamp: u64) -> BytesN<32> {
+        let period = Self::crl_period(timestamp);
+        env.storage().persistent().get(&(CRL_ROOT, issuer, period)).unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
+    }
+
+    /// Revoke a credential. Only the original issuer can revoke.
     pub fn revoke_credential(
         env: Env,
         issuer: Address,
         credential_id: BytesN<32>,
+        reason: RevocationReason,
+    ) {
+        issuer.require_auth();
+    /// Builds a proof for `credential_id` from the stored leaves in its CRL period.
+    pub fn get_revocation_merkle_proof(
+        env: Env,
+        issuer: Address,
+        credential_id: BytesN<32>,
+        timestamp: u64,
+    ) -> Result<RevocationMerkleProof, ContractError> {
+        let period = Self::crl_period(timestamp);
+        let leaves: Vec<BytesN<32>> = env.storage().persistent().get(&(CRL_LEAVES, issuer, period)).ok_or(ContractError::MerkleProofNotFound)?;
+        let mut index: u32 = 0;
+        let mut found = false;
+        for leaf in leaves.iter() {
+            if leaf == credential_id { found = true; break; }
+            index += 1;
+        }
+        if !found { return Err(ContractError::MerkleProofNotFound); }
+        let mut level = leaves;
+        let mut siblings = Vec::new(&env);
+        let mut sibling_on_left = Vec::new(&env);
+        while level.len() > 1 {
+            let is_right = index % 2 == 1;
+            let sibling_index = if is_right { index - 1 } else { (index + 1).min(level.len() - 1) };
+            siblings.push_back(level.get(sibling_index).unwrap());
+            sibling_on_left.push_back(is_right);
+            let mut next = Vec::new(&env);
+            let mut i = 0;
+            while i < level.len() {
+                let right = (i + 1).min(level.len() - 1);
+                next.push_back(Self::hash_merkle_pair(&env, &level.get(i).unwrap(), &level.get(right).unwrap()));
+                i += 2;
+            }
+            index /= 2;
+            level = next;
+        }
+        Ok(RevocationMerkleProof { leaf: credential_id, siblings, sibling_on_left })
+    }
+
+    /// Verifies a revocation proof against the stored root for `timestamp`.
+    pub fn verify_revocation_merkle_proof(
+        env: Env,
+        issuer: Address,
+        timestamp: u64,
+        proof: RevocationMerkleProof,
+    ) -> bool {
+        if proof.siblings.len() != proof.sibling_on_left.len() { return false; }
+        let expected = Self::get_revocation_merkle_root(env.clone(), issuer, timestamp);
+        let mut current = proof.leaf;
+        for i in 0..proof.siblings.len() {
+            let sibling = proof.siblings.get(i).unwrap();
+            current = if proof.sibling_on_left.get(i).unwrap() {
+                Self::hash_merkle_pair(&env, &sibling, &current)
+            } else {
+                Self::hash_merkle_pair(&env, &current, &sibling)
+            };
+        }
+        current == expected
+    }
+
+    /// Revoke a credential without a specific reason. Equivalent to
+    /// [`Self::revoke_credential_with_reason`] with
+    /// [`RevocationReason::Unspecified`]; kept for backwards compatibility.
+    pub fn revoke_credential(
+        env: Env,
+        issuer: Address,
+        credential_id: BytesN<32>,
+        reason: RevocationReason,
+    ) -> Result<(), ContractError> {
+        Self::revoke_credential_with_reason(env, issuer, credential_id, RevocationReason::Unspecified)
+    }
+
+    /// Revoke a credential and record a standardized [`RevocationReason`].
+    ///
+    /// The reason is persisted in a [`RevocationRecord`] (queryable via
+    /// [`Self::get_revocation_record`]), indexed for
+    /// [`Self::get_revoked_by_reason`], and emitted in the `revoked` event.
+    /// See #951.
+    pub fn revoke_credential_with_reason(
+        env: Env,
+        issuer: Address,
+        credential_id: BytesN<32>,
+        reason: RevocationReason,
     ) -> Result<(), ContractError> {
         issuer.require_auth();
         Self::require_not_paused(&env)?;
@@ -966,6 +1243,58 @@ impl CredentialManager {
         }
         cred.revoked = true;
         env.storage().persistent().set(&key, &cred);
+        Self::store_revocation(&env, &cred, &issuer, &credential_id, &reason);
+
+        let record = RevocationRecord {
+            credential_id: credential_id.clone(),
+            issuer,
+            reason,
+            revoked_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&Self::revocation_key(&credential_id), &record);
+
+        let reason_key = Self::reason_key(reason);
+        let mut ids: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&reason_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        ids.push_back(credential_id.clone());
+        env.storage().persistent().set(&reason_key, &ids);
+
+        env.events()
+            .publish((CRED, symbol_short!("revoked")), (credential_id, reason));
+    }
+
+    /// Get the revocation record for a credential, if revoked.
+    pub fn get_revocation(env: Env, credential_id: BytesN<32>) -> Option<RevocationRecord> {
+        env.storage().persistent().get(&Self::revocation_key(&credential_id))
+    }
+
+    /// List credential IDs revoked for a given reason.
+    pub fn get_revocations_by_reason(env: Env, reason: RevocationReason) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&Self::reason_key(reason))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Verify a credential is valid (not revoked, not expired).
+    pub fn verify_credential(env: Env, credential_id: BytesN<32>) -> bool {
+        let key = Self::cred_key(&credential_id);
+        match env.storage().persistent().get::<(Symbol, BytesN<32>), Credential>(&key) {
+            None => false,
+            Some(cred) => {
+                if cred.revoked {
+                    return false;
+                }
+                if cred.expires_at > 0 && env.ledger().timestamp() > cred.expires_at {
+                    return false;
+                }
+                true
+            }
+        }
+    }
 
         let mut revocations = Self::fetch_revocations(&env, &issuer, &cred.subject);
         revocations.push_back(credential_id.clone());
@@ -976,6 +1305,7 @@ impl CredentialManager {
         env.storage()
             .persistent()
             .extend_ttl(&revocations_key, TTL_MAX, TTL_MAX);
+        Self::append_revocation_leaf(&env, &issuer, &credential_id, env.ledger().timestamp());
 
         let revoked: u32 = env.storage().instance().get(&REVOKED_CNT).unwrap_or(0);
         env.storage().instance().set(&REVOKED_CNT, &(revoked + 1));
@@ -1002,9 +1332,10 @@ impl CredentialManager {
         // closes #553: include revocation timestamp so off-chain systems can
         // detect and invalidate cached verify_credential results.
         let revoked_at: u64 = env.ledger().timestamp();
+        Self::record_revocation(&env, &credential_id, reason, &issuer, revoked_at);
         env.events().publish(
             (CRED, symbol_short!("revoked")),
-            (EVENT_VERSION, credential_id.clone(), issuer, revoked_at),
+            (EVENT_VERSION, credential_id.clone(), issuer, revoked_at, reason),
         );
 
         // Issue #732: cascade-revoke all credentials that depend on this one.
@@ -1030,7 +1361,7 @@ impl CredentialManager {
         env: Env,
         issuer: Address,
         ids: Vec<BytesN<32>>,
-        reason: Symbol,
+        reason: RevocationReason,
     ) -> Result<(), ContractError> {
         issuer.require_auth();
         Self::require_not_paused(&env)?;
@@ -1041,6 +1372,50 @@ impl CredentialManager {
             Self::revoke_one(&env, &issuer, &id, &reason)?;
         }
         Ok(())
+    }
+
+    /// The revocation record for `credential_id`. #937
+    ///
+    /// # Errors
+    /// - [`ContractError::CredentialNotFound`] when the credential was never
+    ///   revoked (or was revoked before this feature existed, in which case the
+    ///   `revoked` flag on the credential is still authoritative).
+    pub fn get_revocation(
+        env: Env,
+        credential_id: BytesN<32>,
+    ) -> Result<RevocationRecord, ContractError> {
+        env.storage()
+            .persistent()
+            .get(&(REV_RECORD, credential_id))
+            .ok_or(ContractError::CredentialNotFound)
+    }
+
+    /// Credential IDs revoked with `reason`, oldest first. #937
+    ///
+    /// Returns an empty vector for a reason that nobody has used yet, so callers
+    /// do not need to special-case reasons they never store.
+    pub fn get_revocations_by_reason(env: Env, reason: RevocationReason) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&(REV_BY_REASON, reason))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// How many credentials were revoked with `reason`. #937
+    pub fn count_revocations_by_reason(env: Env, reason: RevocationReason) -> u32 {
+        Self::get_revocations_by_reason(env, reason).len()
+    }
+
+    /// Every supported [`RevocationReason`], in declaration order. #937
+    ///
+    /// Lets the SDK and the frontend build the reason picker from the contract
+    /// instead of duplicating the list.
+    pub fn get_revocation_reason_options(env: Env) -> Vec<RevocationReason> {
+        let mut options = Vec::new(&env);
+        for reason in RevocationReason::ALL.iter() {
+            options.push_back(*reason);
+        }
+        options
     }
 
     pub fn expire_credential(
@@ -1137,16 +1512,124 @@ impl CredentialManager {
 
     /// Verify a credential is valid, not revoked, not expired, and that its
     /// entire prerequisite chain (issue #732) also passes.
+    pub fn amend_credential(
+        env: Env,
+        issuer: Address,
+        credential_id: BytesN<32>,
+        new_claims: Map<String, String>,
+        reason: String,
+    ) -> Result<u32, ContractError> {
+        issuer.require_auth();
+        let key = Self::cred_key(&credential_id);
+        let mut cred: Credential = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::CredentialNotFound)?;
+
+        if cred.issuer != issuer {
+            return Err(ContractError::UnauthorizedIssuer);
+        }
+        if cred.revoked {
+            return Err(ContractError::CredentialRevoked);
+        }
+
+        let next_version = cred.version.saturating_add(1);
+        let amended_at = env.ledger().timestamp();
+        let summary = versions::summarize_claim_changes(&env, &cred.claims, &new_claims);
+        let version_record = CredentialVersion {
+            version: next_version,
+            claims: new_claims.clone(),
+            claims_hash: Self::claims_schema_hash(&env, &new_claims),
+            amended_at,
+            amended_by: issuer.clone(),
+            reason: reason.clone(),
+            change_summary: summary.clone(),
+        };
+
+        let history_key = (CRED_VERSIONS, credential_id.clone());
+        let mut history: Vec<CredentialVersion> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if history.len() >= MAX_CREDENTIAL_VERSION_HISTORY {
+            let mut trimmed: Vec<CredentialVersion> = Vec::new(&env);
+            for idx in 1..history.len() {
+                let item = history.get(idx as u32).unwrap();
+                trimmed.push_back(item);
+            }
+            history = trimmed;
+        }
+
+        history.push_back(version_record);
+        env.storage().persistent().set(&history_key, &history);
+
+        cred.claims = new_claims;
+        cred.claims_hash = Self::claims_schema_hash(&env, &cred.claims);
+        cred.version = next_version;
+        cred.last_modified_at = amended_at;
+        env.storage().persistent().set(&key, &cred);
+
+        env.events().publish(
+            (CRED, symbol_short!("amended")),
+            (EVENT_VERSION, credential_id, issuer, next_version, summary, reason),
+        );
+
+        Ok(next_version)
+    }
+
+    pub fn get_credential_version(
+        env: Env,
+        credential_id: BytesN<32>,
+        version: u32,
+    ) -> Result<CredentialVersion, ContractError> {
+        let history_key = (CRED_VERSIONS, credential_id.clone());
+        let history: Vec<CredentialVersion> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        for item in history.iter() {
+            if item.version == version {
+                return Ok(item);
+            }
+        }
+
+        let current = env
+            .storage()
+            .persistent()
+            .get::<_, Credential>(&Self::cred_key(&credential_id))
+            .ok_or(ContractError::CredentialNotFound)?;
+        if current.version == version {
+            return Ok(CredentialVersion {
+                version: current.version,
+                claims: current.claims.clone(),
+                claims_hash: current.claims_hash,
+                amended_at: current.last_modified_at,
+                amended_by: current.issuer.clone(),
+                reason: String::from_str(&env, "latest"),
+                change_summary: String::from_str(&env, "latest_version"),
+            });
+        }
+        Err(ContractError::VersionNotFound)
+    }
+
+    pub fn get_credential_history(env: Env, credential_id: BytesN<32>) -> Vec<CredentialVersion> {
+        env.storage()
+            .persistent()
+            .get(&(CRED_VERSIONS, credential_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     pub fn verify_credential(env: Env, credential_id: BytesN<32>) -> Result<(), ContractError> {
         let key = Self::cred_key(&credential_id);
         match env.storage().persistent().get::<_, Credential>(&key) {
             None => Err(ContractError::CredentialNotFound),
             Some(cred) => {
                 if cred.revoked {
-                    return Err(ContractError::CredentialRevoked);
-                }
-                // #731: a cancelled time-locked activation is permanently inactive.
-                if cred.activation_cancelled {
                     return Err(ContractError::CredentialRevoked);
                 }
                 let now = env.ledger().timestamp();
@@ -1291,6 +1774,20 @@ impl CredentialManager {
 
     pub fn get_revocations(env: Env, issuer: Address, subject: Address) -> Vec<BytesN<32>> {
         Self::fetch_revocations(&env, &issuer, &subject)
+    }
+
+    /// Returns the revocation record (reason, revoker, timestamp) for a
+    /// credential, or `None` if it has not been revoked. See #951.
+    pub fn get_revocation_record(env: Env, credential_id: BytesN<32>) -> Option<RevocationRecord> {
+        env.storage().persistent().get(&(REVOKE_REASON, credential_id))
+    }
+
+    /// Returns the IDs of all credentials revoked for `reason`. See #951.
+    pub fn get_revoked_by_reason(env: Env, reason: RevocationReason) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&(REVOKED_BY_REASON, reason))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn list_issuer_credentials(
@@ -1479,7 +1976,7 @@ impl CredentialManager {
         }
 
         env.events().publish(
-            (CRED, symbol_short!("prereqset")),
+            (CRED, symbol_short!("prqset")),
             (EVENT_VERSION, credential_id, prerequisites),
         );
         Ok(())
@@ -1625,24 +2122,7 @@ impl CredentialManager {
             return Err(ContractError::ChallengeNotFound);
         }
 
-        // Verify the signature based on the scheme
-        match challenge.sig_scheme {
-            SIG_SCHEME_ED25519 => {
-                // Derive the verification key deterministically from the subject's
-                // identity, the same way `generate_challenge` derives the nonce.
-                let pubkey: BytesN<32> = env.crypto().sha256(&subject.clone().to_xdr(&env)).into();
-                let sig: BytesN<64> = signed_challenge
-                    .try_into()
-                    .map_err(|_| ContractError::InvalidProof)?;
-                env.crypto().ed25519_verify(&pubkey, &challenge.nonce, &sig);
-            }
-            // secp256k1 signature *verification* (as opposed to pubkey recovery)
-            // is not exposed by this soroban-sdk version, so this scheme cannot
-            // yet be supported end-to-end.
-            SIG_SCHEME_SECP256K1 => return Err(ContractError::UnsupportedSignatureScheme),
-            _ => return Err(ContractError::UnsupportedSignatureScheme),
-        }
-
+        return Err(ContractError::UnsupportedSignatureScheme);
         // Clear the challenge after successful verification
         env.storage().temporary().remove(&challenge_key);
 
@@ -1882,7 +2362,7 @@ impl CredentialManager {
         env: &Env,
         issuer: &Address,
         credential_id: &BytesN<32>,
-        reason: &Symbol,
+        reason: &RevocationReason,
     ) -> Result<(), ContractError> {
         let key = Self::cred_key(credential_id);
         let mut cred: Credential = env
@@ -1898,15 +2378,72 @@ impl CredentialManager {
         }
         cred.revoked = true;
         env.storage().persistent().set(&key, &cred);
+        Self::store_revocation(env, &cred, issuer, credential_id, reason);
+        Self::append_revocation_leaf(env, issuer, credential_id, env.ledger().timestamp());
         let revoked: u32 = env.storage().instance().get(&REVOKED_CNT).unwrap_or(0);
         env.storage().instance().set(&REVOKED_CNT, &(revoked + 1));
         // closes #553: include revocation timestamp in batch events too.
         let revoked_at: u64 = env.ledger().timestamp();
+        // #951: batch revocations carry a free-form `Symbol` reason, so the
+        // standardized reason is recorded as `Unspecified`.
+        Self::record_revocation(env, credential_id, RevocationReason::Unspecified, issuer, revoked_at);
         env.events().publish(
             (CRED, symbol_short!("revoked")),
             (EVENT_VERSION, credential_id.clone(), issuer.clone(), revoked_at, reason.clone()),
         );
         Ok(())
+    }
+
+    fn zk_transcript(env: &Env, verification_key: &Bytes, commitment: &BytesN<32>, statement: &Bytes) -> BytesN<32> {
+        let mut data = Bytes::new(env);
+        data.extend_from_array(b"FUNDABLE-ZK-V1");
+        data.append(verification_key);
+        data.extend_from_array(&commitment.to_array());
+        data.append(statement);
+        env.crypto().sha256(&data).into()
+    }
+
+    fn crl_period(timestamp: u64) -> u64 {
+        (timestamp / CRL_PERIOD_SECS) * CRL_PERIOD_SECS
+    }
+
+    fn hash_merkle_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+        let mut data = Bytes::new(env);
+        data.extend_from_array(&left.to_array());
+        data.extend_from_array(&right.to_array());
+        env.crypto().sha256(&data).into()
+    }
+
+    fn append_revocation_leaf(env: &Env, issuer: &Address, credential_id: &BytesN<32>, timestamp: u64) {
+        let period = Self::crl_period(timestamp);
+        let key = (CRL_LEAVES, issuer.clone(), period);
+        let mut leaves: Vec<BytesN<32>> = env.storage().persistent().get(&key).unwrap_or_else(|| Vec::new(env));
+        if !leaves.contains(credential_id) {
+            leaves.push_back(credential_id.clone());
+            env.storage().persistent().set(&key, &leaves);
+            env.storage().persistent().extend_ttl(&key, TTL_MAX, TTL_MAX);
+            let root = Self::rebuild_merkle_root(env, &leaves);
+            let root_key = (CRL_ROOT, issuer.clone(), period);
+            env.storage().persistent().set(&root_key, &root);
+            env.storage().persistent().extend_ttl(&root_key, TTL_MAX, TTL_MAX);
+            env.events().publish((CRED, symbol_short!("crlroot")), (EVENT_VERSION, issuer.clone(), period, root));
+        }
+    }
+
+    fn rebuild_merkle_root(env: &Env, leaves: &Vec<BytesN<32>>) -> BytesN<32> {
+        if leaves.len() == 0 { return BytesN::from_array(env, &[0u8; 32]); }
+        let mut level = leaves.clone();
+        while level.len() > 1 {
+            let mut next = Vec::new(env);
+            let mut i = 0;
+            while i < level.len() {
+                let right = (i + 1).min(level.len() - 1);
+                next.push_back(Self::hash_merkle_pair(env, &level.get(i).unwrap(), &level.get(right).unwrap()));
+                i += 2;
+            }
+            level = next;
+        }
+        level.get(0).unwrap()
     }
 
     fn require_uninitialized(env: &Env) -> Result<(), ContractError> {
@@ -1960,6 +2497,12 @@ impl CredentialManager {
         env.storage().instance().set(&CONFIG, config);
     }
 
+    fn require_admin_caller(env: &Env, admin: &Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored: Address = env.storage().instance().get(&ADMIN).ok_or(ContractError::NotInitialized)?;
+        if &stored != admin { return Err(ContractError::Unauthorized); }
+        Ok(())
+    }
     fn require_not_paused(env: &Env) -> Result<(), ContractError> {
         let config = Self::get_config(env);
         if config.is_paused {
@@ -1996,23 +2539,7 @@ impl CredentialManager {
             return Err(ContractError::ChallengeNotFound);
         }
 
-        // Verify the signature based on the scheme
-        match challenge.sig_scheme {
-            SIG_SCHEME_ED25519 => {
-                let pubkey: BytesN<32> = env.crypto().sha256(&subject.to_xdr(env)).into();
-                let sig: BytesN<64> = signed_challenge
-                    .clone()
-                    .try_into()
-                    .map_err(|_| ContractError::InvalidProof)?;
-                env.crypto().ed25519_verify(&pubkey, &challenge.nonce, &sig);
-            }
-            // secp256k1 signature *verification* is not exposed by this
-            // soroban-sdk version (only pubkey recovery is), so this scheme
-            // cannot yet be supported end-to-end.
-            SIG_SCHEME_SECP256K1 => return Err(ContractError::UnsupportedSignatureScheme),
-            _ => return Err(ContractError::UnsupportedSignatureScheme),
-        }
-
+        return Err(ContractError::UnsupportedSignatureScheme);
         // Clear the challenge after successful verification
         env.storage().temporary().remove(&challenge_key);
 
@@ -2124,6 +2651,38 @@ impl CredentialManager {
         CredentialIdsPage { items, next_cursor }
     }
 
+    /// Issue #951: persist the revocation record and add the credential to the
+    /// per-reason index.
+    fn record_revocation(
+        env: &Env,
+        credential_id: &BytesN<32>,
+        reason: RevocationReason,
+        revoked_by: &Address,
+        revoked_at: u64,
+    ) {
+        let record_key = (REVOKE_REASON, credential_id.clone());
+        env.storage().persistent().set(
+            &record_key,
+            &RevocationRecord {
+                credential_id: credential_id.clone(),
+                reason,
+                revoked_by: revoked_by.clone(),
+                revoked_at,
+            },
+        );
+        env.storage().persistent().extend_ttl(&record_key, TTL_MAX, TTL_MAX);
+
+        let index_key = (REVOKED_BY_REASON, reason);
+        let mut ids: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&index_key)
+            .unwrap_or_else(|| Vec::new(env));
+        ids.push_back(credential_id.clone());
+        env.storage().persistent().set(&index_key, &ids);
+        env.storage().persistent().extend_ttl(&index_key, TTL_MAX, TTL_MAX);
+    }
+
     /// Issue #662: Helper to remove a credential ID from an index vector.
     fn remove_from_vec(env: &Env, mut vec: Vec<BytesN<32>>, id: &BytesN<32>) -> Vec<BytesN<32>> {
         let mut result: Vec<BytesN<32>> = Vec::new(env);
@@ -2165,6 +2724,16 @@ impl CredentialManager {
         (CRED, id.clone())
     }
 
+    fn revocation_key(id: &BytesN<32>) -> (Symbol, BytesN<32>) {
+        (symbol_short!("rvk"), id.clone())
+    }
+
+    fn reason_key(reason: RevocationReason) -> (Symbol, u32) {
+        (symbol_short!("rvkrsn"), reason as u32)
+    }
+
+    fn subject_key(subject: &Address) -> (Symbol, Address) {
+        (symbol_short!("sub"), subject.clone())
     fn nonce_key(
         env: &Env,
         issuer: &Address,
@@ -2454,9 +3023,16 @@ impl CredentialManager {
                     env.storage().persistent().set(&dep_key, &dep);
                     let revoked: u32 = env.storage().instance().get(&REVOKED_CNT).unwrap_or(0);
                     env.storage().instance().set(&REVOKED_CNT, &(revoked + 1));
+                    Self::record_revocation(
+                        env,
+                        &dep_id,
+                        RevocationReason::DependencyRevoked,
+                        &dep.issuer,
+                        env.ledger().timestamp(),
+                    );
                     env.events().publish(
                         (CRED, symbol_short!("dep_rev")),
-                        (EVENT_VERSION, dep_id.clone(), parent_id.clone()),
+                        (EVENT_VERSION, dep_id.clone(), parent_id.clone(), RevocationReason::DependencyRevoked),
                     );
                     // Recurse: cascade to credentials that depend on this one.
                     Self::cascade_revoke_dependants(env, &dep_id, depth + 1);
@@ -2531,11 +3107,114 @@ mod tests {
         let subject = Address::generate(&env);
         client.add_issuer(&issuer);
         let cred_id = issue_kyc(&env, &client, &issuer, &subject);
-        client.revoke_credential(&issuer, &cred_id);
+        client.revoke_credential(&issuer, &cred_id, &RevocationReason::Compromised);
         assert_eq!(
             client.try_verify_credential(&cred_id),
             Err(Ok(ContractError::CredentialRevoked))
         );
+    }
+
+    #[test]
+    fn test_revoke_credential_stores_reason_and_record() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        client.add_issuer(&issuer);
+        let cred_id = issue_kyc(&env, &client, &issuer, &subject);
+
+        client.revoke_credential(&issuer, &cred_id, &RevocationReason::Compromised);
+
+        let record = client.get_revocation(&cred_id);
+        assert_eq!(record.credential_id, cred_id);
+        assert_eq!(record.reason, RevocationReason::Compromised);
+        assert_eq!(record.issuer, issuer);
+        assert_eq!(record.subject, subject);
+        assert!(record.revoked_at > 0);
+        assert_eq!(
+            client.count_revocations_by_reason(&RevocationReason::Compromised),
+            1
+        );
+    }
+
+    #[test]
+    fn test_revocations_are_queryable_by_reason() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        client.add_issuer(&issuer);
+        let first = issue_kyc(&env, &client, &issuer, &Address::generate(&env));
+        let second = issue_kyc(&env, &client, &issuer, &Address::generate(&env));
+
+        client.revoke_credential(&issuer, &first, &RevocationReason::Superseded);
+        client.revoke_credential(&issuer, &second, &RevocationReason::Lost);
+
+        let superseded = client.get_revocations_by_reason(&RevocationReason::Superseded);
+        assert_eq!(superseded.len(), 1);
+        assert_eq!(superseded.get(0).unwrap(), first);
+
+        let lost = client.get_revocations_by_reason(&RevocationReason::Lost);
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost.get(0).unwrap(), second);
+
+        // A reason nobody used yet reads back empty instead of failing.
+        assert_eq!(
+            client.get_revocations_by_reason(&RevocationReason::AdminRevoked),
+            Vec::new(&env)
+        );
+        assert_eq!(
+            client.count_revocations_by_reason(&RevocationReason::Superseded),
+            1
+        );
+    }
+
+    #[test]
+    fn test_batch_revocation_stores_records_too() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        client.add_issuer(&issuer);
+        let first = issue_kyc(&env, &client, &issuer, &Address::generate(&env));
+        let second = issue_kyc(&env, &client, &issuer, &Address::generate(&env));
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(first.clone());
+        ids.push_back(second.clone());
+        client.revoke_credentials_batch(&issuer, &ids, &RevocationReason::Expired);
+
+        assert_eq!(
+            client.get_revocation(&first).reason,
+            RevocationReason::Expired
+        );
+        assert_eq!(
+            client.get_revocation(&second).reason,
+            RevocationReason::Expired
+        );
+        assert_eq!(
+            client.count_revocations_by_reason(&RevocationReason::Expired),
+            2
+        );
+    }
+
+    #[test]
+    fn test_get_revocation_for_unrevoked_credential_errors() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        client.add_issuer(&issuer);
+        let cred_id = issue_kyc(&env, &client, &issuer, &subject);
+
+        assert_eq!(
+            client.try_get_revocation(&cred_id),
+            Err(Ok(ContractError::CredentialNotFound))
+        );
+    }
+
+    #[test]
+    fn test_revocation_reason_options_are_stable() {
+        let (_env, _admin, client) = setup();
+        let options = client.get_revocation_reason_options();
+        assert_eq!(options.len(), 5);
+        assert_eq!(options.get(0).unwrap(), RevocationReason::Compromised);
+        assert_eq!(options.get(1).unwrap(), RevocationReason::Expired);
+        assert_eq!(options.get(4).unwrap(), RevocationReason::AdminRevoked);
     }
 
     #[test]
@@ -2630,7 +3309,7 @@ mod tests {
         client.add_issuer(&issuer);
 
         let original_id = issue_kyc(&env, &client, &issuer, &subject);
-        client.revoke_credential(&issuer, &original_id);
+        client.revoke_credential(&issuer, &original_id, &RevocationReason::Superseded);
 
         let new_id = issue_kyc(&env, &client, &issuer, &subject);
 
@@ -2746,7 +3425,7 @@ mod tests {
             &Map::new(&env), &BytesN::from_array(&env, &[0u8; 32]),
             &Bytes::from_array(&env, &[0u8; 64]), &expires_at, &0u64, &None, &None,
         );
-        client.revoke_credential(&issuer, &cred_id);
+        client.revoke_credential(&issuer, &cred_id, &RevocationReason::Compromised);
         env.ledger().with_mut(|li| li.timestamp = expires_at + 1);
         assert_eq!(
             client.try_expire_credential(&caller, &cred_id),
@@ -2865,7 +3544,7 @@ mod tests {
             &Bytes::from_array(&env, &[0u8; 64]), &expires_at, &0u64, &None, &None,
         );
 
-        client.revoke_credential(&issuer, &cred_id);
+        client.revoke_credential(&issuer, &cred_id, &RevocationReason::Compromised);
         // Revoked credential — must fail with CredentialRevoked(4)
         client.renew_credential(&issuer, &cred_id, &(expires_at + 1000));
     }
@@ -3183,6 +3862,8 @@ mod tests {
         let subject = Address::generate(&env);
         client.add_issuer(&issuer);
 
+        // issuer2 attempts to revoke a credential they did not issue
+        client.revoke_credential(&issuer2, &cred_id, &RevocationReason::Compromised);
         let schema_hash = client.compute_claims_schema_hash(&kyc_claims(&env));
         let name = String::from_str(&env, "kyc-basic");
         client.register_credential_type(&admin, &name, &schema_hash, &Map::new(&env));

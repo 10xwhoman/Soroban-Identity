@@ -218,9 +218,9 @@ impl Reputation {
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
         Self::require_uninitialized(&env)?;
         Self::set_admin(&env, &admin);
-        env.storage()
-            .instance()
-            .set(&MIN_INTERVAL_KEY, &DEFAULT_MIN_INTERVAL);
+        // #949: the rate-limit window is not written here — every read falls
+        // back to DEFAULT_MIN_INTERVAL, so storing the default at deploy time
+        // only adds a ledger write to the initialization transaction.
         env.events().publish(
             (ADMIN, symbol_short!("init")),
             (EVENT_VERSION, admin),
