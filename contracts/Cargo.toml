@@ -8,6 +8,7 @@ publish = false
 members = [
     ".",
     "shared-errors",
+    "shared-events",
     "identity-registry",
     "credential-manager",
     "reputation",
@@ -21,6 +22,7 @@ members = [
 default-members = [
     ".",
     "shared-errors",
+    "shared-events",
     "identity-registry",
     "credential-manager",
     "reputation",
@@ -39,6 +41,7 @@ identity-registry = { path = "identity-registry", features = ["testutils"] }
 reputation = { path = "reputation", features = ["testutils"] }
 governance = { path = "governance" }
 shared-errors = { path = "shared-errors" }
+shared-events = { path = "shared-events" }
 soroban-identity-interface = { path = "soroban-identity-interface" }
 schema-registry = { path = "schema-registry" }
 revocation-registry = { path = "revocation-registry" }
