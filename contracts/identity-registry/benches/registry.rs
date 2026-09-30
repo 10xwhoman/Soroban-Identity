@@ -8,7 +8,10 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use identity_registry::{IdentityRegistry, IdentityRegistryClient};
-use soroban_sdk::{testutils::Address as _, Address, Env, Map, String};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    Address, Env, Map, String,
+};
 
 fn setup() -> (Env, IdentityRegistryClient<'static>, Address) {
     let env = Env::default();
@@ -32,6 +35,25 @@ fn report_budget(name: &str, f: impl FnOnce(&Env, &IdentityRegistryClient<'stati
     let (env, client, _) = setup();
     env.budget().reset_default();
     f(&env, &client);
+    println!(
+        "[budget] {name}: cpu_insns={} mem_bytes={}",
+        env.budget().cpu_instruction_cost(),
+        env.budget().memory_bytes_cost()
+    );
+}
+
+/// Print Soroban resource usage for reading an existing DID some ledgers
+/// after it was written: the steady state of a hot entry (#866).
+fn report_read_budget(name: &str, f: impl FnOnce(&IdentityRegistryClient<'static>, &Address)) {
+    let (env, client, _) = setup();
+    let controller = Address::generate(&env);
+    client.create_did(&controller, &metadata(&env));
+    env.as_contract(&client.address, || {
+        env.storage().instance().extend_ttl(6_000_000, 6_000_000)
+    });
+    env.ledger().with_mut(|li| li.sequence_number += 100);
+    env.budget().reset_default();
+    f(&client, &controller);
     println!(
         "[budget] {name}: cpu_insns={} mem_bytes={}",
         env.budget().cpu_instruction_cost(),
@@ -107,6 +129,16 @@ fn bench_identity_registry(c: &mut Criterion) {
         let controller = Address::generate(env);
         client.create_did(&controller, &metadata(env));
         client.resolve_did(&controller);
+    });
+    report_read_budget("resolve_did (100 ledgers later)", |client, controller| {
+        client.resolve_did(controller);
+    });
+    report_read_budget("has_active_did (100 ledgers later)", |client, controller| {
+        client.has_active_did(controller);
+    });
+    report_read_budget("update_did (100 ledgers later)", |client, controller| {
+        let env = client.env.clone();
+        client.update_did(controller, &metadata(&env));
     });
 }
 
