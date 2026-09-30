@@ -37,6 +37,7 @@ pub(crate) fn recovery_pending_key(env: &Env, controller: &Address) -> (Symbol, 
 pub(crate) fn store_recovery_address(env: &Env, controller: &Address, recovery_addr: &Address) {
     let key = recovery_addr_key(env, controller);
     env.storage().persistent().set(&key, recovery_addr);
+    env.storage().persistent().extend_ttl(&key, crate::TTL_LEDGERS, crate::TTL_LEDGERS);
     env.events().publish(
         (symbol_short!("recovery"), symbol_short!("set")),
         (1u32, controller.clone(), recovery_addr.clone()),
@@ -78,6 +79,7 @@ pub(crate) fn initiate(
         initiated_at: env.ledger().sequence(),
     };
     env.storage().persistent().set(&pending_key, &request);
+    env.storage().persistent().extend_ttl(&pending_key, crate::TTL_LEDGERS, crate::TTL_LEDGERS);
     env.events().publish(
         (symbol_short!("recovery"), symbol_short!("init")),
         (1u32, controller.clone(), recovery_addr.clone(), env.ledger().sequence()),
@@ -141,7 +143,7 @@ pub(crate) fn get_pending(env: &Env, controller: &Address) -> Option<RecoveryReq
 mod tests {
     use super::*;
     use crate::{IdentityRegistry, IdentityRegistryClient};
-    use soroban_sdk::{testutils::Address as _, Env, Map};
+    use soroban_sdk::{testutils::{Address as _, Ledger as _}, Env, Map};
     extern crate std;
 
     fn setup() -> (Env, IdentityRegistryClient<'static>) {
@@ -211,6 +213,9 @@ mod tests {
         client.create_did(&user, &Map::new(&env));
         client.set_recovery_address(&user, &recovery);
         client.initiate_recovery(&recovery, &user, &new_owner);
+        env.as_contract(&client.address, || {
+            env.storage().instance().extend_ttl(6_000_000, 6_000_000);
+        });
 
         env.ledger().with_mut(|li| {
             li.sequence_number += RECOVERY_TIMELOCK_LEDGERS + 1;

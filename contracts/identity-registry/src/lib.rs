@@ -44,6 +44,10 @@ pub enum ContractError {
     RecoveryNotAuthorized = 21,
     /// `recover_did` would transfer the DID to an address that already owns one.
     RecoveryTargetExists = 22,
+    DelegationCycle = 23,
+    DelegationAlreadyExists = 24,
+    DelegationDepthExceeded = 25,
+    DelegationRevoked = 26,
 }
 
 /// Version returned by `ping` for deployment health checks.
@@ -470,7 +474,7 @@ impl IdentityRegistry {
         // Phase 2: Apply updates for entries that passed validation
         for (i, (controller, metadata)) in entries.iter().enumerate() {
             // Check if validation passed for this entry
-            let validation_passed = validation_results.get(i).unwrap_or(Err(ContractError::DidNotFound));
+            let validation_passed = validation_results.get(i as u32).unwrap_or(Err(ContractError::DidNotFound));
             
             if validation_passed.is_err() {
                 // Validation failed, record the error and skip update
@@ -596,6 +600,151 @@ impl IdentityRegistry {
             return Err(ContractError::DidDeactivated);
         }
         Ok(doc)
+    }
+
+    /// Grants a parent DID authority over a child DID for the supplied scope.
+    pub fn delegate_authority(
+        env: Env,
+        parent: Address,
+        child: Address,
+        scope: String,
+    ) -> Result<(), ContractError> {
+        parent.require_auth();
+        Self::require_not_paused(&env)?;
+        if parent == child {
+            return Err(ContractError::DelegationCycle);
+        }
+        if scope.is_empty() || scope.len() > MAX_DELEGATION_SCOPE_LEN {
+            return Err(ContractError::MetadataTooLong);
+        }
+        let storage = env.storage().persistent();
+        let parent_key = Self::did_key(&env, &parent);
+        let mut parent_doc: DidDocument = storage.get(&parent_key).ok_or(ContractError::DidNotFound)?;
+        if !parent_doc.active {
+            return Err(ContractError::DidDeactivated);
+        }
+        let child_key = Self::did_key(&env, &child);
+        let mut child_doc: DidDocument = storage.get(&child_key).ok_or(ContractError::DidNotFound)?;
+        if !child_doc.active {
+            return Err(ContractError::DidDeactivated);
+        }
+        if child_doc.parent != child {
+            return Err(ContractError::DelegationAlreadyExists);
+        }
+        if parent_doc.delegation_depth >= MAX_DELEGATION_DEPTH {
+            return Err(ContractError::DelegationDepthExceeded);
+        }
+        let mut ancestor = parent.clone();
+        for _ in 0..=MAX_DELEGATION_DEPTH {
+            if ancestor == child {
+                return Err(ContractError::DelegationCycle);
+            }
+            let ancestor_doc: DidDocument = storage
+                .get(&Self::did_key(&env, &ancestor))
+                .ok_or(ContractError::DidNotFound)?;
+            if ancestor_doc.parent == ancestor {
+                break;
+            }
+            ancestor = ancestor_doc.parent;
+        }
+        let now = env.ledger().timestamp();
+        let delegation = Delegation {
+            parent: parent.clone(),
+            child: child.clone(),
+            scope,
+            depth: parent_doc.delegation_depth + 1,
+            created_at: now,
+            active: true,
+        };
+        storage.set(&(DELEGATION, child.clone()), &delegation);
+        let mut children: Vec<Address> = storage
+            .get(&(DELEGATION_CHILDREN, parent.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        children.push_back(child.clone());
+        storage.set(&(DELEGATION_CHILDREN, parent.clone()), &children);
+        child_doc.parent = parent.clone();
+        child_doc.delegation_depth = delegation.depth;
+        child_doc.updated_at = now;
+        storage.set(&child_key, &child_doc);
+        storage.extend_ttl(&child_key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
+        parent_doc.updated_at = now;
+        storage.set(&parent_key, &parent_doc);
+        env.events().publish(
+            (DELEGATION, symbol_short!("granted")),
+            (EVENT_VERSION, parent, child, delegation.depth),
+        );
+        Ok(())
+    }
+
+    /// Returns true when an active delegation chain links `parent` to `child`.
+    pub fn is_delegation_authorized(env: Env, parent: Address, child: Address) -> bool {
+        let mut cursor = child.clone();
+        for _ in 0..MAX_DELEGATION_DEPTH {
+            if cursor == parent {
+                return true;
+            }
+            let delegation: Delegation = match env.storage().persistent().get::<_, Delegation>(&(DELEGATION, cursor.clone())) {
+                Some(value) if value.active => value,
+                _ => return false,
+            };
+            if delegation.parent == parent {
+                return true;
+            }
+            cursor = delegation.parent;
+        }
+        false
+    }
+
+    /// Lists active direct child delegations for `parent`.
+    pub fn get_delegations(env: Env, parent: Address) -> Vec<Delegation> {
+        let children: Vec<Address> = env.storage().persistent()
+            .get(&(DELEGATION_CHILDREN, parent)).unwrap_or_else(|| Vec::new(&env));
+        let mut active = Vec::new(&env);
+        for child in children.iter() {
+            if let Some(delegation) = env.storage().persistent()
+                .get::<_, Delegation>(&(DELEGATION, child)) {
+                if delegation.active { active.push_back(delegation); }
+            }
+        }
+        active
+    }
+
+    /// Returns active delegation records from the target DID towards its root.
+    pub fn get_delegation_chain(env: Env, child: Address) -> Vec<Delegation> {
+        let mut cursor = child;
+        let mut chain = Vec::new(&env);
+        for _ in 0..MAX_DELEGATION_DEPTH {
+            let delegation: Delegation = match env.storage().persistent().get::<_, Delegation>(&(DELEGATION, cursor.clone())) {
+                Some(value) if value.active => value,
+                _ => break,
+            };
+            cursor = delegation.parent.clone();
+            chain.push_back(delegation);
+        }
+        chain
+    }
+
+    /// Revokes the direct delegation from `parent` to `child`.
+    pub fn revoke_delegation(env: Env, parent: Address, child: Address) -> Result<(), ContractError> {
+        parent.require_auth();
+        Self::require_not_paused(&env)?;
+        let key = (DELEGATION, child.clone());
+        let mut delegation: Delegation = env.storage().persistent()
+            .get(&key).ok_or(ContractError::DelegationRevoked)?;
+        if !delegation.active || delegation.parent != parent {
+            return Err(ContractError::DelegationRevoked);
+        }
+        delegation.active = false;
+        env.storage().persistent().set(&key, &delegation);
+        let did_key = Self::did_key(&env, &child);
+        let mut doc: DidDocument = env.storage().persistent().get(&did_key).ok_or(ContractError::DidNotFound)?;
+        doc.parent = child.clone();
+        doc.delegation_depth = 0;
+        doc.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&did_key, &doc);
+        env.storage().persistent().extend_ttl(&did_key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
+        env.events().publish((DELEGATION, symbol_short!("revoked")), (EVENT_VERSION, parent, child));
+        Ok(())
     }
 
     pub fn has_active_did(env: Env, controller: Address) -> bool {
@@ -1581,6 +1730,8 @@ mod tests {
             client.try_revoke_delegation(&parent, &child),
             Err(Ok(ContractError::DelegationRevoked))
         );
+    }
+
     /// #866: an access only extends the TTL once it has dropped below
     /// `TTL_BUMP_THRESHOLD`, instead of on every call.
     #[test]
