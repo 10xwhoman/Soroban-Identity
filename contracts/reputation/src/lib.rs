@@ -103,6 +103,8 @@ pub enum ContractError {
     ContractPaused         = 15,
     /// Issue #733: batch too large.
     BatchTooLarge          = 16,
+    /// Issue #657: decay rate exceeds MAX_DECAY_RATE_BPS.
+    InvalidDecayRate       = 17,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────

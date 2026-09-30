@@ -38,6 +38,10 @@ The server configuration can be customized using the following environment varia
 | `RATE_LIMIT_PREMIUM_KEYS` | Comma-separated API key ids that bypass all rate limits. | unset |
 | `TRUST_PROXY` | Trust `X-Forwarded-For` when resolving the client IP. | `false` |
 
+## Container image and health checks
+
+Build the image from the repository root with `docker build -f server/Dockerfile -t soroban-identity .`. The image reports its health through `HEALTHCHECK` using `scripts/healthcheck.mjs` against `/live`. `/ready` and `/health` are available for readiness and detailed status. See [docs/container-health-checks.md](../docs/container-health-checks.md) for probe semantics, the Docker, compose, Kubernetes and ECS settings, and how to verify restarts.
+
 ## Rate Limiting
 
 Two budgets apply to every non-exempt request, and both must be satisfied.
