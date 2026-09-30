@@ -7,6 +7,8 @@ use soroban_sdk::{
 };
 use soroban_sdk::xdr::ToXdr;
 
+pub mod recovery;
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -30,6 +32,18 @@ pub enum ContractError {
     BatchTooLarge = 15,
     /// `create_dids_batch` was called with an empty entry list.
     EmptyBatch = 16,
+    /// `set_recovery_address` / `initiate_recovery` called but no recovery address is stored.
+    RecoveryNotSet = 17,
+    /// `initiate_recovery` called while a recovery request is already pending.
+    RecoveryPending = 18,
+    /// `cancel_recovery` or `recover_did` called but no pending recovery exists.
+    NoPendingRecovery = 19,
+    /// `recover_did` called before the timelock window has elapsed.
+    RecoveryTimelockActive = 20,
+    /// The caller is not the registered recovery address for the target DID.
+    RecoveryNotAuthorized = 21,
+    /// `recover_did` would transfer the DID to an address that already owns one.
+    RecoveryTargetExists = 22,
 }
 
 /// Version returned by `ping` for deployment health checks.
@@ -471,6 +485,92 @@ impl IdentityRegistry {
             total_dids: env.storage().instance().get(&TOTAL_DIDS).unwrap_or(0),
             active_dids: env.storage().instance().get(&DID_COUNT).unwrap_or(0),
         }
+    }
+
+    // ── Recovery (#879) ───────────────────────────────────────────────────────
+
+    /// Register a recovery address for the caller's DID.
+    /// The recovery address can later initiate a time-locked ownership transfer.
+    pub fn set_recovery_address(
+        env: Env,
+        controller: Address,
+        recovery_addr: Address,
+    ) -> Result<(), ContractError> {
+        controller.require_auth();
+        Self::require_not_paused(&env)?;
+        let key = Self::did_key(&env, &controller);
+        if !env.storage().persistent().has(&key) {
+            return Err(ContractError::DidNotFound);
+        }
+        recovery::store_recovery_address(&env, &controller, &recovery_addr);
+        Ok(())
+    }
+
+    /// Return the registered recovery address for `controller`, or `None`.
+    pub fn get_recovery_address(env: Env, controller: Address) -> Option<Address> {
+        recovery::load_recovery_address(&env, &controller)
+    }
+
+    /// Phase 1: recovery address initiates a time-locked challenge to transfer the DID.
+    pub fn initiate_recovery(
+        env: Env,
+        recovery_addr: Address,
+        controller: Address,
+        new_controller: Address,
+    ) -> Result<(), ContractError> {
+        recovery_addr.require_auth();
+        Self::require_not_paused(&env)?;
+        recovery::initiate(&env, &recovery_addr, &controller, &new_controller)
+    }
+
+    /// Phase 1b: original DID owner responds to cancel a pending recovery request.
+    pub fn cancel_recovery(env: Env, controller: Address) -> Result<(), ContractError> {
+        controller.require_auth();
+        recovery::cancel(&env, &controller)
+    }
+
+    /// Phase 2: after the timelock elapses, recovery address completes the transfer.
+    /// The DID document is re-keyed to `new_controller`; the original key is removed.
+    pub fn recover_did(
+        env: Env,
+        recovery_addr: Address,
+        controller: Address,
+    ) -> Result<(), ContractError> {
+        recovery_addr.require_auth();
+        Self::require_not_paused(&env)?;
+        let new_controller = recovery::finalize(&env, &recovery_addr, &controller)?;
+
+        // Guard: new_controller must not already own a DID.
+        let new_key = Self::did_key(&env, &new_controller);
+        if env.storage().persistent().has(&new_key) {
+            return Err(ContractError::RecoveryTargetExists);
+        }
+
+        // Re-key the DID document from old controller to new controller.
+        let old_key = Self::did_key(&env, &controller);
+        let mut doc: DidDocument = env
+            .storage()
+            .persistent()
+            .get(&old_key)
+            .ok_or(ContractError::DidNotFound)?;
+        doc.controller = new_controller.clone();
+        doc.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&new_key, &doc);
+        env.storage().persistent().extend_ttl(&new_key, TTL_LEDGERS, TTL_LEDGERS);
+        env.storage().persistent().remove(&old_key);
+        env.events().publish(
+            (IDENTITY, symbol_short!("rec_done")),
+            (EVENT_VERSION, controller, new_controller, doc.updated_at),
+        );
+        Ok(())
+    }
+
+    /// Return the pending recovery request for `controller`, if any.
+    pub fn get_pending_recovery(
+        env: Env,
+        controller: Address,
+    ) -> Option<recovery::RecoveryRequest> {
+        recovery::get_pending(&env, &controller)
     }
 
     // ── Service endpoints ─────────────────────────────────────────────────────
