@@ -38,8 +38,8 @@ pub struct DecryptionGrant {
 /// Derive a public key identifier without storing key material on-chain.
 pub fn derive_key_id(env: &Env, issuer: &Address, key_material_commitment: &Bytes) -> BytesN<32> {
     let mut input = Bytes::new(env);
-    input.append(issuer.to_xdr(env));
-    input.append(key_material_commitment.clone());
+    input.append(&issuer.to_xdr(env));
+    input.append(key_material_commitment);
     env.crypto().sha256(&input).into()
 }
 

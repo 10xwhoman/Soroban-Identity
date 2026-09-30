@@ -7,6 +7,9 @@ pub use templates::{CredentialTemplate, TemplateRef};
 pub mod encryption;
 mod versions;
 
+mod suspension;
+pub use suspension::{CredentialStatus, SuspensionReason, SuspensionRecord};
+
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
@@ -14,16 +17,10 @@ use soroban_sdk::{
 };
 use versions::{CredentialVersion, MAX_VERSION_HISTORY};
 
-mod types;
-pub use types::{CredentialType, RevocationReason, RevocationRecord};
-
-// ── Storage keys ──────────────────────────────────────────────────────────────
 pub const CONTRACT_VERSION: u32 = 1;
 const EVENT_VERSION: u32 = 1;
 
 const ADMIN: Symbol = symbol_short!("ADMIN");
-const PAUSED: Symbol = symbol_short!("PAUSED");
-const PENDING_ADMIN: Symbol = symbol_short!("PADMIN");
 const ISSUER: Symbol = symbol_short!("ISSUER");
 const CRED: Symbol = symbol_short!("CRED");
 const SUBJECT: Symbol = symbol_short!("sub");
@@ -38,10 +35,6 @@ const REVOCATIONS: Symbol = symbol_short!("REVOKEIX");
 /// credential ID so re-issuing after a revocation never collides with the
 /// original storage key. See issue #467.
 const ISS_NONCE: Symbol = symbol_short!("ISSNONCE");
-/// Issue #937: per-credential revocation record, key `(REV_RECORD, id)`.
-const REV_RECORD: Symbol = symbol_short!("REVREC");
-/// Issue #937: index of revoked credential IDs per `RevocationReason`.
-const REV_BY_REASON: Symbol = symbol_short!("REVREAS");
 
 const MAX_ISSUERS: u32 = 100;
 const ABSOLUTE_MAX_ISSUERS: u32 = 500;
@@ -121,6 +114,30 @@ const SIG_THRESHOLD: Symbol = symbol_short!("SIGTH");
 /// Admin action proposal expiration time in seconds (15 minutes).
 const ADMIN_ACTION_EXPIRATION_SECS: u64 = 900;
 
+// -- Issue #663: upgrade timelock
+/// Storage key for the pending upgrade proposal.
+const UPGRADE_PROPOSAL: Symbol = symbol_short!("UPGPROP");
+/// Default timelock (seconds) applied to an upgrade proposal when the caller
+/// does not specify one explicitly (7 days).
+const DEFAULT_UPGRADE_TIMELOCK: u32 = 604_800;
+
+// -- Issue #656: credential type registry
+/// List of every credential type name ever registered.
+const TYPE_NAMES: Symbol = symbol_short!("TYPENAMES");
+/// Maps a type name to its [`CredentialTypeDescriptor`].
+const TYPE_REGISTRY: Symbol = symbol_short!("TYPEREG");
+/// Maximum number of distinct credential type names that may be registered.
+const MAX_CREDENTIAL_TYPES: u32 = 200;
+
+// -- Issue #662: credential metadata secondary indexes
+const CRED_BY_TYPE: Symbol = symbol_short!("CREDBYTYP");
+const CRED_BY_ISSUER: Symbol = symbol_short!("CREDBYISS");
+const CRED_BY_SUBJECT: Symbol = symbol_short!("CREDBYSUB");
+
+// -- Issue #655: delegated verification
+/// Maps a delegation ID to its [`Delegation`] record.
+const DELEGATION: Symbol = symbol_short!("DELEG");
+
 #[contracterror]
 #[derive(Clone, Debug, PartialEq, Copy)]
 pub enum ContractError {
@@ -133,8 +150,8 @@ pub enum ContractError {
     Unauthorized = 7,
     MaxIssuersReached = 8,
     CredentialExpired = 9,
-    NoPendingAdmin = 10,
-    NotPendingAdmin = 11,
+    // Codes 10 and 11 (NoPendingAdmin / NotPendingAdmin) are retired: this
+    // contract has no two-step admin transfer. Do not reuse them.
     SchemaNotFound = 12,
     CredentialNotExpiredYet = 13,
     /// New expiry must be strictly later than the current expiry
@@ -189,31 +206,11 @@ pub enum ContractError {
     UnsupportedZkProofType = 48,
     InvalidZkProof = 49,
     /// Issue #816: credential version was not found in the amendment history.
-    VersionNotFound = 32,
-    /// Issue #947: no encryption key registered for the address.
-    EncryptionKeyNotFound = 33,
-    /// Issue #947: the address's encryption key has been revoked.
-    EncryptionKeyRevoked = 34,
-    /// Issue #947: malformed public key or wrapped key.
-    InvalidEncryptionKey = 35,
-    /// Issue #947: credential has no encrypted claims attached.
-    EncryptedClaimsNotFound = 36,
-    /// Issue #947: encrypted claims were already attached to this credential.
-    EncryptedClaimsAlreadyAttached = 37,
-    /// Issue #947: malformed encrypted field, field name, or disclosure.
-    InvalidEncryptedField = 38,
-    /// Issue #947: caller holds no access grant for the encrypted claims.
-    AccessDenied = 39,
-    /// Issue #947: the caller's access grant has expired.
-    AccessGrantExpired = 40,
-    /// Issue #947: a field marked sensitive also appears in plaintext claims.
-    SensitiveClaimInPlaintext = 41,
-    /// Issue #947: zero or more than MAX_ENCRYPTED_FIELDS encrypted fields.
-    TooManyEncryptedFields = 42,
-    /// Issue #947: unsupported key algorithm or encryption scheme.
-    UnsupportedEncryptionScheme = 43,
-    /// Issue #947: credential already has MAX_READERS_PER_CREDENTIAL grants.
-    TooManyClaimReaders = 44,
+    VersionNotFound = 50,
+    /// Issue #856: the credential is temporarily suspended.
+    CredentialSuspended = 51,
+    /// Issue #856: the credential is not suspended, so it cannot be reactivated.
+    CredentialNotSuspended = 52,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -244,6 +241,59 @@ pub struct CredentialStorageStats {
 /// X.509 CRL reason codes (RFC 5280 §5.3.1) so that off-chain systems can
 /// map them directly. Stored as a `u32` on-chain. See #951.
 #[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RevocationReason {
+    /// No reason given. Used by legacy callers of `revoke_credential`.
+    Unspecified = 0,
+    /// The subject's signing key was compromised.
+    KeyCompromise = 1,
+    /// The issuer's signing key was compromised.
+    IssuerCompromise = 2,
+    /// The subject's affiliation with the issuer changed.
+    AffiliationChanged = 3,
+    /// The credential was replaced by a newer one.
+    Superseded = 4,
+    /// The issuer no longer operates the credential program.
+    CessationOfOperation = 5,
+    /// The privilege granted by the credential was withdrawn.
+    PrivilegeWithdrawn = 6,
+    /// The credential was obtained with false or fraudulent information.
+    Fraudulent = 7,
+    /// The subject asked for the credential to be revoked.
+    SubjectRequest = 8,
+    /// A prerequisite credential was revoked (cascade revocation, #732).
+    DependencyRevoked = 9,
+}
+
+impl RevocationReason {
+    /// Every variant, in declaration order. Backs
+    /// [`CredentialManager::get_revocation_reason_options`]. #937
+    pub const ALL: [RevocationReason; 10] = [
+        RevocationReason::Unspecified,
+        RevocationReason::KeyCompromise,
+        RevocationReason::IssuerCompromise,
+        RevocationReason::AffiliationChanged,
+        RevocationReason::Superseded,
+        RevocationReason::CessationOfOperation,
+        RevocationReason::PrivilegeWithdrawn,
+        RevocationReason::Fraudulent,
+        RevocationReason::SubjectRequest,
+        RevocationReason::DependencyRevoked,
+    ];
+}
+
+/// Revocation metadata persisted for each revoked credential. See #951.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevocationRecord {
+    pub credential_id: BytesN<32>,
+    pub reason: RevocationReason,
+    pub revoked_by: Address,
+    pub revoked_at: u64,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct CredentialIdsPage {
     pub items: Vec<BytesN<32>>,
@@ -258,17 +308,6 @@ pub struct IssuersPage {
 }
 
 // ── Issue #732: dependency chain types ────────────────────────────────────────
-
-/// One entry in a `verify_credentials_batch` response (#733).
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct BatchVerifyResult {
-    /// The credential ID that was checked.
-    pub id: BytesN<32>,
-    /// `true` if the credential passed all validity checks including its
-    /// full prerequisite chain; `false` otherwise.
-    pub valid: bool,
-}
 
 /// The full prerequisite tree rooted at a given credential (#732).
 #[contracttype]
@@ -368,6 +407,9 @@ pub struct Credential {
     pub activation_time: u64,
     pub expires_at: u64,
     pub revoked: bool,
+    /// `true` when a pending time-locked activation has been cancelled by the
+    /// issuer; a cancelled credential can never become active (#731).
+    pub activation_cancelled: bool,
     /// All-zero when no schema was supplied at issuance — mirrors the
     /// "zero hash is never a registered schema" convention used by `register_schema`.
     pub schema_hash: BytesN<32>,
@@ -540,6 +582,7 @@ impl CredentialManager {
         env: Env,
         admin: Address,
         new_wasm_hash: BytesN<32>,
+        timelock_duration: Option<u32>,
     ) -> Result<(), ContractError> {
         admin.require_auth();
         let stored: Address = env
@@ -634,7 +677,11 @@ impl CredentialManager {
 
     pub fn pause(env: Env) -> Result<(), ContractError> {
         Self::require_admin(&env)?;
-        env.storage().instance().set(&PAUSED, &true);
+        // The pause flag lives in the packed config (#661), which is what
+        // `require_not_paused` reads.
+        let mut config = Self::get_config(&env);
+        config.is_paused = true;
+        Self::set_config(&env, &config);
         env.events().publish(
             (symbol_short!("contract"), symbol_short!("paused")),
             EVENT_VERSION,
@@ -644,7 +691,9 @@ impl CredentialManager {
 
     pub fn unpause(env: Env) -> Result<(), ContractError> {
         Self::require_admin(&env)?;
-        env.storage().instance().set(&PAUSED, &false);
+        let mut config = Self::get_config(&env);
+        config.is_paused = false;
+        Self::set_config(&env, &config);
         env.events().publish(
             (symbol_short!("contract"), symbol_short!("unpaused")),
             EVENT_VERSION,
@@ -964,15 +1013,7 @@ impl CredentialManager {
             return Err(ContractError::ClaimsSchemaMismatch);
         }
         Self::issue_credential(
-            env,
-            issuer,
-            subject,
-            credential_type,
-            claims,
-            claims_hash,
-            signature,
-            expires_at,
-            None,
+            env, issuer, subject, credential_type, claims, claims_hash, signature, expires_at, 0, None,
             None,
         )
     }
@@ -1089,6 +1130,7 @@ impl CredentialManager {
             activation_time,
             expires_at,
             revoked: false,
+            activation_cancelled: false,
             schema_hash: schema_hash.unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32])),
         };
 
@@ -1230,11 +1272,7 @@ impl CredentialManager {
         timestamp: u64,
     ) -> Result<RevocationMerkleProof, ContractError> {
         let period = Self::crl_period(timestamp);
-        let leaves: Vec<BytesN<32>> = env
-            .storage()
-            .persistent()
-            .get(&(CRL_LEAVES, issuer, period))
-            .ok_or(ContractError::MerkleProofNotFound)?;
+        let leaves: Vec<BytesN<32>> = env.storage().persistent().get(&(CRL_LEAVES, issuer, period)).ok_or(ContractError::CredentialNotFound)?;
         let mut index: u32 = 0;
         let mut found = false;
         for leaf in leaves.iter() {
@@ -1244,10 +1282,7 @@ impl CredentialManager {
             }
             index += 1;
         }
-        if !found {
-            return Err(ContractError::MerkleProofNotFound);
-        }
-
+        if !found { return Err(ContractError::CredentialNotFound); }
         let mut level = leaves;
         let mut siblings = Vec::new(&env);
         let mut sibling_on_left = Vec::new(&env);
@@ -1304,22 +1339,15 @@ impl CredentialManager {
         current == expected
     }
 
-    /// Revoke a credential without a specific reason. Equivalent to
-    /// [`Self::revoke_credential_with_reason`] with
-    /// [`RevocationReason::Unspecified`]; kept for backwards compatibility.
+    /// Revoke a credential. Equivalent to
+    /// [`Self::revoke_credential_with_reason`]; kept for backwards compatibility.
     pub fn revoke_credential(
         env: Env,
         issuer: Address,
         credential_id: BytesN<32>,
         reason: RevocationReason,
     ) -> Result<(), ContractError> {
-        let _ = reason;
-        Self::revoke_credential_with_reason(
-            env,
-            issuer,
-            credential_id,
-            RevocationReason::Unspecified,
-        )
+        Self::revoke_credential_with_reason(env, issuer, credential_id, reason)
     }
 
     /// Revoke a credential and record a standardized [`RevocationReason`].
@@ -1347,61 +1375,6 @@ impl CredentialManager {
 
         cred.revoked = true;
         env.storage().persistent().set(&key, &cred);
-
-        let record = RevocationRecord {
-            credential_id: credential_id.clone(),
-            issuer: issuer.clone(),
-            reason,
-            revoked_at: env.ledger().timestamp(),
-        };
-        env.storage()
-            .persistent()
-            .set(&Self::revocation_key(&credential_id), &record);
-
-        let reason_key = Self::reason_key(reason);
-        let mut ids: Vec<BytesN<32>> = env
-            .storage()
-            .persistent()
-            .get(&reason_key)
-            .unwrap_or_else(|| Vec::new(&env));
-        ids.push_back(credential_id.clone());
-        env.storage().persistent().set(&reason_key, &ids);
-
-        env.events().publish(
-            (CRED, symbol_short!("revoked")),
-            (EVENT_VERSION, credential_id.clone(), issuer, reason),
-        );
-        Ok(())
-    }
-
-    /// Get the revocation record for a credential, if revoked.
-    pub fn get_revocation(env: Env, credential_id: BytesN<32>) -> Option<RevocationRecord> {
-        env.storage()
-            .persistent()
-            .get(&Self::revocation_key(&credential_id))
-    }
-
-    /// List credential IDs revoked for a given reason.
-    pub fn get_revocations_by_reason(env: Env, reason: RevocationReason) -> Vec<BytesN<32>> {
-        env.storage()
-            .persistent()
-            .get(&Self::reason_key(reason))
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    /// How many credentials were revoked with `reason`. #937
-    pub fn count_revocations_by_reason(env: Env, reason: RevocationReason) -> u32 {
-        Self::get_revocations_by_reason(env, reason).len()
-    }
-
-    /// Every supported [`RevocationReason`], in declaration order. #937
-    pub fn get_revocation_reason_options(env: Env) -> Vec<RevocationReason> {
-        let mut options = Vec::new(&env);
-        for reason in RevocationReason::ALL.iter() {
-            options.push_back(*reason);
-        }
-        options
-    }
 
     pub fn set_transfer_auto_approve(
         env: Env,
@@ -1567,12 +1540,8 @@ impl CredentialManager {
         };
         env.storage()
             .persistent()
-            .set(&Self::transfer_key(&credential_id), &request);
-        env.events().publish(
-            (CRED, symbol_short!("xfer_conf")),
-            (EVENT_VERSION, credential_id, issuer, approved),
-        );
-        Ok(())
+            .get(&(REVOKE_REASON, credential_id))
+            .ok_or(ContractError::CredentialNotFound)
     }
 
     pub fn get_transfer_history(
@@ -1581,7 +1550,7 @@ impl CredentialManager {
     ) -> Vec<CredentialTransferRecord> {
         env.storage()
             .persistent()
-            .get(&Self::transfer_history_key(&credential_id))
+            .get(&(REVOKED_BY_REASON, reason))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -1806,6 +1775,10 @@ impl CredentialManager {
                 if cred.revoked {
                     return Err(ContractError::CredentialRevoked);
                 }
+                // #856: suspended credentials fail verification until reactivated.
+                if suspension::is_suspended(&env, &credential_id) {
+                    return Err(ContractError::CredentialSuspended);
+                }
                 let now = env.ledger().timestamp();
                 // #731: credential must have reached its activation_time.
                 if cred.activation_time != 0 && now < cred.activation_time {
@@ -1829,6 +1802,89 @@ impl CredentialManager {
                 Ok(())
             }
         }
+    }
+
+    // ── Credential delegation (#655) ──────────────────────────────────────────
+
+    /// Grants `delegate` the right to verify on `subject`'s behalf — scoped to
+    /// one credential, or to all of `subject`'s via the zero id. `subject`
+    /// must sign; overwrites any existing grant to the same `delegate`.
+    pub fn delegate_verification(
+        env: Env,
+        subject: Address,
+        delegate: Address,
+        credential_id: BytesN<32>,
+        expires_at: u64,
+    ) -> Result<(), ContractError> {
+        subject.require_auth();
+        Self::require_not_paused(&env)?;
+        let now = env.ledger().timestamp();
+        if expires_at <= now {
+            return Err(ContractError::InvalidDelegationExpiry);
+        }
+        let key = Self::delegation_key(&subject, &delegate);
+        let delegation = Delegation {
+            subject: subject.clone(),
+            delegate: delegate.clone(),
+            credential_id: credential_id.clone(),
+            granted_at: now,
+            expires_at,
+            revoked: false,
+        };
+        env.storage().persistent().set(&key, &delegation);
+        let ttl = Self::ttl_for_credential(&env, expires_at);
+        env.storage().persistent().extend_ttl(&key, ttl, ttl);
+        env.events().publish(
+            (DELEGATION, symbol_short!("granted")),
+            (EVENT_VERSION, subject, delegate, credential_id, expires_at),
+        );
+        Ok(())
+    }
+
+    /// Revokes a previously granted delegation (subject only).
+    pub fn revoke_delegation(env: Env, subject: Address, delegate: Address) -> Result<(), ContractError> {
+        subject.require_auth();
+        Self::require_not_paused(&env)?;
+        let key = Self::delegation_key(&subject, &delegate);
+        let mut delegation: Delegation =
+            env.storage().persistent().get(&key).ok_or(ContractError::DelegationNotFound)?;
+        if delegation.revoked {
+            return Err(ContractError::DelegationAlreadyRevoked);
+        }
+        delegation.revoked = true;
+        env.storage().persistent().set(&key, &delegation);
+        env.events().publish(
+            (DELEGATION, symbol_short!("revoked")),
+            (EVENT_VERSION, subject, delegate),
+        );
+        Ok(())
+    }
+
+    /// Whether `delegate` currently holds an active, unexpired delegation
+    /// from `subject` covering `credential_id`.
+    pub fn is_delegate_authorized(env: Env, subject: Address, delegate: Address, credential_id: BytesN<32>) -> bool {
+        Self::active_delegation(&env, &subject, &delegate, &credential_id).is_some()
+    }
+
+    /// Verifies a credential on `subject`'s behalf via a delegation grant.
+    /// `delegate` must sign and hold a matching, active delegation — see
+    /// [`Self::delegate_verification`].
+    pub fn verify_credential_as_delegate(
+        env: Env,
+        delegate: Address,
+        subject: Address,
+        credential_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        delegate.require_auth();
+        if Self::active_delegation(&env, &subject, &delegate, &credential_id).is_none() {
+            return Err(ContractError::UnauthorizedDelegate);
+        }
+        let key = Self::cred_key(&credential_id);
+        let cred: Credential = env.storage().persistent().get(&key).ok_or(ContractError::CredentialNotFound)?;
+        if cred.subject != subject {
+            return Err(ContractError::CredentialNotFound);
+        }
+        Self::verify_credential(env, credential_id)
     }
 
     pub fn get_credential(
@@ -2201,7 +2257,9 @@ impl CredentialManager {
             .ok_or(ContractError::CredentialNotFound)?;
 
         let now = env.ledger().timestamp();
-        let valid = !cred.revoked && (cred.expires_at == 0 || now <= cred.expires_at);
+        let valid = !cred.revoked
+            && !suspension::is_suspended(&env, &credential_id)
+            && (cred.expires_at == 0 || now <= cred.expires_at);
         let prerequisites = Self::fetch_prereqs(&env, &credential_id);
 
         Ok(DependencyTree {
@@ -2211,26 +2269,19 @@ impl CredentialManager {
         })
     }
 
-    // ── Issue #733: batch verify credentials ──────────────────────────────────
+    // ── Issue #819 / #733: batch verify credentials ────────────────────────────
 
-    /// Verify multiple credentials in a single call, returning one result per ID.
-    ///
-    /// Capped at `MAX_VERIFY_BATCH` (50) entries. Each result includes whether
-    /// the full prerequisite chain also passes. No `require_auth` is needed;
-    /// verification is read-only. Returns `BatchTooLarge` if `ids.len() > 50`.
+    /// Verify multiple credentials in a single call, returning one detailed
+    /// result per id. See the [`batch`] module for the algorithm (shared
+    /// per-call memoization of credential lookups) and the exact meaning of
+    /// `fail_fast`. No `require_auth` is needed; verification is read-only.
+    /// Returns `BatchTooLarge` if `ids.len() > batch::MAX_VERIFY_BATCH` (50).
     pub fn verify_credentials_batch(
         env: Env,
         ids: Vec<BytesN<32>>,
+        fail_fast: bool,
     ) -> Result<Vec<BatchVerifyResult>, ContractError> {
-        if ids.len() > MAX_VERIFY_BATCH {
-            return Err(ContractError::BatchTooLarge);
-        }
-        let mut results: Vec<BatchVerifyResult> = Vec::new(&env);
-        for id in ids.iter() {
-            let valid = Self::check_credential_valid(&env, &id, 0);
-            results.push_back(BatchVerifyResult { id, valid });
-        }
-        Ok(results)
+        batch::verify_batch(&env, ids, fail_fast)
     }
 
     // -- Issue #659: Proof of possession challenge (credential proof requirements)
@@ -2587,21 +2638,12 @@ impl CredentialManager {
         }
         cred.revoked = true;
         env.storage().persistent().set(&key, &cred);
-        Self::store_revocation(env, &cred, issuer, credential_id, reason);
         Self::append_revocation_leaf(env, issuer, credential_id, env.ledger().timestamp());
         let revoked: u32 = env.storage().instance().get(&REVOKED_CNT).unwrap_or(0);
         env.storage().instance().set(&REVOKED_CNT, &(revoked + 1));
         // closes #553: include revocation timestamp in batch events too.
         let revoked_at: u64 = env.ledger().timestamp();
-        // #951: batch revocations carry a free-form `Symbol` reason, so the
-        // standardized reason is recorded as `Unspecified`.
-        Self::record_revocation(
-            env,
-            credential_id,
-            RevocationReason::Unspecified,
-            issuer,
-            revoked_at,
-        );
+        Self::record_revocation(env, credential_id, *reason, issuer, revoked_at);
         env.events().publish(
             (CRED, symbol_short!("revoked")),
             (
@@ -2712,6 +2754,23 @@ impl CredentialManager {
             .get(&ADMIN)
             .ok_or(ContractError::NotInitialized)?;
         admin.require_auth();
+        Ok(())
+    }
+
+    /// Issue #656: like [`Self::require_admin`], but for call sites that already
+    /// have an explicit `admin` address argument to authenticate (rather than
+    /// looking one up as the sole caller). Requires `caller`'s auth and checks
+    /// it matches the stored admin.
+    fn require_admin_caller(env: &Env, caller: &Address) -> Result<(), ContractError> {
+        caller.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(ContractError::NotInitialized)?;
+        if &stored != caller {
+            return Err(ContractError::Unauthorized);
+        }
         Ok(())
     }
 
@@ -2988,30 +3047,6 @@ impl CredentialManager {
         (CRED, id.clone())
     }
 
-    fn revocation_key(id: &BytesN<32>) -> (Symbol, BytesN<32>) {
-        (symbol_short!("rvk"), id.clone())
-    }
-
-    fn reason_key(reason: RevocationReason) -> (Symbol, u32) {
-        (symbol_short!("rvkrsn"), reason as u32)
-    }
-
-    fn transfer_key(credential_id: &BytesN<32>) -> (Symbol, BytesN<32>) {
-        (symbol_short!("xfer"), credential_id.clone())
-    }
-
-    fn transfer_history_key(credential_id: &BytesN<32>) -> (Symbol, BytesN<32>) {
-        (symbol_short!("xferhist"), credential_id.clone())
-    }
-
-    fn auto_approve_transfers_key() -> Symbol {
-        symbol_short!("autoxfer")
-    }
-
-    fn subject_key(subject: &Address) -> (Symbol, Address) {
-        (SUBJECT, subject.clone())
-    }
-
     fn nonce_key(
         env: &Env,
         issuer: &Address,
@@ -3061,6 +3096,92 @@ impl CredentialManager {
         Some(delegation)
     }
 
+    /// Issue #655: grant `delegate` the ability to call
+    /// [`Self::verify_credential_as_delegate`] on `subject`'s behalf, either for
+    /// one specific credential (`credential_id`) or, when `credential_id` is the
+    /// all-zero id, for every credential `subject` holds. Requires `subject`'s
+    /// auth. `expires_at` must be strictly in the future. A second grant to the
+    /// same (subject, delegate) pair replaces the previous one.
+    pub fn delegate_verification(
+        env: Env,
+        subject: Address,
+        delegate: Address,
+        credential_id: BytesN<32>,
+        expires_at: u64,
+    ) -> Result<(), ContractError> {
+        subject.require_auth();
+        if expires_at <= env.ledger().timestamp() {
+            return Err(ContractError::InvalidDelegationExpiry);
+        }
+        let key = Self::delegation_key(&subject, &delegate);
+        let delegation = Delegation {
+            subject: subject.clone(),
+            delegate: delegate.clone(),
+            credential_id: credential_id.clone(),
+            granted_at: env.ledger().timestamp(),
+            expires_at,
+            revoked: false,
+        };
+        env.storage().persistent().set(&key, &delegation);
+        let ttl = Self::ttl_for_credential(&env, expires_at);
+        env.storage().persistent().extend_ttl(&key, ttl, ttl);
+        env.events().publish(
+            (DELEGATION, symbol_short!("granted")),
+            (EVENT_VERSION, subject, delegate, credential_id, expires_at),
+        );
+        Ok(())
+    }
+
+    /// Issue #655: whether `delegate` currently holds an active (not revoked,
+    /// not expired) delegation from `subject` covering `credential_id`.
+    pub fn is_delegate_authorized(
+        env: Env,
+        subject: Address,
+        delegate: Address,
+        credential_id: BytesN<32>,
+    ) -> bool {
+        Self::active_delegation(&env, &subject, &delegate, &credential_id).is_some()
+    }
+
+    /// Issue #655: verify `credential_id` on `subject`'s behalf as `delegate`,
+    /// provided `delegate` currently holds an active delegation covering it.
+    /// Requires `delegate`'s auth. Delegates to [`Self::verify_credential`] for
+    /// the actual validity check (revocation, expiry, activation, prerequisites).
+    pub fn verify_credential_as_delegate(
+        env: Env,
+        delegate: Address,
+        subject: Address,
+        credential_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        delegate.require_auth();
+        if Self::active_delegation(&env, &subject, &delegate, &credential_id).is_none() {
+            return Err(ContractError::UnauthorizedDelegate);
+        }
+        Self::verify_credential(env, credential_id)
+    }
+
+    /// Issue #655: revoke a previously granted delegation from `subject` to
+    /// `delegate`. Requires `subject`'s auth.
+    pub fn revoke_delegation(env: Env, subject: Address, delegate: Address) -> Result<(), ContractError> {
+        subject.require_auth();
+        let key = Self::delegation_key(&subject, &delegate);
+        let mut delegation: Delegation = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::DelegationNotFound)?;
+        if delegation.revoked {
+            return Err(ContractError::DelegationAlreadyRevoked);
+        }
+        delegation.revoked = true;
+        env.storage().persistent().set(&key, &delegation);
+        env.events().publish(
+            (DELEGATION, symbol_short!("revoked")),
+            (EVENT_VERSION, subject, delegate),
+        );
+        Ok(())
+    }
+
     fn type_names(env: &Env) -> Vec<String> {
         env.storage()
             .instance()
@@ -3077,7 +3198,7 @@ impl CredentialManager {
             data.append(&k.to_xdr(env));
             data.push_back(0u8);
         }
-        env.crypto().sha256(&data)
+        env.crypto().sha256(&data).into()
     }
 
     fn issuer_creds_key(issuer: &Address) -> (Symbol, Address) {
@@ -3190,7 +3311,7 @@ impl CredentialManager {
         match env.storage().persistent().get::<_, Credential>(&key) {
             None => false,
             Some(cred) => {
-                if cred.revoked {
+                if cred.revoked || suspension::is_suspended(env, id) {
                     return false;
                 }
                 let now = env.ledger().timestamp();
@@ -3294,14 +3415,9 @@ mod tests {
         subject: &Address,
     ) -> BytesN<32> {
         client.issue_credential(
-            issuer,
-            subject,
-            &CredentialType::Kyc,
-            &Map::new(env),
-            &BytesN::from_array(env, &[1u8; 32]),
-            &Bytes::from_array(env, &[0u8; 64]),
-            &0u64,
-            &None,
+            issuer, subject, &CredentialType::Kyc,
+            &Map::new(env), &BytesN::from_array(env, &[1u8; 32]),
+            &Bytes::from_array(env, &[0u8; 64]), &0u64, &0u64, &None, &None,
         )
     }
 
@@ -3348,7 +3464,7 @@ mod tests {
         let subject = Address::generate(&env);
         client.add_issuer(&issuer);
         let cred_id = issue_kyc(&env, &client, &issuer, &subject);
-        client.revoke_credential(&issuer, &cred_id, &RevocationReason::Compromised);
+        client.revoke_credential(&issuer, &cred_id, &RevocationReason::KeyCompromise);
         assert_eq!(
             client.try_verify_credential(&cred_id),
             Err(Ok(ContractError::CredentialRevoked))
@@ -3363,16 +3479,16 @@ mod tests {
         client.add_issuer(&issuer);
         let cred_id = issue_kyc(&env, &client, &issuer, &subject);
 
-        client.revoke_credential(&issuer, &cred_id, &RevocationReason::Compromised);
+        env.ledger().with_mut(|li| li.timestamp = 1_000);
+        client.revoke_credential(&issuer, &cred_id, &RevocationReason::KeyCompromise);
 
         let record = client.get_revocation(&cred_id);
         assert_eq!(record.credential_id, cred_id);
-        assert_eq!(record.reason, RevocationReason::Compromised);
-        assert_eq!(record.issuer, issuer);
-        assert_eq!(record.subject, subject);
-        assert!(record.revoked_at > 0);
+        assert_eq!(record.reason, RevocationReason::KeyCompromise);
+        assert_eq!(record.revoked_by, issuer);
+        assert_eq!(record.revoked_at, 1_000);
         assert_eq!(
-            client.count_revocations_by_reason(&RevocationReason::Compromised),
+            client.count_revocations_by_reason(&RevocationReason::KeyCompromise),
             1
         );
     }
@@ -3386,19 +3502,19 @@ mod tests {
         let second = issue_kyc(&env, &client, &issuer, &Address::generate(&env));
 
         client.revoke_credential(&issuer, &first, &RevocationReason::Superseded);
-        client.revoke_credential(&issuer, &second, &RevocationReason::Lost);
+        client.revoke_credential(&issuer, &second, &RevocationReason::Fraudulent);
 
         let superseded = client.get_revocations_by_reason(&RevocationReason::Superseded);
         assert_eq!(superseded.len(), 1);
         assert_eq!(superseded.get(0).unwrap(), first);
 
-        let lost = client.get_revocations_by_reason(&RevocationReason::Lost);
-        assert_eq!(lost.len(), 1);
-        assert_eq!(lost.get(0).unwrap(), second);
+        let fraudulent = client.get_revocations_by_reason(&RevocationReason::Fraudulent);
+        assert_eq!(fraudulent.len(), 1);
+        assert_eq!(fraudulent.get(0).unwrap(), second);
 
         // A reason nobody used yet reads back empty instead of failing.
         assert_eq!(
-            client.get_revocations_by_reason(&RevocationReason::AdminRevoked),
+            client.get_revocations_by_reason(&RevocationReason::CessationOfOperation),
             Vec::new(&env)
         );
         assert_eq!(
@@ -3418,18 +3534,18 @@ mod tests {
         let mut ids = Vec::new(&env);
         ids.push_back(first.clone());
         ids.push_back(second.clone());
-        client.revoke_credentials_batch(&issuer, &ids, &RevocationReason::Expired);
+        client.revoke_credentials_batch(&issuer, &ids, &RevocationReason::AffiliationChanged);
 
         assert_eq!(
             client.get_revocation(&first).reason,
-            RevocationReason::Expired
+            RevocationReason::AffiliationChanged
         );
         assert_eq!(
             client.get_revocation(&second).reason,
-            RevocationReason::Expired
+            RevocationReason::AffiliationChanged
         );
         assert_eq!(
-            client.count_revocations_by_reason(&RevocationReason::Expired),
+            client.count_revocations_by_reason(&RevocationReason::AffiliationChanged),
             2
         );
     }
@@ -3452,10 +3568,10 @@ mod tests {
     fn test_revocation_reason_options_are_stable() {
         let (_env, _admin, client) = setup();
         let options = client.get_revocation_reason_options();
-        assert_eq!(options.len(), 5);
-        assert_eq!(options.get(0).unwrap(), RevocationReason::Compromised);
-        assert_eq!(options.get(1).unwrap(), RevocationReason::Expired);
-        assert_eq!(options.get(4).unwrap(), RevocationReason::AdminRevoked);
+        assert_eq!(options.len(), 10);
+        assert_eq!(options.get(0).unwrap(), RevocationReason::Unspecified);
+        assert_eq!(options.get(1).unwrap(), RevocationReason::KeyCompromise);
+        assert_eq!(options.get(9).unwrap(), RevocationReason::DependencyRevoked);
     }
 
     #[test]
@@ -3466,14 +3582,9 @@ mod tests {
         client.add_issuer(&issuer);
         let expires_at = env.ledger().timestamp() + 100;
         let cred_id = client.issue_credential(
-            &issuer,
-            &subject,
-            &CredentialType::Kyc,
-            &Map::new(&env),
-            &BytesN::from_array(&env, &[0u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &expires_at,
-            &None,
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[0u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &expires_at, &0u64, &None, &None,
         );
         env.ledger().with_mut(|li| li.timestamp = expires_at + 1);
         assert_eq!(
@@ -3490,14 +3601,9 @@ mod tests {
         client.add_issuer(&issuer);
         issue_kyc(&env, &client, &issuer, &subject);
         let result = client.try_issue_credential(
-            &issuer,
-            &subject,
-            &CredentialType::Kyc,
-            &Map::new(&env),
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &0u64,
-            &None,
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &0u64, &0u64, &None, &None,
         );
         assert_eq!(result, Err(Ok(ContractError::CredentialAlreadyExists)));
     }
@@ -3522,28 +3628,18 @@ mod tests {
 
         // Issuing with unregistered schema returns SchemaNotFound
         let result = client.try_issue_credential(
-            &issuer,
-            &subject,
-            &CredentialType::Kyc,
-            &Map::new(&env),
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &0u64,
-            &Some(schema_hash.clone()),
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &0u64, &0u64, &Some(schema_hash.clone()), &None,
         );
         assert_eq!(result, Err(Ok(ContractError::SchemaNotFound)));
 
         // Register schema then issue succeeds
         client.register_schema(&issuer, &schema_hash);
         let cred_id = client.issue_credential(
-            &issuer,
-            &subject,
-            &CredentialType::Kyc,
-            &Map::new(&env),
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &0u64,
-            &Some(schema_hash),
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &0u64, &0u64, &Some(schema_hash), &None,
         );
         client.verify_credential(&cred_id);
     }
@@ -3652,14 +3748,9 @@ mod tests {
 
         let expires_at = env.ledger().timestamp() + 100;
         let cred_id = client.issue_credential(
-            &issuer,
-            &subject,
-            &CredentialType::Kyc,
-            &Map::new(&env),
-            &BytesN::from_array(&env, &[0u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &expires_at,
-            &None,
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[0u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &expires_at, &0u64, &None, &None,
         );
 
         // Before expiry returns CredentialNotExpiredYet
@@ -3687,16 +3778,11 @@ mod tests {
 
         let expires_at = env.ledger().timestamp() + 100;
         let cred_id = client.issue_credential(
-            &issuer,
-            &subject,
-            &CredentialType::Kyc,
-            &Map::new(&env),
-            &BytesN::from_array(&env, &[0u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &expires_at,
-            &None,
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[0u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &expires_at, &0u64, &None, &None,
         );
-        client.revoke_credential(&issuer, &cred_id, &RevocationReason::Compromised);
+        client.revoke_credential(&issuer, &cred_id, &RevocationReason::KeyCompromise);
         env.ledger().with_mut(|li| li.timestamp = expires_at + 1);
         assert_eq!(
             client.try_expire_credential(&caller, &cred_id),
@@ -3716,14 +3802,9 @@ mod tests {
             CredentialType::Achievement,
         ] {
             client.issue_credential(
-                &issuer,
-                &subject,
-                &ct,
-                &Map::new(&env),
-                &BytesN::from_array(&env, &[1u8; 32]),
-                &Bytes::from_array(&env, &[0u8; 64]),
-                &0u64,
-                &None,
+                &issuer, &subject, &ct,
+                &Map::new(&env), &BytesN::from_array(&env, &[1u8; 32]),
+                &Bytes::from_array(&env, &[0u8; 64]), &0u64, &0u64, &None, &None,
             );
         }
         let page1 = client.list_subject_credentials(&subject, &None, &2, &None);
@@ -3745,14 +3826,9 @@ mod tests {
 
         let expires_at = env.ledger().timestamp() + 1000;
         let cred_id = client.issue_credential(
-            &issuer,
-            &subject,
-            &CredentialType::Kyc,
-            &Map::new(&env),
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &expires_at,
-            &None,
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &expires_at, &0u64, &None, &None,
         );
 
         let new_expires_at = expires_at + 5000;
@@ -3776,14 +3852,9 @@ mod tests {
 
         let expires_at = env.ledger().timestamp() + 1000;
         let cred_id = client.issue_credential(
-            &issuer,
-            &subject,
-            &CredentialType::Kyc,
-            &Map::new(&env),
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &expires_at,
-            &None,
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &expires_at, &0u64, &None, &None,
         );
 
         let new_expires_at = expires_at + 5000;
@@ -3813,14 +3884,9 @@ mod tests {
 
         let expires_at = env.ledger().timestamp() + 1000;
         let cred_id = client.issue_credential(
-            &issuer,
-            &subject,
-            &CredentialType::Kyc,
-            &Map::new(&env),
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &expires_at,
-            &None,
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &expires_at, &0u64, &None, &None,
         );
 
         // non_issuer tries to renew — must fail with UnauthorizedIssuer(2)
@@ -3837,17 +3903,12 @@ mod tests {
 
         let expires_at = env.ledger().timestamp() + 1000;
         let cred_id = client.issue_credential(
-            &issuer,
-            &subject,
-            &CredentialType::Kyc,
-            &Map::new(&env),
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &expires_at,
-            &None,
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &expires_at, &0u64, &None, &None,
         );
 
-        client.revoke_credential(&issuer, &cred_id, &RevocationReason::Compromised);
+        client.revoke_credential(&issuer, &cred_id, &RevocationReason::KeyCompromise);
         // Revoked credential — must fail with CredentialRevoked(4)
         client.renew_credential(&issuer, &cred_id, &(expires_at + 1000));
     }
@@ -3862,14 +3923,9 @@ mod tests {
 
         let expires_at = env.ledger().timestamp() + 5000;
         let cred_id = client.issue_credential(
-            &issuer,
-            &subject,
-            &CredentialType::Kyc,
-            &Map::new(&env),
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &expires_at,
-            &None,
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &expires_at, &0u64, &None, &None,
         );
 
         // new_expires_at <= current expires_at — must fail with NewExpiryNotLater(14)
@@ -3886,14 +3942,9 @@ mod tests {
 
         let expires_at = env.ledger().timestamp() + 1000;
         let cred_id = client.issue_credential(
-            &issuer,
-            &subject,
-            &CredentialType::Kyc,
-            &Map::new(&env),
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &expires_at,
-            &None,
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &expires_at, &0u64, &None, &None,
         );
 
         // new_expires_at == 0 is not allowed
@@ -3921,14 +3972,9 @@ mod tests {
 
         let expires_at = env.ledger().timestamp() + 500;
         let cred_id = client.issue_credential(
-            &issuer,
-            &subject,
-            &CredentialType::Kyc,
-            &Map::new(&env),
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &expires_at,
-            &None,
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &expires_at, &0u64, &None, &None,
         );
 
         let new_expires_at = expires_at + 10_000;
@@ -3942,20 +3988,30 @@ mod tests {
     }
 
     #[test]
+    fn test_pause_blocks_state_changes_until_unpaused() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        client.add_issuer(&issuer);
+        let cred_id = issue_kyc(&env, &client, &issuer, &subject);
+
+        client.pause();
+        assert!(client.is_paused());
+        assert_eq!(
+            client.try_revoke_credential(&issuer, &cred_id, &RevocationReason::Superseded),
+            Err(Ok(ContractError::ContractPaused))
+        );
+
+        client.unpause();
+        assert!(!client.is_paused());
+        client.revoke_credential(&issuer, &cred_id, &RevocationReason::Superseded);
+    }
+
+    #[test]
     fn test_storage_key_symbols_are_unique() {
         let keys = [
-            ADMIN,
-            ISSUER,
-            CRED,
-            SUBJECT,
-            CRED_CNT,
-            REVOKED_CNT,
-            ISSUER_CREDS,
-            SCHEMA,
-            ISS_NONCE,
-            TYPE_REGISTRY,
-            TYPE_NAMES,
-            DELEGATION,
+            ADMIN, ISSUER, CRED, SUBJECT, CRED_CNT, REVOKED_CNT, ISSUER_CREDS, SCHEMA, ISS_NONCE,
+            TYPE_REGISTRY, TYPE_NAMES, DELEGATION, suspension::SUSPENDED,
         ];
         for (i, left) in keys.iter().enumerate() {
             for right in keys.iter().skip(i + 1) {
@@ -3985,14 +4041,7 @@ mod tests {
         let sig = Bytes::from_array(&env, &[0u8; 64]);
         assert_eq!(
             client.try_issue_credential(
-                &rando,
-                &rando,
-                &CredentialType::Kyc,
-                &claims,
-                &claims_hash,
-                &sig,
-                &0u64,
-                &None,
+                &rando, &rando, &CredentialType::Kyc, &claims, &claims_hash, &sig, &0u64, &0u64, &None, &None,
             ),
             Err(Ok(ContractError::UnauthorizedIssuer))
         );
@@ -4000,12 +4049,17 @@ mod tests {
 
     /// Ring-buffer eviction: when issuer index reaches MAX_ISSUER_CREDS,
     /// issuing the (MAX_ISSUER_CREDS + 1)th credential drops the oldest entry.
+    ///
+    /// The index is seeded directly in storage: issuing 10 000 real
+    /// credentials takes the better part of an hour in the test host.
     #[test]
     fn test_issuer_credentials_ring_buffer_eviction() {
         let (env, _admin, client) = setup();
+        env.budget().reset_unlimited();
         let issuer = Address::generate(&env);
         client.add_issuer(&issuer);
 
+        env.budget().reset_unlimited();
         let mut first_id = None;
         for i in 0..MAX_ISSUER_CREDS {
             let subject = Address::generate(&env);
@@ -4013,30 +4067,22 @@ mod tests {
             if i == 0 {
                 first_id = Some(id);
             }
-        }
+            env.storage()
+                .persistent()
+                .set(&CredentialManager::issuer_creds_key(&issuer), &index);
+        });
+        assert_eq!(client.get_issuer_credentials(&issuer).len(), MAX_ISSUER_CREDS);
 
-        let creds_before = client.get_issuer_credentials(&issuer);
-        assert_eq!(creds_before.len(), MAX_ISSUER_CREDS as u32);
-
-        let new_subject = Address::generate(&env);
-        let _new_id = issue_kyc(&env, &client, &issuer, &new_subject);
+        let new_id = issue_kyc(&env, &client, &issuer, &Address::generate(&env));
 
         let creds_after = client.get_issuer_credentials(&issuer);
-        assert_eq!(creds_after.len(), MAX_ISSUER_CREDS as u32);
-
-        if let Some(first) = first_id {
-            let mut found = false;
-            for cred_id in creds_after.iter() {
-                if cred_id == first {
-                    found = true;
-                    break;
-                }
-            }
-            assert!(
-                !found,
-                "First credential ID should have been evicted from the index"
-            );
-        }
+        assert_eq!(creds_after.len(), MAX_ISSUER_CREDS);
+        assert_eq!(creds_after.get(0).unwrap(), seeded_id(1));
+        assert_eq!(creds_after.last().unwrap(), new_id);
+        assert!(
+            !creds_after.contains(&seeded_id(0)),
+            "First credential ID should have been evicted from the index"
+        );
     }
 
     // ── Credential type registry tests (#656) ───────────────────────────────
@@ -4152,15 +4198,10 @@ mod tests {
         let name = String::from_str(&env, "kyc-basic");
         client.register_credential_type(&admin, &name, &schema_hash, &Map::new(&env));
 
-        let cred_id = client.issue_typed_credential(
-            &issuer,
-            &subject,
-            &name,
-            &CredentialType::Kyc,
-            &claims,
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &0u64,
+        let cred_id = client.issue_scheduled_credential(
+            &issuer, &subject, &name, &CredentialType::Kyc,
+            &claims, &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &0u64,
         );
         client.verify_credential(&cred_id);
     }
@@ -4174,15 +4215,10 @@ mod tests {
         let claims = kyc_claims(&env);
         let name = String::from_str(&env, "nope");
 
-        let result = client.try_issue_typed_credential(
-            &issuer,
-            &subject,
-            &name,
-            &CredentialType::Kyc,
-            &claims,
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &0u64,
+        let result = client.try_issue_scheduled_credential(
+            &issuer, &subject, &name, &CredentialType::Kyc,
+            &claims, &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &0u64,
         );
         assert_eq!(result, Err(Ok(ContractError::CredentialTypeNotFound)));
     }
@@ -4200,15 +4236,10 @@ mod tests {
         client.register_credential_type(&admin, &name, &schema_hash, &Map::new(&env));
         client.deactivate_credential_type(&admin, &name);
 
-        let result = client.try_issue_typed_credential(
-            &issuer,
-            &subject,
-            &name,
-            &CredentialType::Kyc,
-            &claims,
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &0u64,
+        let result = client.try_issue_scheduled_credential(
+            &issuer, &subject, &name, &CredentialType::Kyc,
+            &claims, &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &0u64,
         );
         assert_eq!(result, Err(Ok(ContractError::CredentialTypeInactive)));
     }
@@ -4220,8 +4251,6 @@ mod tests {
         let subject = Address::generate(&env);
         client.add_issuer(&issuer);
 
-        // issuer2 attempts to revoke a credential they did not issue
-        client.revoke_credential(&issuer2, &cred_id, &RevocationReason::Compromised);
         let schema_hash = client.compute_claims_schema_hash(&kyc_claims(&env));
         let name = String::from_str(&env, "kyc-basic");
         client.register_credential_type(&admin, &name, &schema_hash, &Map::new(&env));
@@ -4233,17 +4262,226 @@ mod tests {
             String::from_str(&env, "x"),
         );
 
-        let result = client.try_issue_typed_credential(
-            &issuer,
-            &subject,
-            &name,
-            &CredentialType::Kyc,
-            &wrong_claims,
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &Bytes::from_array(&env, &[0u8; 64]),
-            &0u64,
+        let result = client.try_issue_scheduled_credential(
+            &issuer, &subject, &name, &CredentialType::Kyc,
+            &wrong_claims, &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &0u64,
         );
         assert_eq!(result, Err(Ok(ContractError::ClaimsSchemaMismatch)));
+    }
+
+    // ── Batch verification tests (#819) ───────────────────────────────────────
+
+    #[test]
+    fn test_verify_batch_all_valid() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        client.add_issuer(&issuer);
+
+        let mut ids = Vec::new(&env);
+        for _ in 0..3 {
+            let subject = Address::generate(&env);
+            ids.push_back(issue_kyc(&env, &client, &issuer, &subject));
+        }
+
+        let results = client.verify_credentials_batch(&ids, &false);
+        assert_eq!(results.len(), 3);
+        for r in results.iter() {
+            assert!(r.valid);
+            assert_eq!(r.reason, BatchFailureReason::Valid);
+        }
+    }
+
+    #[test]
+    fn test_verify_batch_reports_detailed_reasons() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        client.add_issuer(&issuer);
+
+        let valid_id = issue_kyc(&env, &client, &issuer, &subject);
+
+        let revoked_subject = Address::generate(&env);
+        let revoked_id = issue_kyc(&env, &client, &issuer, &revoked_subject);
+        client.revoke_credential(&issuer, &revoked_id);
+
+        let expires_at = env.ledger().timestamp() + 100;
+        let expiring_subject = Address::generate(&env);
+        let expired_id = client.issue_credential(
+            &issuer, &expiring_subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[7u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &expires_at, &0u64, &None, &None,
+        );
+        env.ledger().with_mut(|li| li.timestamp = expires_at + 1);
+
+        let missing_id = BytesN::from_array(&env, &[9u8; 32]);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(valid_id.clone());
+        ids.push_back(revoked_id.clone());
+        ids.push_back(expired_id.clone());
+        ids.push_back(missing_id.clone());
+
+        let results = client.verify_credentials_batch(&ids, &false);
+        assert_eq!(results.len(), 4);
+        assert_eq!(results.get(0).unwrap().reason, BatchFailureReason::Valid);
+        assert_eq!(results.get(1).unwrap().reason, BatchFailureReason::Revoked);
+        assert_eq!(results.get(2).unwrap().reason, BatchFailureReason::Expired);
+        assert_eq!(results.get(3).unwrap().reason, BatchFailureReason::NotFound);
+        assert!(results.get(0).unwrap().valid);
+        assert!(!results.get(1).unwrap().valid);
+        assert!(!results.get(2).unwrap().valid);
+        assert!(!results.get(3).unwrap().valid);
+    }
+
+    #[test]
+    fn test_verify_batch_fail_fast_stops_at_first_failure() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        client.add_issuer(&issuer);
+
+        let subject_a = Address::generate(&env);
+        let good_a = issue_kyc(&env, &client, &issuer, &subject_a);
+
+        let subject_b = Address::generate(&env);
+        let bad_b = issue_kyc(&env, &client, &issuer, &subject_b);
+        client.revoke_credential(&issuer, &bad_b);
+
+        let subject_c = Address::generate(&env);
+        let good_c = issue_kyc(&env, &client, &issuer, &subject_c);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(good_a);
+        ids.push_back(bad_b);
+        ids.push_back(good_c);
+
+        // fail_fast stops right after the first invalid entry — the third
+        // id is never evaluated or reported.
+        let results = client.verify_credentials_batch(&ids, &true);
+        assert_eq!(results.len(), 2);
+        assert!(results.get(0).unwrap().valid);
+        assert!(!results.get(1).unwrap().valid);
+
+        // Without fail_fast, every id is reported.
+        let full_results = client.verify_credentials_batch(&ids, &false);
+        assert_eq!(full_results.len(), 3);
+    }
+
+    #[test]
+    fn test_verify_batch_rejects_over_max_size() {
+        let (env, _admin, client) = setup();
+        let mut ids = Vec::new(&env);
+        for i in 0..51u8 {
+            ids.push_back(BytesN::from_array(&env, &[i; 32]));
+        }
+        assert_eq!(
+            client.try_verify_credentials_batch(&ids, &false),
+            Err(Ok(ContractError::BatchTooLarge))
+        );
+    }
+
+    #[test]
+    fn test_verify_batch_shared_prerequisite_lookup_stays_correct() {
+        // Two top-level credentials that both depend on the same prerequisite.
+        // The batch call must only need to resolve that shared prerequisite
+        // once internally, but still report both dependants consistently.
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        client.add_issuer(&issuer);
+
+        // The base credential expires (rather than being explicitly revoked)
+        // so we exercise `PrerequisiteNotMet` on the dependants without also
+        // triggering `revoke_credential`'s cascade-revoke of dependants —
+        // that would mark the dependants themselves `revoked` and mask the
+        // prerequisite-chain check this test is aimed at.
+        let base_expires_at = env.ledger().timestamp() + 100;
+        let base_id = client.issue_credential(
+            &issuer, &subject, &CredentialType::Kyc,
+            &Map::new(&env), &BytesN::from_array(&env, &[10u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &base_expires_at, &0u64, &None, &None,
+        );
+        let dependant_a = client.issue_credential(
+            &issuer, &subject, &CredentialType::Reputation,
+            &Map::new(&env), &BytesN::from_array(&env, &[11u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &0u64, &0u64, &None, &None,
+        );
+        let dependant_b = client.issue_credential(
+            &issuer, &subject, &CredentialType::Achievement,
+            &Map::new(&env), &BytesN::from_array(&env, &[12u8; 32]),
+            &Bytes::from_array(&env, &[0u8; 64]), &0u64, &0u64, &None, &None,
+        );
+        client.set_prerequisites(&issuer, &dependant_a, &Vec::from_array(&env, [base_id.clone()]));
+        client.set_prerequisites(&issuer, &dependant_b, &Vec::from_array(&env, [base_id.clone()]));
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(dependant_a.clone());
+        ids.push_back(dependant_b.clone());
+        let all_valid = client.verify_credentials_batch(&ids, &false);
+        assert!(all_valid.iter().all(|r| r.valid));
+
+        // Let the shared prerequisite expire — both dependants must now
+        // report PrerequisiteNotMet, proving the memoized lookup resolved
+        // the shared base credential once and applied it consistently to
+        // both different top-level ids in the same batch.
+        env.ledger().with_mut(|li| li.timestamp = base_expires_at + 1);
+        let after_expiry = client.verify_credentials_batch(&ids, &false);
+        for r in after_expiry.iter() {
+            assert!(!r.valid);
+            assert_eq!(r.reason, BatchFailureReason::PrerequisiteNotMet);
+        }
+    }
+
+    #[test]
+    fn test_verify_batch_emits_event() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        client.add_issuer(&issuer);
+        let id = issue_kyc(&env, &client, &issuer, &subject);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(id);
+        client.verify_credentials_batch(&ids, &false);
+
+        let events = env.events().all();
+        let has_batch_event = events.iter().any(|ev| {
+            let topic_str = std::format!("{:?}", ev);
+            topic_str.contains("batchvrf")
+        });
+        assert!(has_batch_event, "batch verification event should have been emitted");
+    }
+
+    /// Gas benchmark (#819 DoD): a batch call over N credentials should cost
+    /// fewer CPU instructions than N separate `verify_credential` calls, since
+    /// the batch path skips each call's TTL-refresh write and shares any
+    /// repeated lookups.
+    #[test]
+    fn test_verify_batch_cheaper_than_individual_calls() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        client.add_issuer(&issuer);
+
+        let mut ids = Vec::new(&env);
+        for _ in 0..10 {
+            let subject = Address::generate(&env);
+            ids.push_back(issue_kyc(&env, &client, &issuer, &subject));
+        }
+
+        env.budget().reset_default();
+        for id in ids.iter() {
+            client.verify_credential(&id);
+        }
+        let individual_cost = env.budget().cpu_instruction_cost();
+
+        env.budget().reset_default();
+        client.verify_credentials_batch(&ids, &false);
+        let batch_cost = env.budget().cpu_instruction_cost();
+
+        assert!(
+            batch_cost < individual_cost,
+            "batch verification should cost fewer instructions than the same number of individual calls"
+        );
     }
 
     // ── Credential delegation tests (#655) ───────────────────────────────────
