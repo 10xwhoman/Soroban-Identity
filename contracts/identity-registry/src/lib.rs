@@ -7,6 +7,8 @@ use soroban_sdk::{
 };
 use soroban_sdk::xdr::ToXdr;
 
+pub mod recovery;
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -30,13 +32,18 @@ pub enum ContractError {
     BatchTooLarge = 15,
     /// `create_dids_batch` was called with an empty entry list.
     EmptyBatch = 16,
-    DelegationNotFound = 17,
-    DelegationAlreadyExists = 18,
-    DelegationDepthExceeded = 19,
-    DelegationCycle = 20,
-    InvalidDelegationScope = 21,
-    DelegationRevoked = 22,
-    CannotDelegateToInactiveDid = 23,
+    /// `set_recovery_address` / `initiate_recovery` called but no recovery address is stored.
+    RecoveryNotSet = 17,
+    /// `initiate_recovery` called while a recovery request is already pending.
+    RecoveryPending = 18,
+    /// `cancel_recovery` or `recover_did` called but no pending recovery exists.
+    NoPendingRecovery = 19,
+    /// `recover_did` called before the timelock window has elapsed.
+    RecoveryTimelockActive = 20,
+    /// The caller is not the registered recovery address for the target DID.
+    RecoveryNotAuthorized = 21,
+    /// `recover_did` would transfer the DID to an address that already owns one.
+    RecoveryTargetExists = 22,
 }
 
 /// Version returned by `ping` for deployment health checks.
@@ -500,121 +507,90 @@ impl IdentityRegistry {
         }
     }
 
-    // ── Hierarchical DID delegation (#810) ───────────────────────────────────
-    /// Delegates authority from an active parent DID to an active child DID.
-    /// A child can have at most one active parent and chains are limited to
-    /// [`MAX_DELEGATION_DEPTH`] edges. The scope is application-defined.
-    pub fn delegate_authority(
+    // ── Recovery (#879) ───────────────────────────────────────────────────────
+
+    /// Register a recovery address for the caller's DID.
+    /// The recovery address can later initiate a time-locked ownership transfer.
+    pub fn set_recovery_address(
         env: Env,
-        parent: Address,
-        child: Address,
-        scope: String,
+        controller: Address,
+        recovery_addr: Address,
     ) -> Result<(), ContractError> {
-        parent.require_auth();
+        controller.require_auth();
         Self::require_not_paused(&env)?;
-        if parent == child || scope.len() == 0 || scope.len() > MAX_DELEGATION_SCOPE_LEN {
-            return Err(if parent == child { ContractError::DelegationCycle } else { ContractError::InvalidDelegationScope });
+        let key = Self::did_key(&env, &controller);
+        if !env.storage().persistent().has(&key) {
+            return Err(ContractError::DidNotFound);
         }
-        let storage = env.storage().persistent();
-        let parent_key = Self::did_key(&env, &parent);
-        let child_key = Self::did_key(&env, &child);
-        let parent_doc: DidDocument = storage.get(&parent_key).ok_or(ContractError::DidNotFound)?;
-        let mut child_doc: DidDocument = storage.get(&child_key).ok_or(ContractError::DidNotFound)?;
-        if !parent_doc.active || !child_doc.active {
-            return Err(ContractError::CannotDelegateToInactiveDid);
-        }
-        let existing_parent_key = (DELEGATION_PARENT, child.clone());
-        if storage.has(&existing_parent_key) {
-            return Err(ContractError::DelegationAlreadyExists);
-        }
-        let depth = parent_doc.delegation_depth.saturating_add(1);
-        if depth > MAX_DELEGATION_DEPTH {
-            return Err(ContractError::DelegationDepthExceeded);
-        }
-        // A child with an existing ancestor relationship cannot be re-used as
-        // a parent in its own chain; the single-parent invariant makes this
-        // cycle check deterministic and bounded.
-        let delegation = Delegation {
-            parent: parent.clone(),
-            child: child.clone(),
-            scope,
-            depth,
-            created_at: env.ledger().timestamp(),
-            active: true,
-        };
-        let edge_key = (DELEGATION, parent.clone(), child.clone());
-        storage.set(&edge_key, &delegation);
-        storage.set(&existing_parent_key, &parent);
-        let children_key = (DELEGATION_CHILDREN, parent.clone());
-        let mut children: Vec<Address> = storage.get(&children_key).unwrap_or_else(|| Vec::new(&env));
-        children.push_back(child.clone());
-        storage.set(&children_key, &children);
-        storage.extend_ttl(&edge_key, TTL_LEDGERS, TTL_LEDGERS);
-        storage.extend_ttl(&existing_parent_key, TTL_LEDGERS, TTL_LEDGERS);
-        child_doc.parent = parent.clone();
-        child_doc.delegation_depth = depth;
-        child_doc.updated_at = env.ledger().timestamp();
-        storage.set(&child_key, &child_doc);
-        storage.extend_ttl(&child_key, TTL_LEDGERS, TTL_LEDGERS);
-        env.events().publish((DELEGATION, symbol_short!("created")), (EVENT_VERSION, parent, child, depth));
+        recovery::store_recovery_address(&env, &controller, &recovery_addr);
         Ok(())
     }
-    /// Revokes an active parent-to-child delegation. The parent must authorize.
-    pub fn revoke_delegation(env: Env, parent: Address, child: Address) -> Result<(), ContractError> {
-        parent.require_auth();
+
+    /// Return the registered recovery address for `controller`, or `None`.
+    pub fn get_recovery_address(env: Env, controller: Address) -> Option<Address> {
+        recovery::load_recovery_address(&env, &controller)
+    }
+
+    /// Phase 1: recovery address initiates a time-locked challenge to transfer the DID.
+    pub fn initiate_recovery(
+        env: Env,
+        recovery_addr: Address,
+        controller: Address,
+        new_controller: Address,
+    ) -> Result<(), ContractError> {
+        recovery_addr.require_auth();
         Self::require_not_paused(&env)?;
-        let storage = env.storage().persistent();
-        let edge_key = (DELEGATION, parent.clone(), child.clone());
-        let mut delegation: Delegation = storage.get(&edge_key).ok_or(ContractError::DelegationNotFound)?;
-        if !delegation.active { return Err(ContractError::DelegationRevoked); }
-        delegation.active = false;
-        storage.set(&edge_key, &delegation);
-        storage.remove(&(DELEGATION_PARENT, child.clone()));
-        let child_key = Self::did_key(&env, &child);
-        if let Some(mut doc) = storage.get::<_, DidDocument>(&child_key) {
-            doc.parent = child.clone();
-            doc.delegation_depth = 0;
-            doc.updated_at = env.ledger().timestamp();
-            storage.set(&child_key, &doc);
+        recovery::initiate(&env, &recovery_addr, &controller, &new_controller)
+    }
+
+    /// Phase 1b: original DID owner responds to cancel a pending recovery request.
+    pub fn cancel_recovery(env: Env, controller: Address) -> Result<(), ContractError> {
+        controller.require_auth();
+        recovery::cancel(&env, &controller)
+    }
+
+    /// Phase 2: after the timelock elapses, recovery address completes the transfer.
+    /// The DID document is re-keyed to `new_controller`; the original key is removed.
+    pub fn recover_did(
+        env: Env,
+        recovery_addr: Address,
+        controller: Address,
+    ) -> Result<(), ContractError> {
+        recovery_addr.require_auth();
+        Self::require_not_paused(&env)?;
+        let new_controller = recovery::finalize(&env, &recovery_addr, &controller)?;
+
+        // Guard: new_controller must not already own a DID.
+        let new_key = Self::did_key(&env, &new_controller);
+        if env.storage().persistent().has(&new_key) {
+            return Err(ContractError::RecoveryTargetExists);
         }
-        env.events().publish((DELEGATION, symbol_short!("revoked")), (EVENT_VERSION, parent, child));
+
+        // Re-key the DID document from old controller to new controller.
+        let old_key = Self::did_key(&env, &controller);
+        let mut doc: DidDocument = env
+            .storage()
+            .persistent()
+            .get(&old_key)
+            .ok_or(ContractError::DidNotFound)?;
+        doc.controller = new_controller.clone();
+        doc.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&new_key, &doc);
+        env.storage().persistent().extend_ttl(&new_key, TTL_LEDGERS, TTL_LEDGERS);
+        env.storage().persistent().remove(&old_key);
+        env.events().publish(
+            (IDENTITY, symbol_short!("rec_done")),
+            (EVENT_VERSION, controller, new_controller, doc.updated_at),
+        );
         Ok(())
     }
-    /// Returns all delegation records created by `parent`, including revoked records.
-    pub fn get_delegations(env: Env, parent: Address) -> Vec<Delegation> {
-        let children_key = (DELEGATION_CHILDREN, parent.clone());
-        let children: Vec<Address> = env.storage().persistent().get(&children_key).unwrap_or_else(|| Vec::new(&env));
-        let mut result = Vec::new(&env);
-        for child in children.iter() {
-            let key = (DELEGATION, parent.clone(), child);
-            if let Some(delegation) = env.storage().persistent().get(&key) { result.push_back(delegation); }
-        }
-        result
-    }
-    /// Returns the active delegation chain from `child` toward its root parent.
-    /// The first entry is the direct parent edge; callers can inspect `depth`.
-    pub fn get_delegation_chain(env: Env, child: Address) -> Result<Vec<Delegation>, ContractError> {
-        let mut current = child;
-        let mut result = Vec::new(&env);
-        for _ in 0..MAX_DELEGATION_DEPTH {
-            let parent: Address = match env.storage().persistent().get(&(DELEGATION_PARENT, current.clone())) {
-                Some(value) => value, None => break,
-            };
-            let edge: Delegation = env.storage().persistent().get(&(DELEGATION, parent.clone(), current.clone())).ok_or(ContractError::DelegationNotFound)?;
-            if !edge.active { return Err(ContractError::DelegationRevoked); }
-            current = parent;
-            result.push_back(edge);
-        }
-        Ok(result)
-    }
-    /// Checks whether `ancestor` delegates authority to `child` through a
-    /// complete active chain, enforcing every edge's depth and active status.
-    pub fn is_delegation_authorized(env: Env, ancestor: Address, child: Address) -> bool {
-        if ancestor == child { return false; }
-        match Self::get_delegation_chain(env, child) {
-            Ok(chain) => chain.iter().any(|edge| edge.parent == ancestor) && !chain.is_empty(),
-            Err(_) => false,
-        }
+
+    /// Return the pending recovery request for `controller`, if any.
+    pub fn get_pending_recovery(
+        env: Env,
+        controller: Address,
+    ) -> Option<recovery::RecoveryRequest> {
+        recovery::get_pending(&env, &controller)
     }
 
     // ── Service endpoints ─────────────────────────────────────────────────────
