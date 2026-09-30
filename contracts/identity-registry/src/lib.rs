@@ -82,6 +82,12 @@ const MAX_SERVICES: u32 = 10;
 /// Maximum number of entries accepted by [`IdentityRegistry::create_dids_batch`]
 /// in a single call, chosen to stay well within Soroban instruction limits.
 pub const MAX_BATCH_DIDS: u32 = 50;
+/// Maximum depth of a delegation chain, including the direct parent edge.
+pub const MAX_DELEGATION_DEPTH: u32 = 3;
+const DELEGATION: Symbol = symbol_short!("DELEG");
+const DELEGATION_CHILDREN: Symbol = symbol_short!("DELGCH");
+const DELEGATION_PARENT: Symbol = symbol_short!("DELGPAR");
+const MAX_DELEGATION_SCOPE_LEN: u32 = 128;
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -110,6 +116,20 @@ pub struct DidDocument {
     pub updated_at: u64,
     pub active: bool,
     pub services: Vec<ServiceEndpoint>,
+    /// Parent controller. A root DID stores its own controller here.
+    pub parent: Address,
+    pub delegation_depth: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Delegation {
+    pub parent: Address,
+    pub child: Address,
+    pub scope: String,
+    pub depth: u32,
+    pub created_at: u64,
+    pub active: bool,
 }
 
 #[contract]
@@ -663,6 +683,8 @@ impl IdentityRegistry {
             updated_at: now,
             active: true,
             services: Vec::new(env),
+            parent: controller.clone(),
+            delegation_depth: 0,
         };
         storage.set(&key, &doc);
         storage.extend_ttl(&key, TTL_BUMP_THRESHOLD, TTL_LEDGERS);
@@ -1349,6 +1371,86 @@ mod tests {
         assert_eq!(client.try_create_dids_batch(&entries), Err(Ok(ContractError::ContractPaused)));
     }
 
+    #[test]
+    fn test_hierarchical_delegation_updates_document_and_chain() {
+        let (env, client) = setup();
+        let root = Address::generate(&env);
+        let child = Address::generate(&env);
+        let grandchild = Address::generate(&env);
+        client.create_did(&root, &Map::new(&env));
+        client.create_did(&child, &Map::new(&env));
+        client.create_did(&grandchild, &Map::new(&env));
+
+        client.delegate_authority(&root, &child, &String::from_str(&env, "issue"));
+        client.delegate_authority(&child, &grandchild, &String::from_str(&env, "verify"));
+
+        let doc = client.resolve_did(&grandchild);
+        assert_eq!(doc.parent, child.clone());
+        assert_eq!(doc.delegation_depth, 2);
+        assert!(client.is_delegation_authorized(&root, &grandchild));
+        assert_eq!(client.get_delegation_chain(&grandchild).len(), 2);
+        assert_eq!(client.get_delegations(&root).len(), 1);
+    }
+
+    #[test]
+    fn test_delegation_depth_is_limited_to_three_edges() {
+        let (env, client) = setup();
+        let root = Address::generate(&env);
+        let first = Address::generate(&env);
+        let second = Address::generate(&env);
+        let third = Address::generate(&env);
+        let fourth = Address::generate(&env);
+        for address in [&root, &first, &second, &third, &fourth] {
+            client.create_did(address, &Map::new(&env));
+        }
+        let scope = String::from_str(&env, "all");
+        client.delegate_authority(&root, &first, &scope);
+        client.delegate_authority(&first, &second, &scope);
+        client.delegate_authority(&second, &third, &scope);
+        assert_eq!(
+            client.try_delegate_authority(&third, &fourth, &scope),
+            Err(Ok(ContractError::DelegationDepthExceeded))
+        );
+    }
+
+    #[test]
+    fn test_delegation_rejects_cycles_and_duplicate_parent() {
+        let (env, client) = setup();
+        let parent = Address::generate(&env);
+        let child = Address::generate(&env);
+        let other_parent = Address::generate(&env);
+        for address in [&parent, &child, &other_parent] {
+            client.create_did(address, &Map::new(&env));
+        }
+        let scope = String::from_str(&env, "read");
+        assert_eq!(
+            client.try_delegate_authority(&parent, &parent, &scope),
+            Err(Ok(ContractError::DelegationCycle))
+        );
+        client.delegate_authority(&parent, &child, &scope);
+        assert_eq!(
+            client.try_delegate_authority(&other_parent, &child, &scope),
+            Err(Ok(ContractError::DelegationAlreadyExists))
+        );
+    }
+
+    #[test]
+    fn test_revoke_delegation_clears_child_parent_and_authorization() {
+        let (env, client) = setup();
+        let parent = Address::generate(&env);
+        let child = Address::generate(&env);
+        client.create_did(&parent, &Map::new(&env));
+        client.create_did(&child, &Map::new(&env));
+        client.delegate_authority(&parent, &child, &String::from_str(&env, "read"));
+        client.revoke_delegation(&parent, &child);
+        let doc = client.resolve_did(&child);
+        assert_eq!(doc.parent, child.clone());
+        assert_eq!(doc.delegation_depth, 0);
+        assert!(!client.is_delegation_authorized(&parent, &child));
+        assert_eq!(
+            client.try_revoke_delegation(&parent, &child),
+            Err(Ok(ContractError::DelegationRevoked))
+        );
     /// #866: an access only extends the TTL once it has dropped below
     /// `TTL_BUMP_THRESHOLD`, instead of on every call.
     #[test]
