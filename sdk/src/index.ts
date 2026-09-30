@@ -58,6 +58,25 @@ export {
   RevocationReason,
   revocationReasonName,
 } from './types';
+export {
+  EXPORT_FORMATS,
+  EXPORT_MIME_TYPES,
+  EXPORT_SCHEMA_VERSION,
+  credentialStatus,
+  credentialToJson,
+  credentialToPdf,
+  credentialToXml,
+  escapeXml,
+  exportCredential,
+  exportLines,
+  toExportModel,
+} from './export';
+export type {
+  ExportedCredential,
+  ExportedFile,
+  ExportFormat,
+  CredentialStatus,
+} from './export';
 export type {
   DidDocument,
   ServiceEndpoint,
