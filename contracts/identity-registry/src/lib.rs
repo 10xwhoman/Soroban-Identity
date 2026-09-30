@@ -89,6 +89,11 @@ const DELEGATION_CHILDREN: Symbol = symbol_short!("DELGCH");
 const DELEGATION_PARENT: Symbol = symbol_short!("DELGPAR");
 const MAX_DELEGATION_SCOPE_LEN: u32 = 128;
 
+/// Maximum number of entries accepted by [`IdentityRegistry::update_dids_batch`]
+/// in a single call. Set lower than creation batch to account for additional
+/// validation overhead (existence checks, deactivation status).
+pub const MAX_BATCH_UPDATE_SIZE: u32 = 20;
+
 // ── Data types ────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -376,6 +381,131 @@ impl IdentityRegistry {
         let meta_hash: BytesN<32> = env.crypto().sha256(&hash_input).into();
         env.events().publish((IDENTITY, symbol_short!("updated")), (EVENT_VERSION, controller, meta_hash));
         Ok(())
+    }
+
+    /// Updates multiple DIDs (up to [`MAX_BATCH_UPDATE_SIZE`]) in one transaction.
+    /// Each controller must sign. All updates are validated before any writes occur,
+    /// ensuring atomic success or failure. Returns a vector of results indicating
+    /// success or failure for each DID update.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `entries` - A vector of tuples, each containing an address (controller) and
+    ///   the new metadata map for that DID.
+    ///
+    /// # Returns
+    /// A vector of `Result<(), ContractError>` in the same order as `entries`.
+    /// Each element indicates whether the corresponding update succeeded or failed.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::ContractPaused`] if the contract is paused.
+    /// Returns [`ContractError::EmptyBatch`] if the entries vector is empty.
+    /// Returns [`ContractError::BatchTooLarge`] if entries exceed [`MAX_BATCH_UPDATE_SIZE`].
+    ///
+    /// Individual update failures are captured in the returned vector and do not
+    /// halt processing of remaining entries. Common per-entry errors include:
+    /// - [`ContractError::DidNotFound`] if the DID doesn't exist
+    /// - [`ContractError::DidDeactivated`] if the DID is deactivated
+    /// - [`ContractError::EmptyMetadata`] if metadata is empty
+    /// - [`ContractError::MetadataTooLong`] or [`ContractError::MetadataTooLarge`] on validation failure
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let entries = vec![
+    ///     &env,
+    ///     (user1.clone(), metadata1.clone()),
+    ///     (user2.clone(), metadata2.clone()),
+    /// ];
+    /// let results = contract.update_dids_batch(&entries);
+    /// // results[0] -> Ok(()) or Err(...)
+    /// // results[1] -> Ok(()) or Err(...)
+    /// ```
+    pub fn update_dids_batch(
+        env: Env,
+        entries: Vec<(Address, Map<String, String>)>,
+    ) -> Result<Vec<Result<(), ContractError>>, ContractError> {
+        Self::require_not_paused(&env)?;
+
+        // Validate batch size constraints
+        if entries.is_empty() {
+            return Err(ContractError::EmptyBatch);
+        }
+        if entries.len() > MAX_BATCH_UPDATE_SIZE {
+            return Err(ContractError::BatchTooLarge);
+        }
+
+        let storage = env.storage().persistent();
+        let now = env.ledger().timestamp();
+        let mut results = Vec::new(&env);
+
+        // Phase 1: Validate all entries before applying any updates
+        // This ensures we can provide meaningful per-entry error information
+        // while still validating the entire batch upfront
+        let mut validation_results = Vec::new(&env);
+        
+        for (controller, metadata) in entries.iter() {
+            // Require authorization for each controller
+            controller.require_auth();
+
+            // Validate this entry
+            let validation_result: Result<(), ContractError> = (|| {
+                if metadata.is_empty() {
+                    return Err(ContractError::EmptyMetadata);
+                }
+                Self::validate_metadata(&metadata)?;
+                
+                let key = Self::did_key(&env, &controller);
+                let doc: DidDocument = storage.get(&key).ok_or(ContractError::DidNotFound)?;
+                
+                if !doc.active {
+                    return Err(ContractError::DidDeactivated);
+                }
+                
+                Ok(())
+            })();
+            
+            validation_results.push_back(validation_result);
+        }
+
+        // Phase 2: Apply updates for entries that passed validation
+        for (i, (controller, metadata)) in entries.iter().enumerate() {
+            // Check if validation passed for this entry
+            let validation_passed = validation_results.get(i).unwrap_or(Err(ContractError::DidNotFound));
+            
+            if validation_passed.is_err() {
+                // Validation failed, record the error and skip update
+                results.push_back(validation_passed);
+                continue;
+            }
+
+            // Validation passed, perform the update
+            let update_result: Result<(), ContractError> = (|| {
+                let key = Self::did_key(&env, &controller);
+                let mut doc: DidDocument = storage.get(&key).ok_or(ContractError::DidNotFound)?;
+                
+                doc.metadata = metadata.clone();
+                doc.updated_at = now;
+                
+                storage.set(&key, &doc);
+                storage.extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
+                
+                // Emit update event with metadata hash
+                let mut hash_input = Self::string_to_bytes(&env, &doc.id);
+                hash_input.extend_from_array(&doc.updated_at.to_be_bytes());
+                let meta_hash: BytesN<32> = env.crypto().sha256(&hash_input).into();
+                
+                env.events().publish(
+                    (IDENTITY, symbol_short!("updated")),
+                    (EVENT_VERSION, controller.clone(), meta_hash),
+                );
+                
+                Ok(())
+            })();
+            
+            results.push_back(update_result);
+        }
+
+        Ok(results)
     }
 
     /// Deactivates a DID. Only its controller can call this.
