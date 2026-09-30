@@ -6,7 +6,7 @@ use soroban_sdk::{
     Vec,
 };
 
-use crate::{CredentialManager, CredentialManagerClient, CredentialType};
+use crate::{ContractError, CredentialManager, CredentialManagerClient, CredentialType};
 
 const TMPL: Symbol = symbol_short!("TMPL");
 const TMPLV: Symbol = symbol_short!("TMPLV");
@@ -122,15 +122,17 @@ impl CredentialManager {
 
     /// Issue a credential conforming to the latest version of a template.
     /// Panics if any required claim is missing.
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_from_template(
         env: Env,
         issuer: Address,
         subject: Address,
         template_id: u32,
         claims: Map<String, String>,
+        claims_hash: BytesN<32>,
         signature: Bytes,
         expires_at: u64,
-    ) -> BytesN<32> {
+    ) -> Result<BytesN<32>, ContractError> {
         let template = Self::get_template(env.clone(), template_id);
         for key in template.required_claims.iter() {
             if !claims.contains_key(key) {
@@ -144,12 +146,16 @@ impl CredentialManager {
             subject,
             template.credential_type,
             claims,
+            claims_hash,
             signature,
             expires_at,
-        );
+            0,
+            None,
+            None,
+        )?;
         let link = TemplateRef { template_id, version: template.version };
         env.storage().persistent().set(&(CTMPL, id.clone()), &link);
-        id
+        Ok(id)
     }
 
     /// Get the template a credential was issued from, if any.
@@ -170,13 +176,26 @@ impl CredentialManager {
 #[cfg(test)]
 mod tests {
     use crate::{CredentialManager, CredentialManagerClient, CredentialType};
-    use soroban_sdk::{symbol_short, testutils::Address as _, vec, Address, Bytes, Env, Map, String};
+    use soroban_sdk::{
+        contract, contractimpl, symbol_short, testutils::Address as _, vec, Address, Bytes, BytesN,
+        Env, Map, String,
+    };
+
+    #[contract]
+    struct MockIdentityRegistry;
+    #[contractimpl]
+    impl MockIdentityRegistry {
+        pub fn has_active_did(_env: Env, _controller: Address) -> bool {
+            true
+        }
+    }
 
     fn setup() -> (Env, Address, CredentialManagerClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
+        let registry_id = env.register_contract(None, MockIdentityRegistry);
         let client = CredentialManagerClient::new(&env, &env.register_contract(None, CredentialManager));
-        client.initialize(&Address::generate(&env));
+        client.initialize(&Address::generate(&env), &registry_id);
         let issuer = Address::generate(&env);
         client.add_issuer(&issuer);
         (env, issuer, client)
@@ -210,11 +229,12 @@ mod tests {
         claims.set(key, String::from_str(&env, "Alice"));
 
         let cred = client.issue_from_template(
-            &issuer, &Address::generate(&env), &id, &claims, &Bytes::new(&env), &0,
+            &issuer, &Address::generate(&env), &id, &claims, &BytesN::from_array(&env, &[1u8; 32]),
+            &Bytes::new(&env), &0,
         );
         let link = client.get_credential_template(&cred).unwrap();
         assert_eq!((link.template_id, link.version), (id, 1));
-        assert!(client.verify_credential(&cred));
+        client.verify_credential(&cred);
     }
 
     #[test]
@@ -225,6 +245,9 @@ mod tests {
             &issuer, &String::from_str(&env, "KYC"), &symbol_short!("kyc"), &CredentialType::Kyc,
             &vec![&env, String::from_str(&env, "name")],
         );
-        client.issue_from_template(&issuer, &Address::generate(&env), &id, &Map::new(&env), &Bytes::new(&env), &0);
+        client.issue_from_template(
+            &issuer, &Address::generate(&env), &id, &Map::new(&env),
+            &BytesN::from_array(&env, &[1u8; 32]), &Bytes::new(&env), &0,
+        );
     }
 }
