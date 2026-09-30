@@ -269,14 +269,13 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
   const [isIssuer, setIsIssuer] = useState(false);
   const [checkingIssuer, setCheckingIssuer] = useState(false);
 
+  const jsonImportRef = useRef<HTMLInputElement>(null);
+  const [importError, setImportError] = useState<string | null>(null);
+  const [importedCount, setImportedCount] = useState<number | null>(null);
   const [revokeId, setRevokeId] = useState("");
   const [revokeReason, setRevokeReason] = useState<RevocationReason>("Compromised");
   const [revokeResult, setRevokeResult] = useState<string | null>(null);
 
-  const filteredCredentials =
-    activeFilter === "All"
-      ? MOCK_CREDENTIALS
-      : MOCK_CREDENTIALS.filter((c) => c.credentialType === activeFilter);
   const [searchAddress, setSearchAddress] = useState("");
   const [lastCheckedAt, setLastCheckedAt] = useState<number | null>(null);
   const [verifyCheckedAt, setVerifyCheckedAt] = useState<number | null>(null);

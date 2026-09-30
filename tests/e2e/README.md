@@ -10,7 +10,7 @@ Issue #820. Playwright drives the Vite app with a mocked Freighter wallet and a 
 - Credentials tab: issue, verify, and revoke sections are present
 - Verify of an unknown id fails closed (red or pending badge, never a silent success)
 - Serious and critical axe violations on the home screen
-- A full-page screenshot of the connected shell (`wallet-connected.png`)
+- A full-page screenshot of the connected shell (`wallet-connected.png`), compared locally. CI attaches the same screenshot and records video instead of pixel-matching across operating systems.
 
 ## Browsers
 
@@ -39,5 +39,5 @@ npm run test:update
 ## Limits
 
 - Issuance and revocation are not completed on a chain. The RPC stub returns a JSON-RPC error for ledger reads, so those forms stop at the error state. A passing run does not mean a contract call succeeded.
-- Screenshot baselines are desktop-sized. Firefox and WebKit can differ by more than the allowed pixel ratio; if a browser fails only the screenshot, update that project's snapshot rather than loosening the assertion globally.
+- The screenshot baseline in git was captured on macOS Chromium. Other browsers and CI hosts are not pixel-compared. Firefox and WebKit still run the same flows and upload video.
 - Critical-path coverage is the wallet and credential shell, not every issuer-dashboard chart. The 80% figure in the issue is not a line-coverage number this suite measures.

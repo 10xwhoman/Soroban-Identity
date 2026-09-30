@@ -29,13 +29,9 @@ export async function installFreighter(page: Page, opts?: { connected?: boolean;
 
 /** Soroban RPC stub. Health succeeds. Every other method fails in a structured way. */
 export async function stubSorobanRpc(page: Page) {
-  await page.route("**/*", async (route) => {
+  await page.route(/stellar\.org|soroban-testnet|soroban-mainnet/, async (route) => {
     const request = route.request();
     const url = request.url();
-    if (!url.includes("stellar.org") && !url.includes("soroban")) {
-      await route.continue();
-      return;
-    }
     let id: number | string = 1;
     try {
       const body = request.postDataJSON() as { id?: number | string; method?: string };
