@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { logger } from '../logger.js';
 import { requestContextStore } from '../request-context.js';
+import { correlationHeaders } from '../middleware/tracing.js';
 
 export const TraceSpanKind = {
   INTERNAL: 'INTERNAL',
@@ -142,14 +143,14 @@ export class TraceExporter {
         }));
         await fetch(this.endpoint, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...correlationHeaders() },
           body: JSON.stringify(zipkinSpans),
         }).catch(() => {});
       } else {
         // Jaeger / OTLP format
         await fetch(this.endpoint, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...correlationHeaders() },
           body: JSON.stringify({ resourceSpans: [{ scopeSpans: [{ spans: spansToExport }] }] }),
         }).catch(() => {});
       }

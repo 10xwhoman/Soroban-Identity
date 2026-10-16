@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { VaultLeaseManager } from './vault.js';
+import { requestContextStore } from './request-context.js';
 
 test('reads KV v2 secrets, maps keys, and audits metadata without values', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'soroban-vault-'));
@@ -58,6 +59,33 @@ test('authenticates with a JWT when no static token is present', async () => {
   manager.stop();
   assert.deepEqual(loginBody, { role: 'github-actions', jwt: 'jwt-value' });
   assert.deepEqual(secrets, { key: 'value' });
+});
+
+test('propagates the ambient correlation ID to Vault login and secret reads', async () => {
+  const calls = [];
+  const manager = new VaultLeaseManager({
+    env: {
+      VAULT_ENABLED: 'true',
+      VAULT_ADDR: 'https://vault.example.test',
+      VAULT_SECRET_PATH: 'secret/data/app',
+      VAULT_JWT: 'jwt-value',
+      VAULT_ROLE: 'test-role',
+    },
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url.endsWith('/v1/auth/jwt/login')) {
+        return new Response(JSON.stringify({ auth: { client_token: 'token' } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: { data: { key: 'value' } } }), { status: 200 });
+    },
+  });
+  await requestContextStore.run({ correlationId: 'vault-chain-correlation-123' }, () => manager.refresh());
+  manager.stop();
+
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.equal(call.options.headers['x-correlation-id'], 'vault-chain-correlation-123');
+  }
 });
 
 test('fails when Vault is enabled without an address or path', async () => {
