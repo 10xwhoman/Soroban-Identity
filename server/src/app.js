@@ -66,7 +66,16 @@ function wantsJsonLd(req, url) {
   const accept = String(req.headers.accept ?? "");
   return accept.includes("application/ld+json");
 }
-import { schemas, validateRequest } from "./validation.js";
+import { sanitizeDidMetadata, schemas, validateRequest } from "./validation.js";
+import {
+  buildApiRootLinks,
+  buildCredentialCollectionLinks,
+  buildCredentialLinks,
+  buildDidLinks,
+  buildWebhookLinks,
+  formatLinkHeader,
+  resolveLinkPrefix,
+} from "./hateoas.js";
 import { routeLabel } from "./route-label.js";
 import { requestContextStore } from "./request-context.js";
 import { correlationMiddleware, handleTraceRoutes } from "./middleware/tracing.js";
@@ -101,6 +110,7 @@ const SERVER_FEATURES = [
   "response_compression",
   "job_queue",
   "graceful_shutdown",
+  "hateoas",
 ];
 
 const usageTracker = new UsageTracker();
@@ -831,6 +841,20 @@ export function createApp({
             return res.writeHead(304).end();
           }
 
+          const collectionLinks = buildCredentialCollectionLinks({
+            prefix: linkPrefix,
+            limit: limitNum,
+            nextCursor,
+            previousCursor,
+          });
+          const hasFieldsFilter = Boolean(validated.data.query?.fields);
+          const itemsWithLinks = hasFieldsFilter
+            ? projectedItems
+            : projectedItems.map((item) => ({
+                ...item,
+                _links: buildCredentialLinks(item, linkPrefix),
+              }));
+
           if (version === "v2") {
             return sendJson(
               res,
@@ -838,7 +862,7 @@ export function createApp({
               {
                 apiVersion: "v2",
                 data: {
-                  items: projectedItems,
+                  items: itemsWithLinks,
                   pageInfo: {
                     nextCursor,
                     previousCursor,
@@ -851,6 +875,7 @@ export function createApp({
                 meta: {
                   timestamp: new Date().toISOString(),
                 },
+                _links: collectionLinks,
               },
               { ETag: collectionEtag },
             );
@@ -858,13 +883,13 @@ export function createApp({
           return sendJson(
             res,
             200,
-            { items: projectedItems, nextCursor, previousCursor, pagination },
+            { items: itemsWithLinks, nextCursor, previousCursor, pagination, _links: collectionLinks },
             { ETag: collectionEtag },
           );
         }
 
         // Single-item GET /credentials/:id. #745: strong ETag + conditional
-        // GET. #747: optional `?fields=` projection.
+        // GET. #747: optional `?fields=` projection. #1069: HATEOAS _links.
         const credentialIdMatch = pathname.match(/^\/credentials\/([^/]+)$/);
         if (req.method === "GET" && credentialIdMatch) {
           const credentialId = decodeURIComponent(credentialIdMatch[1]);
@@ -913,15 +938,20 @@ export function createApp({
             return res.writeHead(304).end();
           }
 
+          const itemLinks = buildCredentialLinks(credential, linkPrefix);
+          const payloadWithLinks = validated.data.query?.fields
+            ? projectedCredential
+            : { ...projectedCredential, _links: itemLinks };
+
           if (version === "v2") {
             return sendJson(
               res,
               200,
-              { apiVersion: "v2", data: projectedCredential },
-              { ETag: etag },
+              { apiVersion: "v2", data: payloadWithLinks, _links: itemLinks },
+              { ETag: etag, Link: formatLinkHeader(itemLinks) },
             );
           }
-          return sendJson(res, 200, projectedCredential, { ETag: etag });
+          return sendJson(res, 200, payloadWithLinks, { ETag: etag, Link: formatLinkHeader(itemLinks) });
         }
 
         // Credential status (#753). Referenced by every credential's
@@ -938,12 +968,18 @@ export function createApp({
           if (!credential) return notFound(res);
 
           const status = credentialStatus(credential);
+          const statusLinks = buildCredentialLinks(credential, linkPrefix);
           return sendJson(res, 200, {
             id: `${pathname}`,
             type: CREDENTIAL_STATUS_TYPE,
             credentialId,
             ...status,
             checkedAt: new Date().toISOString(),
+            _links: {
+              ...statusLinks,
+              self: { href: `${linkPrefix}${pathname}`, method: "GET" },
+              credential: { href: `${linkPrefix}/credentials/${encodeURIComponent(credentialId)}`, method: "GET" },
+            },
           });
         }
 
@@ -1221,7 +1257,16 @@ export function createApp({
                 { "content-type": "application/ld+json; charset=utf-8" },
               );
             }
-            return sendJson(res, 201, credential);
+            const createdLinks = buildCredentialLinks(credential, linkPrefix);
+            return sendJson(
+              res,
+              201,
+              { ...credential, _links: createdLinks },
+              {
+                Location: createdLinks.self?.href ?? `/credentials/${encodeURIComponent(credential.id)}`,
+                Link: formatLinkHeader(createdLinks),
+              },
+            );
           } catch (err) {
             if (err instanceof DuplicateCredentialError) {
               return sendFormatted(req, res, 409, {
@@ -1264,7 +1309,17 @@ export function createApp({
           await appendAuditLog(config, { action: "revoke_credential", credentialId });
           webhookService.trigger("credential.revoked", { id: credentialId, revokedAt: revoked.revokedAt }).catch(() => {});
           realtime?.emitCredentialEvent("revoked", revoked);
-          return sendJson(res, 200, { revoked: true, credential: revoked });
+          const revokedLinks = buildCredentialLinks(revoked, linkPrefix);
+          return sendJson(
+            res,
+            200,
+            {
+              revoked: true,
+              credential: { ...revoked, _links: revokedLinks },
+              _links: revokedLinks,
+            },
+            { Link: formatLinkHeader(revokedLinks) },
+          );
         }
 
         // Credential update: PUT /credentials/:id or PATCH /credentials/:id with optimistic concurrency
@@ -1404,6 +1459,114 @@ export function createApp({
           const did = decodeURIComponent(cacheDidMatch[1]);
           const invalidated = didCache ? await didCache.invalidate(did) : false;
           return sendJson(res, 200, { did, invalidated });
+        }
+
+        // ── DID Resolution & Metadata Endpoints (#1067) ────────────────
+        if (req.method === "POST" && (pathname === "/dids" || pathname === "/identity/did")) {
+          if (validateContentType(req, res)) return;
+          const body = await readJson(req, config);
+          if (body.__payloadTooLarge) {
+            return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+          }
+          const validated = validateRequest(res, schemas.upsertDid, { body });
+          if (!validated.ok) return;
+          const rawIdentifier = validated.data.body.did ?? validated.data.body.address ?? "";
+          if (!rawIdentifier) {
+            return sendJson(res, 400, {
+              error: "validation_failed",
+              code: "VALIDATION_FAILED",
+              message: "Either did or address is required.",
+            });
+          }
+          const address = rawIdentifier.startsWith("did:stellar:")
+            ? rawIdentifier.slice("did:stellar:".length)
+            : rawIdentifier;
+          const safeMetadata = sanitizeDidMetadata(body.metadata ?? validated.data.body.metadata ?? {});
+          const nowSec = Math.floor(Date.now() / 1000);
+          const didDoc = {
+            id: `did:stellar:${address}`,
+            controller: validated.data.body.controller ?? `did:stellar:${address}`,
+            createdAt: nowSec,
+            updatedAt: nowSec,
+            metadata: safeMetadata,
+            active: validated.data.body.active !== false,
+          };
+          if (didCache) {
+            await didCache.set(address, didDoc);
+          }
+          const didLinks = buildDidLinks(didDoc, linkPrefix);
+          return sendJson(
+            res,
+            pathname === "/identity/did" ? 200 : 201,
+            { ...didDoc, _links: didLinks },
+            { Link: formatLinkHeader(didLinks) },
+          );
+        }
+
+        const didRouteMatch = pathname.match(/^\/dids\/([^/]+)(\/metadata)?$/);
+        if (didRouteMatch) {
+          let rawDid;
+          try {
+            rawDid = decodeURIComponent(didRouteMatch[1]);
+          } catch {
+            return sendJson(res, 400, { code: "INVALID_DID", message: "Malformed URL-encoded DID parameter." });
+          }
+          const address = rawDid.startsWith("did:stellar:") ? rawDid.slice("did:stellar:".length) : rawDid;
+
+          if (req.method === "GET") {
+            const doc = soroban?.resolveDid ? await soroban.resolveDid(address) : null;
+            if (!doc) return notFound(res, req);
+            const didLinks = buildDidLinks(doc, linkPrefix);
+            return sendJson(
+              res,
+              200,
+              {
+                ...doc,
+                metadata: sanitizeDidMetadata(doc.metadata ?? {}),
+                _links: didLinks,
+              },
+              { Link: formatLinkHeader(didLinks) },
+            );
+          }
+
+          if (req.method === "PUT" || req.method === "PATCH") {
+            if (validateContentType(req, res)) return;
+            const body = await readJson(req, config);
+            if (body.__payloadTooLarge) {
+              return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+            }
+            const rawMetadata = body.metadata !== undefined ? body.metadata : body;
+            if (!rawMetadata || typeof rawMetadata !== "object" || Array.isArray(rawMetadata)) {
+              return sendJson(res, 400, {
+                error: "validation_failed",
+                code: "VALIDATION_FAILED",
+                message: "DID metadata must be a JSON object.",
+              });
+            }
+            const safeMetadata = sanitizeDidMetadata(rawMetadata);
+            const existing = (soroban?.resolveDid ? await soroban.resolveDid(address) : null) ?? {
+              id: `did:stellar:${address}`,
+              controller: `did:stellar:${address}`,
+              createdAt: Math.floor(Date.now() / 1000),
+              active: true,
+              metadata: {},
+            };
+            const updatedDoc = {
+              ...existing,
+              updatedAt: Math.floor(Date.now() / 1000),
+              metadata: req.method === "PATCH" ? { ...(existing.metadata ?? {}), ...safeMetadata } : safeMetadata,
+            };
+            if (didCache) {
+              await didCache.set(address, updatedDoc);
+            }
+            const didLinks = buildDidLinks(updatedDoc, linkPrefix);
+            return sendJson(
+              res,
+              200,
+              { ...updatedDoc, _links: didLinks },
+              { Link: formatLinkHeader(didLinks) },
+            );
+          }
         }
 
         if (req.method === "GET" && pathname === "/notifications/summary") {

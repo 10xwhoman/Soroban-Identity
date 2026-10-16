@@ -13,6 +13,9 @@ mod versions;
 mod suspension;
 pub use suspension::{CredentialStatus, SuspensionReason, SuspensionRecord};
 
+mod bundle;
+pub use bundle::{BundleVerificationResult, CredentialBundle};
+
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
@@ -190,16 +193,10 @@ pub enum ContractError {
     CredentialSuspended = 51,
     /// Issue #856: the credential is not suspended, so it cannot be reactivated.
     CredentialNotSuspended = 52,
-    /// Issue #1054: transfers are disabled for this credential type.
-    TransferNotAllowed = 53,
-    /// Issue #1054: a transfer is already pending for this credential.
-    TransferAlreadyPending = 54,
-    /// Issue #1054: no pending transfer exists for this credential.
-    TransferNotFound = 55,
-    /// Issue #1054: the transfer is not in a state that permits this action.
-    TransferNotPending = 56,
-    /// Issue #1054: the configured transfer fee is invalid.
-    InvalidTransferFee = 57,
+    /// Issue #1058: credential bundle was not found.
+    BundleNotFound = 53,
+    /// Issue #1058: credential bundle must contain at least one credential.
+    EmptyBundle = 54,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -2572,6 +2569,60 @@ impl CredentialManager {
         batch::verify_batch(&env, ids, fail_fast)
     }
 
+    // ── Issue #1058: Credential bundling functionality ─────────────────────────
+
+    /// Create a verifiable bundle grouping multiple credentials together (#1058).
+    /// Expiry is automatically set to the shortest credential expiry in the bundle.
+    pub fn create_bundle(
+        env: Env,
+        owner: Address,
+        credential_ids: Vec<BytesN<32>>,
+    ) -> Result<BytesN<32>, ContractError> {
+        bundle::create_bundle(&env, owner, credential_ids)
+    }
+
+    /// Add credentials to an existing bundle and update its shortest expiry (#1058).
+    pub fn add_credentials_to_bundle(
+        env: Env,
+        owner: Address,
+        bundle_id: BytesN<32>,
+        additional_ids: Vec<BytesN<32>>,
+    ) -> Result<CredentialBundle, ContractError> {
+        bundle::add_credentials_to_bundle(&env, owner, bundle_id, additional_ids)
+    }
+
+    /// Verify all credentials in a bundle atomically (#1058).
+    pub fn verify_bundle(env: Env, bundle_id: BytesN<32>) -> Result<(), ContractError> {
+        bundle::verify_bundle(&env, bundle_id)
+    }
+
+    /// Verify all or a subset of credentials in a bundle with partial verification results (#1058).
+    pub fn verify_bundle_partial(
+        env: Env,
+        bundle_id: BytesN<32>,
+        subset_ids: Option<Vec<BytesN<32>>>,
+    ) -> Result<BundleVerificationResult, ContractError> {
+        bundle::verify_bundle_partial(&env, bundle_id, subset_ids)
+    }
+
+    /// Query a credential bundle's metadata and member credential IDs (#1058).
+    pub fn get_bundle(env: Env, bundle_id: BytesN<32>) -> Result<CredentialBundle, ContractError> {
+        bundle::get_bundle(&env, bundle_id)
+    }
+
+    /// Query the full `Credential` contents of a bundle (#1058).
+    pub fn get_bundle_credentials(
+        env: Env,
+        bundle_id: BytesN<32>,
+    ) -> Result<Vec<Credential>, ContractError> {
+        bundle::get_bundle_credentials(&env, bundle_id)
+    }
+
+    /// Query all bundle IDs owned by `owner` (#1058).
+    pub fn get_owner_bundles(env: Env, owner: Address) -> Vec<BytesN<32>> {
+        bundle::get_owner_bundles(&env, owner)
+    }
+
     // -- Issue #659: Proof of possession challenge (credential proof requirements)
     /// Generates a challenge for proof of possession. The subject must sign this
     /// challenge with their private key before issuing a credential.
@@ -3510,7 +3561,7 @@ impl CredentialManager {
             .unwrap_or_else(|| Vec::new(env))
     }
 
-    fn ttl_for_credential(env: &Env, expires_at: u64) -> u32 {
+    pub(crate) fn ttl_for_credential(env: &Env, expires_at: u64) -> u32 {
         if expires_at == 0 {
             return TTL_MAX;
         }
