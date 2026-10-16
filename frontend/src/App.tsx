@@ -5,6 +5,9 @@ import LoadingFallback from "./components/LoadingFallback";
 import KeyboardShortcutsModal from "./components/KeyboardShortcutsModal";
 import { useKeyboardShortcuts, useSequentialShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useKeyboardShortcutsContext } from "./context/KeyboardShortcutsContext";
+import ViewTransition from "./components/ViewTransition";
+import VoiceCommandButton from "./components/VoiceCommandButton";
+import { useVoiceCommands, type VoiceCommand } from "./hooks/useVoiceCommands";
 
 // Tab panels are route-like application surfaces. Keep the initial identity
 // route small and fetch the credentials route only when it is needed.
@@ -76,6 +79,44 @@ export default function App() {
   // Keyboard shortcuts
   const { enabled: shortcutsEnabled, toggleHelp: toggleShortcutsHelp, showHelp: showShortcutsHelp } = useKeyboardShortcutsContext();
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Voice commands (#1046): hands-free search, navigation and verification.
+  const voiceCommands = useMemo<VoiceCommand[]>(
+    () => [
+      {
+        phrases: ["search", "find", "buscar", "rechercher", "搜索"],
+        description: t("voice.commands.search"),
+        handler: () => {
+          searchInputRef.current?.focus();
+        },
+      },
+      {
+        phrases: ["navigate", "go to", "open", "navegar", "aller", "导航"],
+        description: t("voice.commands.navigate"),
+        handler: (transcript) => {
+          const target = transcript.toLowerCase();
+          if (target.includes("credential")) {
+            setTab(Tab.Credentials);
+          } else if (target.includes("issuer") || target.includes("analytics")) {
+            setTab(Tab.IssuerAnalytics);
+          } else {
+            setTab(Tab.Identity);
+          }
+        },
+      },
+      {
+        phrases: ["verify", "verificar", "vérifier", "验证"],
+        description: t("voice.commands.verify"),
+        handler: () => {
+          setTab(Tab.Credentials);
+          setScanning(true);
+        },
+      },
+    ],
+    [t],
+  );
+
+  const voice = useVoiceCommands({ commands: voiceCommands });
 
   // Mobile nav drawer (#882): while open, focus moves into the drawer and
   // Tab cycles inside it, the page behind does not scroll, and Escape closes
@@ -548,6 +589,7 @@ export default function App() {
       <main id="main-content" tabIndex={-1}>
         <ErrorBoundary>
           <Suspense fallback={<LoadingFallback />}>
+          <ViewTransition viewKey={tab}>
           <div
             id={`panel-${Tab.Identity}`}
             role="tabpanel"
@@ -595,6 +637,7 @@ export default function App() {
           >
             {tab === Tab.IssuerAnalytics && <IssuerDashboard />}
           </div>
+          </ViewTransition>
           </Suspense>
         </ErrorBoundary>
       </main>

@@ -316,6 +316,18 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_merkle_root_updated() {
+        let env = Env::default();
+        let batch_id = BytesN::from_array(&env, &[4u8; 32]);
+        let merkle_root = BytesN::from_array(&env, &[5u8; 32]);
+
+        emit_merkle_root_updated(&env, batch_id, merkle_root, 42);
+
+        let events = env.events().all();
+        assert!(events.len() > 0);
+    }
+
+    #[test]
     fn test_emit_credential_renewed() {
         let env = Env::default();
         let subject = Address::generate(&env);
