@@ -87,6 +87,80 @@
     "switchLanguage": "Switch language",
     "dismissNotification": "Dismiss notification"
   },
+  "tour": {
+    "helpLabel": "Help & Tour",
+    "startTour": "Start tour",
+    "restartTour": "Restart tour",
+    "next": "Next",
+    "back": "Back",
+    "skip": "Skip",
+    "finish": "Finish",
+    "stepOf": "Step {{current}} of {{total}}",
+    "choosePath": "Choose your tour",
+    "choosePathDescription": "Pick the walkthrough that matches how you'll use Soroban Identity.",
+    "paths": {
+      "issuer": {
+        "title": "Issuer tour",
+        "description": "Learn how to create a DID and issue verifiable credentials."
+      },
+      "holder": {
+        "title": "Holder tour",
+        "description": "Learn how to create a DID and manage your credentials."
+      }
+    },
+    "issuer": {
+      "welcome": {
+        "title": "Welcome, issuer",
+        "description": "This short tour shows how to set up your identity and issue credentials."
+      },
+      "createDid": {
+        "title": "Create your DID",
+        "description": "Start by creating an on-chain decentralized identifier for your organization."
+      },
+      "connectWallet": {
+        "title": "Connect your wallet",
+        "description": "Connect Freighter to sign the transaction that creates your DID."
+      },
+      "issueCredential": {
+        "title": "Issue a credential",
+        "description": "Issue KYC or other verifiable credentials to subject addresses."
+      },
+      "verifyCredential": {
+        "title": "Verify credentials",
+        "description": "Check that a credential is valid, unrevoked and unexpired."
+      },
+      "analytics": {
+        "title": "Track issuance",
+        "description": "Use Issuer Analytics to monitor the credentials you've issued."
+      }
+    },
+    "holder": {
+      "welcome": {
+        "title": "Welcome, holder",
+        "description": "This short tour shows how to set up your identity and manage your credentials."
+      },
+      "createDid": {
+        "title": "Create your DID",
+        "description": "Create an on-chain decentralized identifier that represents you."
+      },
+      "connectWallet": {
+        "title": "Connect your wallet",
+        "description": "Connect Freighter to sign the transaction that creates your DID."
+      },
+      "viewCredentials": {
+        "title": "View your credentials",
+        "description": "Browse the credentials issued to your address in the Credentials tab."
+      },
+      "verifyCredential": {
+        "title": "Verify a credential",
+        "description": "Confirm a credential is valid before relying on it."
+      },
+      "exportCredential": {
+        "title": "Export credentials",
+        "description": "Download your credentials as JSON, XML or PDF."
+      }
+    }
+  },
   "shortcuts": {
     "title": "Keyboard Shortcuts",
     "description": "Use keyboard shortcuts to navigate and interact with the application more efficiently.",

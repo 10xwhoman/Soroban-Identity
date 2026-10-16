@@ -5,6 +5,9 @@ import LoadingFallback from "./components/LoadingFallback";
 import KeyboardShortcutsModal from "./components/KeyboardShortcutsModal";
 import { useKeyboardShortcuts, useSequentialShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useKeyboardShortcutsContext } from "./context/KeyboardShortcutsContext";
+import { TourProvider, useTour } from "./context/TourContext";
+import TourOverlay from "./components/TourOverlay";
+import { TOUR_ENABLED } from "./config";
 
 // Tab panels are route-like application surfaces. Keep the initial identity
 // route small and fetch the credentials route only when it is needed.
@@ -56,7 +59,7 @@ export enum Tab {
 
 const TAB_ORDER: Tab[] = [Tab.Identity, Tab.Credentials, Tab.IssuerAnalytics];
 
-export default function App() {
+function AppContent() {
   const [tab, setTab] = useState<Tab>(Tab.Identity);
   const tabRefs = useRef<Partial<Record<Tab, HTMLButtonElement | null>>>({});
   const [activeNetwork, setActiveNetwork] = useState<NetworkName>(DEFAULT_NETWORK);
@@ -76,6 +79,10 @@ export default function App() {
   // Keyboard shortcuts
   const { enabled: shortcutsEnabled, toggleHelp: toggleShortcutsHelp, showHelp: showShortcutsHelp } = useKeyboardShortcutsContext();
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Guided onboarding tour (#1042). The provider only auto-starts for users
+  // with no stored progress, and only when the feature flag is on.
+  const { startTour, restartTour, isActive: tourActive } = useTour();
 
   // Mobile nav drawer (#882): while open, focus moves into the drawer and
   // Tab cycles inside it, the page behind does not scroll, and Escape closes
@@ -380,6 +387,18 @@ export default function App() {
           >
             {getThemeIcon(theme, isDarkMode)} {getThemeLabel(theme, isDarkMode, t)}
           </button>
+          {TOUR_ENABLED && (
+            <button
+              type="button"
+              className="tour-help-btn"
+              data-tour="tour-help"
+              onClick={() => (tourActive ? restartTour() : startTour())}
+              aria-label={t("tour.restart", "Restart guided tour")}
+              title={t("tour.restart", "Restart guided tour")}
+            >
+              <span aria-hidden="true">?</span> {t("tour.help", "Tour")}
+            </button>
+          )}
           <WalletButton wallet={wallet} />
         </div>
         <div
@@ -495,6 +514,7 @@ export default function App() {
             ref={(node) => {
               tabRefs.current[name] = node;
             }}
+            data-tour={`tab-${name}`}
             onClick={() => setTab(name)}
             onMouseEnter={name === Tab.Credentials ? preloadCredentialsPanel : undefined}
             onFocus={name === Tab.Credentials ? preloadCredentialsPanel : undefined}
@@ -511,6 +531,7 @@ export default function App() {
             id={`panel-${Tab.Identity}`}
             role="tabpanel"
             aria-labelledby={`tab-${Tab.Identity}`}
+            data-tour="panel-identity"
             hidden={tab !== Tab.Identity}
           >
             {tab === Tab.Identity && <IdentityPanel />}
@@ -519,6 +540,7 @@ export default function App() {
             id={`panel-${Tab.Credentials}`}
             role="tabpanel"
             aria-labelledby={`tab-${Tab.Credentials}`}
+            data-tour="panel-credentials"
             hidden={tab !== Tab.Credentials}
           >
             {tab === Tab.Credentials && (
@@ -550,6 +572,7 @@ export default function App() {
             id={`panel-${Tab.IssuerAnalytics}`}
             role="tabpanel"
             aria-labelledby={`tab-${Tab.IssuerAnalytics}`}
+            data-tour="panel-issuer"
             hidden={tab !== Tab.IssuerAnalytics}
           >
             {tab === Tab.IssuerAnalytics && <IssuerDashboard />}
@@ -559,5 +582,14 @@ export default function App() {
       </main>
     </div>
     </ToastProvider>
+  );
+}
+
+export default function App() {
+  return (
+    <TourProvider>
+      <AppContent />
+      <TourOverlay />
+    </TourProvider>
   );
 }

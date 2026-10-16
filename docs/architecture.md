@@ -185,6 +185,103 @@ should be applied to any new function that performs a cross-contract call.
 - `persistent` storage is used for DID documents and credentials (survives ledger expiry with TTL bumps)
 - `instance` storage is used for admin and issuer registry
 
+## Geo-Distributed Read Replicas
+
+To serve global read traffic with low latency, the backend runs read
+replicas in three regions alongside a single authoritative primary.
+
+### Replication Topology
+
+```
+                    ┌──────────────────────────┐
+                    │   Primary (write node)   │
+                    │        us-east-1         │
+                    └────────────┬─────────────┘
+                                 │  async WAL / logical replication
+        ┌────────────────────────┼────────────────────────┐
+        │                        │                        │
+        ▼                        ▼                        ▼
+┌───────────────┐        ┌───────────────┐        ┌───────────────┐
+│  Replica US   │        │  Replica EU   │        │ Replica Asia  │
+│   us-west-2   │        │  eu-central-1 │        │ ap-southeast-1│
+└───────────────┘        └───────────────┘        └───────────────┘
+        ▲                        ▲                        ▲
+        └──────────── nearest-replica routing ───────────┘
+```
+
+- **Primary** (`us-east-1`): the only node that accepts writes. All
+  `create_did`, `update_did`, `deactivate_did`, `issue_credential`,
+  `revoke_credential`, and admin operations are routed here.
+- **Replicas** (`us-west-2`, `eu-central-1`, `ap-southeast-1`): read-only
+  followers that stream changes from the primary asynchronously. They serve
+  `resolve_did`, `has_active_did`, `get_credential`, `verify_credential`,
+  and `verify_claims_hash`.
+- Replication is **asynchronous**, so replicas may lag the primary by a small
+  amount (typically tens to low hundreds of milliseconds).
+
+### Read/Write Splitting
+
+The backend exposes a single logical connection and splits traffic based on
+the operation:
+
+| Operation type | Target | Rationale |
+|---|---|---|
+| Writes (contract invocations that mutate state) | Primary | Only the primary can accept writes |
+| Reads after a write in the same request/session | Primary | Read-your-writes consistency |
+| Independent reads | Nearest healthy replica | Low latency, offloads the primary |
+
+Rules:
+
+1. Any request that performs a write is pinned to the primary for the
+   remainder of that request/session, guaranteeing read-your-writes.
+2. Read-only requests are routed to the nearest healthy replica based on the
+   client's region.
+3. If no replica is healthy, reads fall back to the primary.
+
+### Replica Lag Monitoring
+
+Each replica reports its replication lag (the difference between the
+primary's last applied ledger/sequence and the replica's). The backend:
+
+- Exposes lag per replica as a metric (`replica_lag_seconds{region=...}`).
+- Marks a replica **unhealthy** when lag exceeds the configured threshold
+  (`REPLICA_MAX_LAG_SECONDS`, default 5s) and stops routing reads to it.
+- Alerts when any replica exceeds the threshold for a sustained period.
+
+### Failover
+
+- **Replica failure**: the replica is removed from the routing pool and its
+  traffic is redistributed to the remaining healthy replicas, or to the
+  primary if none remain. No writes are affected.
+- **Primary failure**: writes fail over to the promoted primary; reads
+  continue to be served by replicas (subject to lag) until promotion
+  completes.
+- Failover is automatic and health-check driven; a recovered replica is
+  re-added to the pool only after it has caught up below the lag threshold.
+
+### Eventual Consistency
+
+Because replication is asynchronous, reads from a replica may not reflect a
+just-committed write. The backend handles this as follows:
+
+- **Read-your-writes**: after a write, the session is pinned to the primary
+  (see Read/Write Splitting), so a client always observes its own writes.
+- **Monotonic reads**: a session that has read from a replica is not moved
+  to a replica that is further behind, avoiding time-travel on subsequent
+  reads.
+- **Lag-bounded reads**: replicas lagging beyond `REPLICA_MAX_LAG_SECONDS`
+  are excluded from routing, bounding staleness for independent reads.
+- **Consistency-sensitive reads**: callers that require the latest state can
+  pass a `consistency: 'strong'` hint, which routes the read to the primary.
+
+### Nearest-Replica Routing
+
+The router selects a replica using, in order:
+
+1. The client's region (from geo-IP or an explicit region hint).
+2. The lowest-latency healthy replica within that region.
+3. The nearest healthy replica in an adjacent region.
+4. The primary, if no replica is healthy.
 
 ## Deployment
 

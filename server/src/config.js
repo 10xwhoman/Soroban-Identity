@@ -141,6 +141,88 @@ export const DEFAULT_CORS_EXPOSED_HEADERS = [
 /** Preflight cache lifetime in seconds. Browsers cap this themselves. */
 export const DEFAULT_CORS_MAX_AGE = 86400;
 
+/**
+ * Parse the geo-distributed read replica topology (#1051).
+ *
+ * Accepts a JSON object mapping region names to replica endpoints, e.g.
+ * `{"us":"https://us.db.example.com","eu":"https://eu.db.example.com"}`.
+ * A plain comma-separated list of `region=url` pairs is also accepted so the
+ * value stays readable in a shell. Invalid entries are dropped rather than
+ * throwing, so one malformed region cannot take down the whole server.
+ *
+ * @param {string|undefined} value
+ * @returns {Object<string,string>} region (lowercased) -> endpoint URL
+ */
+function parseReplicaEndpoints(value) {
+  if (!value) return {};
+  const endpoints = {};
+  const trimmed = String(value).trim();
+  if (trimmed.startsWith("{")) {
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (error) {
+      throw new Error(`Invalid JSON configuration: ${error.message}`);
+    }
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [region, url] of Object.entries(parsed)) {
+        if (typeof url === "string" && url.trim()) {
+          endpoints[region.trim().toLowerCase()] = url.trim();
+        }
+      }
+    }
+    return endpoints;
+  }
+  for (const pair of trimmed.split(",")) {
+    const [region, ...rest] = pair.split("=");
+    const url = rest.join("=").trim();
+    if (region && region.trim() && url) {
+      endpoints[region.trim().toLowerCase()] = url;
+    }
+  }
+  return endpoints;
+}
+
+/**
+ * Parse the region -> nearest-replica routing table (#1051).
+ *
+ * Accepts a JSON object or `region=replicaRegion` pairs, e.g.
+ * `{"us-east-1":"us","eu-west-1":"eu"}`. Keys are lowercased so lookups can
+ * be case-insensitive.
+ *
+ * @param {string|undefined} value
+ * @returns {Object<string,string>}
+ */
+function parseRegionRouting(value) {
+  if (!value) return {};
+  const routing = {};
+  const trimmed = String(value).trim();
+  if (trimmed.startsWith("{")) {
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (error) {
+      throw new Error(`Invalid JSON configuration: ${error.message}`);
+    }
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [region, replica] of Object.entries(parsed)) {
+        if (typeof replica === "string" && replica.trim()) {
+          routing[region.trim().toLowerCase()] = replica.trim().toLowerCase();
+        }
+      }
+    }
+    return routing;
+  }
+  for (const pair of trimmed.split(",")) {
+    const [region, ...rest] = pair.split("=");
+    const replica = rest.join("=").trim();
+    if (region && region.trim() && replica) {
+      routing[region.trim().toLowerCase()] = replica.toLowerCase();
+    }
+  }
+  return routing;
+}
+
 function parseThresholds(value, fallback = [30, 7, 1]) {
   if (!value) return fallback;
   try {
@@ -370,6 +452,43 @@ export function loadConfig(env = process.env) {
       credential: env.CREDENTIAL_CONTRACT_ID ?? env.CREDENTIAL_MANAGER_ID ?? "",
       reputation: env.REPUTATION_ID ?? "",
     },
+    // Geo-distributed read replicas (#1051). Replicas are opt-in: with no
+    // endpoints configured every query goes to the primary, so an existing
+    // single-region deployment is unaffected.
+    readReplicasEnabled: parseBoolean(env.READ_REPLICAS_ENABLED, false),
+    // Region -> replica endpoint, e.g. {"us":"https://us.db.example.com"}.
+    replicaEndpoints: parseReplicaEndpoints(env.REPLICA_ENDPOINTS),
+    // Region -> nearest replica region, e.g. {"us-east-1":"us"}.
+    replicaRegionRouting: parseRegionRouting(env.REPLICA_REGION_ROUTING),
+    // Region this instance runs in; used as the routing fallback.
+    replicaLocalRegion: (env.REPLICA_LOCAL_REGION ?? "").trim().toLowerCase(),
+    // Replica lag above this (ms) takes the replica out of rotation.
+    replicaMaxLagMs: parseInteger(env.REPLICA_MAX_LAG_MS, 5000),
+    // Lag above this (ms) is logged as a warning but still serves reads.
+    replicaWarnLagMs: parseInteger(env.REPLICA_WARN_LAG_MS, 1000),
+    // How often replica lag is sampled (0 disables the monitor).
+    replicaLagCheckIntervalMs: parseInteger(
+      env.REPLICA_LAG_CHECK_INTERVAL_MS,
+      10_000,
+      true,
+    ),
+    // Consecutive failed health checks before a replica is marked down.
+    replicaFailureThreshold: parseInteger(env.REPLICA_FAILURE_THRESHOLD, 3),
+    // Consecutive successful checks before a down replica is restored.
+    replicaRecoveryThreshold: parseInteger(env.REPLICA_RECOVERY_THRESHOLD, 2),
+    // When true, reads fall back to the primary if every replica is unhealthy.
+    replicaFailoverToPrimary: parseBoolean(env.REPLICA_FAILOVER_TO_PRIMARY, true),
+    // When true, a read that must observe its own write is sent to the primary
+    // instead of a possibly-stale replica.
+    replicaReadAfterWriteConsistency: parseBoolean(
+      env.REPLICA_READ_AFTER_WRITE_CONSISTENCY,
+      true,
+    ),
+    // Window (ms) after a write during which reads are pinned to the primary.
+    replicaConsistencyWindowMs: parseInteger(
+      env.REPLICA_CONSISTENCY_WINDOW_MS,
+      2000,
+    ),
     // Jaeger distributed tracing (#714)
     jaegerEnabled: parseBoolean(env.JAEGER_ENABLED, false),
     jaegerServiceName: env.JAEGER_SERVICE_NAME ?? "soroban-identity-server",
@@ -433,6 +552,12 @@ export function validateConfig(env = process.env) {
     { key: "OAUTH_AUTH_CODE_TTL_MS", desc: "must be a valid integer" },
     { key: "OAUTH_ACCESS_TOKEN_TTL_MS", desc: "must be a valid integer" },
     { key: "OAUTH_REFRESH_TOKEN_TTL_MS", desc: "must be a valid integer" },
+    { key: "REPLICA_MAX_LAG_MS", desc: "must be a valid integer" },
+    { key: "REPLICA_WARN_LAG_MS", desc: "must be a valid integer" },
+    { key: "REPLICA_LAG_CHECK_INTERVAL_MS", desc: "must be a valid integer" },
+    { key: "REPLICA_FAILURE_THRESHOLD", desc: "must be a valid integer" },
+    { key: "REPLICA_RECOVERY_THRESHOLD", desc: "must be a valid integer" },
+    { key: "REPLICA_CONSISTENCY_WINDOW_MS", desc: "must be a valid integer" },
   ];
 
   for (const item of numericVars) {
@@ -528,6 +653,49 @@ export function validateConfig(env = process.env) {
     }
   }
 
+  // Geo-distributed read replicas (#1051): every configured endpoint must be a
+  // usable URL, and routing must only point at regions that exist.
+  const replicaEndpoints = parseReplicaEndpoints(env.REPLICA_ENDPOINTS);
+  for (const [region, endpoint] of Object.entries(replicaEndpoints)) {
+    try {
+      new URL(endpoint);
+    } catch {
+      invalid.push(
+        `REPLICA_ENDPOINTS: '${region}' must map to a valid URL, got '${endpoint}'`,
+      );
+    }
+  }
+
+  const replicaRouting = parseRegionRouting(env.REPLICA_REGION_ROUTING);
+  for (const [region, replica] of Object.entries(replicaRouting)) {
+    if (!replicaEndpoints[replica]) {
+      invalid.push(
+        `REPLICA_REGION_ROUTING: '${region}' points at unknown replica region '${replica}'`,
+      );
+    }
+  }
+
+  if (
+    parseBoolean(env.READ_REPLICAS_ENABLED, false) &&
+    Object.keys(replicaEndpoints).length === 0
+  ) {
+    invalid.push(
+      "REPLICA_ENDPOINTS: required when READ_REPLICAS_ENABLED is true",
+    );
+  }
+
+  const replicaLocalRegion = (env.REPLICA_LOCAL_REGION ?? "").trim().toLowerCase();
+  if (
+    replicaLocalRegion &&
+    Object.keys(replicaEndpoints).length > 0 &&
+    !replicaEndpoints[replicaLocalRegion] &&
+    !replicaRouting[replicaLocalRegion]
+  ) {
+    invalid.push(
+      `REPLICA_LOCAL_REGION: '${replicaLocalRegion}' is neither a replica endpoint nor a routing key`,
+    );
+  }
+
   const cronSchedule = env.EXPIRY_CRON_SCHEDULE;
   if (cronSchedule !== undefined && cronSchedule !== "") {
     try {
@@ -599,6 +767,18 @@ export function logDefaultValues(env = process.env) {
     { key: "CORS_ALLOWED_HEADERS", defaultVal: DEFAULT_CORS_ALLOWED_HEADERS.join(",") },
     { key: "CORS_EXPOSED_HEADERS", defaultVal: DEFAULT_CORS_EXPOSED_HEADERS.join(",") },
     { key: "CORS_MAX_AGE", defaultVal: String(DEFAULT_CORS_MAX_AGE) },
+    { key: "READ_REPLICAS_ENABLED", defaultVal: "false" },
+    { key: "REPLICA_ENDPOINTS", defaultVal: "{} (primary only)" },
+    { key: "REPLICA_REGION_ROUTING", defaultVal: "{}" },
+    { key: "REPLICA_LOCAL_REGION", defaultVal: "''" },
+    { key: "REPLICA_MAX_LAG_MS", defaultVal: "5000" },
+    { key: "REPLICA_WARN_LAG_MS", defaultVal: "1000" },
+    { key: "REPLICA_LAG_CHECK_INTERVAL_MS", defaultVal: "10000" },
+    { key: "REPLICA_FAILURE_THRESHOLD", defaultVal: "3" },
+    { key: "REPLICA_RECOVERY_THRESHOLD", defaultVal: "2" },
+    { key: "REPLICA_FAILOVER_TO_PRIMARY", defaultVal: "true" },
+    { key: "REPLICA_READ_AFTER_WRITE_CONSISTENCY", defaultVal: "true" },
+    { key: "REPLICA_CONSISTENCY_WINDOW_MS", defaultVal: "2000" },
     { key: "JAEGER_ENABLED", defaultVal: "false" },
     { key: "JAEGER_SERVICE_NAME", defaultVal: "'soroban-identity-server'" },
     { key: "JAEGER_AGENT_HOST", defaultVal: "'localhost'" },
