@@ -47,6 +47,7 @@ import {
   validateContentType,
 } from "./http-utils.js";
 import { KEY_ID_HEADER, NonceStore, verifySignedRequest } from "./request-signing.js";
+import { createNonceStore, nonceMiddleware } from "./middleware/nonce.js";
 import { normalizeCspReports, setSecurityHeaders } from "./security-headers.js";
 import {
   CREDENTIAL_STATUS_TYPE,
@@ -124,6 +125,7 @@ export function createApp({
   accessLogSink = null,
   realtime = null,
   nonceStore = new NonceStore({ ttlSeconds: config.requestSigningMaxAgeSeconds }),
+  replayNonceStore = null,
   vcSerializer = createVcSerializer(config, { logger }),
   emailTransport = new EmailTransport(config),
   quotaTracker = null,
@@ -183,6 +185,22 @@ export function createApp({
 
   const tenantRegistry = new TenantRegistry(config);
   void tenantRegistry.init();
+
+  // #1052: nonce-based replay prevention for sensitive (state-changing)
+  // operations. Backed by Redis when available so nonces are shared across
+  // instances; falls back to an in-process store otherwise.
+  const replayStore =
+    replayNonceStore ??
+    createNonceStore({
+      redisClient,
+      ttlSeconds: config.nonceTtlSeconds ?? 300,
+      metrics,
+    });
+  const checkNonce = nonceMiddleware({
+    store: replayStore,
+    ttlSeconds: config.nonceTtlSeconds ?? 300,
+    metrics,
+  });
 
   const eventStore = new EventStore({ dataDir: `${config.dataDir}/events` });
   void eventStore.init();
@@ -344,6 +362,32 @@ export function createApp({
     // Rate limiting check (exempt /info, /health, /metrics)
     const isExempt = ["/info", "/health", "/ready", "/live", "/metrics"].includes(url.pathname);
 
+    // #1052: replay prevention. Only state-changing methods are checked, and
+    // operational endpoints (plus the browser-posted CSP report) are exempt
+    // because they cannot carry client credentials.
+    const isNonceExempt = isExempt || pathname === "/csp-report";
+    const isStateChanging = !["GET", "HEAD", "OPTIONS"].includes(req.method);
+    if (!isNonceExempt && isStateChanging) {
+      const nonceResult = await checkNonce(req, res);
+      if (!nonceResult.ok) {
+        metrics?.observeNonceCollision?.(nonceResult.reason ?? "replayed");
+        logger.warn(
+          { code: nonceResult.code, route: routeLabel(pathname), tenantId },
+          "Rejected replayed request nonce",
+        );
+        return sendJson(res, nonceResult.status ?? 409, {
+          error: "nonce_replayed",
+          code: nonceResult.code ?? "SIGNATURE_REPLAYED",
+          message: nonceResult.message ?? "Request nonce has already been used.",
+        });
+      }
+      // A fresh server nonce is attached to every accepted response so a
+      // client can chain requests without reusing a nonce.
+      if (nonceResult.serverNonce) {
+        res.setHeader("X-Nonce", nonceResult.serverNonce);
+      }
+    }
+
     // HMAC request signing (#752). Verified before routing so no handler can
     // act on a request whose body was tampered with or replayed. Operational
     // endpoints are exempt for the same reason they skip rate limiting: a
@@ -478,12 +522,52 @@ export function createApp({
       }
     }
 
+    // #1053: resolve the tenant before quota/limit checks so per-tenant
+    // budgets apply. The tenant registry is the source of truth for limits.
+    const tenant = tenantRegistry.get(tenantId) ?? null;
+    req.tenant = tenant;
+    if (tenant) {
+      const tenantLimits = tenant.limits ?? {};
+      if (
+        tenantLimits.maxCredentials != null &&
+        req.method === "POST" &&
+        (pathname === "/credentials" || pathname === "/credentials/issue")
+      ) {
+        const existing = await readCredentials(config, { tenantId });
+        if (existing.length >= tenantLimits.maxCredentials) {
+          return sendJson(res, 429, {
+            error: "tenant_limit_exceeded",
+            code: "TENANT_LIMIT_EXCEEDED",
+            scope: "credentials",
+            tenantId,
+            message: `Tenant '${tenantId}' has reached its credential limit (${tenantLimits.maxCredentials}).`,
+          });
+        }
+      }
+      if (
+        tenantLimits.maxDids != null &&
+        req.method === "POST" &&
+        pathname === "/admin/issuers"
+      ) {
+        const issuers = await soroban.getIssuers();
+        if (issuers.length >= tenantLimits.maxDids) {
+          return sendJson(res, 429, {
+            error: "tenant_limit_exceeded",
+            code: "TENANT_LIMIT_EXCEEDED",
+            scope: "dids",
+            tenantId,
+            message: `Tenant '${tenantId}' has reached its DID limit (${tenantLimits.maxDids}).`,
+          });
+        }
+      }
+    }
+
     // Quota check (#748): a separate budget from the rate limit above,
     // measured against calendar day/month boundaries rather than a rolling
     // window. GET /quota itself is exempt so checking your own usage never
     // consumes it.
     if (!isExempt && pathname !== "/quota") {
-      const quotaResult = quota.consume(req);
+      const quotaResult = quota.consume(req, tenant ? { tenantId, limits: tenant.limits } : undefined);
       const binding = pickQuotaBinding(quotaResult);
       res.setHeader("X-Quota-Tier", quotaResult.tier);
       res.setHeader("X-Quota-Period", binding.period);
@@ -705,7 +789,7 @@ export function createApp({
           if (!validated.ok) return;
           const limitNum = validated.data.query.limit ?? 50;
           const direction = validated.data.query.direction ?? "next";
-          const credentials = await readCredentials(config);
+          const credentials = await readCredentials(config, { tenantId });
           const { items, nextCursor, previousCursor, pagination } = cursorPage(credentials, {
             limit: limitNum,
             cursor: validated.data.query.cursor ?? null,
@@ -789,7 +873,7 @@ export function createApp({
             query: url.searchParams,
           });
           if (!validated.ok) return;
-          const credentials = await readCredentials(config);
+          const credentials = await readCredentials(config, { tenantId });
           const credential = credentials.find((c) => c.id === credentialId);
           if (!credential) return notFound(res, req);
 
@@ -849,7 +933,7 @@ export function createApp({
           if (!validateRequest(res, schemas.credentialByIdParams, { params: { credentialId } }).ok) {
             return;
           }
-          const credentials = await readCredentials(config);
+          const credentials = await readCredentials(config, { tenantId });
           const credential = credentials.find((c) => c.id === credentialId);
           if (!credential) return notFound(res);
 
@@ -872,7 +956,7 @@ export function createApp({
           if (!validateRequest(res, schemas.credentialByIdParams, { params: { credentialId } }).ok) {
             return;
           }
-          const credentials = await readCredentials(config);
+          const credentials = await readCredentials(config, { tenantId });
           const credential = credentials.find((c) => c.id === credentialId);
           const recordVerification = (result) =>
             metrics?.observeCredentialVerification?.(result);
@@ -1125,7 +1209,7 @@ export function createApp({
           if (!validated.ok) return;
           const credential = validated.data.body;
           try {
-            await createAndPersistCredential(config, credential);
+            await createAndPersistCredential(config, credential, { tenantId });
             await appendAuditLog(config, { action: "issue_credential", credentialId: credential.id });
             webhookService.trigger("credential.issued", credential).catch(() => {});
             realtime?.emitCredentialEvent("issued", credential);
@@ -1165,7 +1249,7 @@ export function createApp({
           // it, and this request was built from the stale copy.
           const ifMatch = req.headers["if-match"];
           if (ifMatch) {
-            const existing = (await readCredentials(config)).find((c) => c.id === credentialId);
+            const existing = (await readCredentials(config, { tenantId })).find((c) => c.id === credentialId);
             if (!existing) return notFound(res);
             if (!matchesIfMatch(ifMatch, computeEtag(existing))) {
               return sendJson(res, 412, {
@@ -1175,7 +1259,7 @@ export function createApp({
             }
           }
 
-          const revoked = await revokeAndPersistCredential(config, credentialId);
+          const revoked = await revokeAndPersistCredential(config, credentialId, { tenantId });
           if (!revoked) return notFound(res);
           await appendAuditLog(config, { action: "revoke_credential", credentialId });
           webhookService.trigger("credential.revoked", { id: credentialId, revokedAt: revoked.revokedAt }).catch(() => {});
@@ -1200,7 +1284,7 @@ export function createApp({
             : (body.version ?? body.expectedVersion);
 
           try {
-            const updated = await updateAndPersistCredential(config, credentialId, body, expectedVersion);
+            const updated = await updateAndPersistCredential(config, credentialId, body, expectedVersion, { tenantId });
             if (!updated) return notFound(res);
             await appendAuditLog(config, { action: "update_credential", credentialId });
             webhookService.trigger("credential.updated", updated).catch(() => {});
@@ -1465,7 +1549,7 @@ export function createApp({
           });
           if (!validated.ok) return;
           const windowDays = validated.data.query.windowDays ?? config.expiryWarningDays;
-          const credentials = await readCredentials(config);
+          const credentials = await readCredentials(config, { tenantId });
           const expiring = findExpiringCredentials(credentials, {
             windowDays,
             includeNotified: true,
