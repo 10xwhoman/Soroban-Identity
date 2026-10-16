@@ -14,6 +14,7 @@
  */
 
 import { V1_ROUTES, withV1Prefix } from "./v1.js";
+import { buildApiRootLinks, buildCredentialCollectionLinks, buildCredentialLinks } from "../hateoas.js";
 
 export const V2_PREFIX = "/v2";
 
@@ -40,12 +41,14 @@ export function withV2Prefix(path) {
  * Wrap a v1-style response body in the v2 envelope.
  *
  * For list responses (`data.items` present), `pageInfo` is synthesised from
- * `nextCursor` / `previousCursor` / `pagination` if available.
+ * `nextCursor` / `previousCursor` / `pagination` if available, and HATEOAS
+ * `_links` are attached (#1069).
  *
  * @param {*} data  v1 response payload (already-serialisable object)
+ * @param {Record<string, {href: string, method?: string}>} [links]
  * @returns {object} v2 envelope
  */
-export function wrapResponse(data) {
+export function wrapResponse(data, links) {
   const envelope = {
     apiVersion: "v2",
     data,
@@ -54,7 +57,16 @@ export function wrapResponse(data) {
 
   // Promote cursor pagination fields for list responses.
   if (data && typeof data === "object" && Array.isArray(data.items)) {
-    const { items, nextCursor, previousCursor, pagination } = data;
+    const { items, nextCursor, previousCursor, pagination, _links } = data;
+    const collectionLinks =
+      links ??
+      _links ??
+      buildCredentialCollectionLinks({
+        prefix: V2_PREFIX,
+        limit: pagination?.pageSize ?? 50,
+        nextCursor: nextCursor ?? null,
+        previousCursor: previousCursor ?? null,
+      });
     envelope.data = {
       items,
       pageInfo: {
@@ -67,6 +79,13 @@ export function wrapResponse(data) {
       },
       pagination: pagination ?? null,
     };
+    envelope._links = collectionLinks;
+  } else if (links) {
+    envelope._links = links;
+  } else if (data && typeof data === "object" && data.id && ("issuer" in data || "credentialType" in data || "subject" in data)) {
+    envelope._links = buildCredentialLinks(data, V2_PREFIX);
+  } else {
+    envelope._links = buildApiRootLinks(V2_PREFIX);
   }
 
   return envelope;

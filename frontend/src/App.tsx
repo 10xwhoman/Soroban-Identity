@@ -380,6 +380,26 @@ export default function App() {
           >
             {getThemeIcon(theme, isDarkMode)} {getThemeLabel(theme, isDarkMode, t)}
           </button>
+          {notification && !notification.dismissed && notification.count > 0 && (
+            <span
+              className="notification-badge-icon"
+              data-testid="notification-badge"
+              aria-label={`${notification.count} notification${notification.count > 1 ? "s" : ""}`}
+              style={{
+                position: "relative",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "0.25rem",
+                fontSize: "0.85rem",
+                fontWeight: 600,
+              }}
+            >
+              <span aria-hidden="true">🔔</span>
+              <span className="badge badge-yellow" data-testid="notification-badge-count">
+                {notification.count}
+              </span>
+            </span>
+          )}
           <WalletButton wallet={wallet} />
         </div>
         <div
