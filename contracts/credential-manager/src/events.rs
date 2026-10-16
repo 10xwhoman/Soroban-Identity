@@ -130,6 +130,28 @@ pub fn emit_credential_renewed(
     // TODO: Notify subscribers (see comment in emit_credential_issued)
 }
 
+/// Emit a merkle root updated event and notify all subscribers.
+///
+/// This is called when the merkle root for a credential batch is created
+/// or updated (e.g., after incremental tree updates). Off-chain indexers
+/// can subscribe to this event to track batch commitments and verify
+/// merkle proofs against the latest on-chain root.
+///
+/// # Parameters
+/// - `batch_id`: The unique identifier of the credential batch
+/// - `merkle_root`: The new merkle root commitment for the batch
+/// - `leaf_count`: The number of credential leaves in the batch
+pub fn emit_merkle_root_updated(
+    env: &Env,
+    batch_id: BytesN<32>,
+    merkle_root: BytesN<32>,
+    leaf_count: u32,
+) {
+    let topics = (symbol_short!("merkle"), symbol_short!("root_upd"));
+    env.events()
+        .publish(topics, (batch_id, merkle_root, leaf_count));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +194,18 @@ mod tests {
             RevocationReason::IssuerRevoked,
             12345,
         );
+
+        let events = env.events().all();
+        assert!(events.len() > 0);
+    }
+
+    #[test]
+    fn test_emit_merkle_root_updated() {
+        let env = Env::default();
+        let batch_id = BytesN::from_array(&env, &[4u8; 32]);
+        let merkle_root = BytesN::from_array(&env, &[5u8; 32]);
+
+        emit_merkle_root_updated(&env, batch_id, merkle_root, 42);
 
         let events = env.events().all();
         assert!(events.len() > 0);

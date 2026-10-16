@@ -125,3 +125,38 @@ pub struct RevocationRecord {
     pub reason: RevocationReason,
     pub revoked_at: u64,
 }
+
+/// A merkle inclusion proof for a single credential leaf.
+///
+/// The leaf is the credential id (or a hash derived from it) and `siblings`
+/// holds the sibling hashes ordered from the leaf level up to the root.
+/// `sibling_on_left[i]` indicates whether `siblings[i]` is the left child at
+/// that level; when false the sibling is the right child.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MerkleProof {
+    pub leaf: BytesN<32>,
+    pub siblings: soroban_sdk::Vec<BytesN<32>>,
+    pub sibling_on_left: soroban_sdk::Vec<bool>,
+}
+
+/// On-chain record of a merkle root for a batch of credentials.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MerkleBatchRoot {
+    pub batch_id: BytesN<32>,
+    pub root: BytesN<32>,
+    pub leaf_count: u32,
+    pub updated_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum MerkleError {
+    InvalidProof = 0,
+    UnknownBatch = 1,
+    EmptyBatch = 2,
+    ProofLengthMismatch = 3,
+    LeafCountMismatch = 4,
+}

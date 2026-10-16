@@ -4,6 +4,9 @@
 mod batch;
 pub use batch::{BatchFailureReason, BatchVerifyResult};
 
+mod merkle;
+pub use merkle::{MerkleBatch, MerkleProof};
+
 mod templates;
 pub use templates::{CredentialTemplate, TemplateRef};
 
@@ -64,6 +67,16 @@ const DEFAULT_UPGRADE_TIMELOCK: u64 = 86_400;
 const CRL_LEAVES: Symbol = symbol_short!("CRLLEAF");
 const CRL_ROOT: Symbol = symbol_short!("CRLROOT");
 const CRL_PERIOD_SECS: u64 = 86_400;
+
+// ── Issue #1056: batch credential Merkle trees ───────────────────────────────
+/// Maps a batch id to the stored [`MerkleBatch`] metadata (root, leaf count,
+/// and the ordered leaf set used for incremental updates).
+const MERKLE_BATCH: Symbol = symbol_short!("MRKLBAT");
+/// Maps a batch id to its current Merkle root, kept separately so proof
+/// verification is a single small read.
+const MERKLE_ROOT: Symbol = symbol_short!("MRKLROOT");
+/// Maximum number of leaves accepted in a single batch.
+const MAX_MERKLE_LEAVES: u32 = 1_000;
 
 // ── Issue #951: standardized revocation reasons ──────────────────────────────
 /// Maps a credential ID to its [`RevocationRecord`].
@@ -1232,6 +1245,157 @@ impl CredentialManager {
             ),
         );
         Ok(id)
+    }
+
+    // ── Issue #1056: batch credential Merkle trees ────────────────────────────
+
+    /// Builds a Merkle tree over `credential_ids` and stores its root under
+    /// `batch_id`. Only the batch owner (the caller) may register a batch, and
+    /// the caller must be a registered issuer. Re-registering an existing
+    /// `batch_id` overwrites it, which is how incremental updates are seeded.
+    ///
+    /// Returns the computed Merkle root.
+    pub fn register_merkle_batch(
+        env: Env,
+        issuer: Address,
+        batch_id: BytesN<32>,
+        credential_ids: Vec<BytesN<32>>,
+    ) -> Result<BytesN<32>, ContractError> {
+        issuer.require_auth();
+        Self::require_not_paused(&env)?;
+        Self::require_issuer(&env, &issuer)?;
+        if credential_ids.len() == 0 || credential_ids.len() > MAX_MERKLE_LEAVES {
+            return Err(ContractError::BatchTooLarge);
+        }
+        let root = merkle::build_root(&env, &credential_ids);
+        let batch = MerkleBatch {
+            batch_id: batch_id.clone(),
+            issuer: issuer.clone(),
+            root: root.clone(),
+            leaf_count: credential_ids.len(),
+            leaves: credential_ids,
+            updated_at: env.ledger().timestamp(),
+        };
+        let batch_key = (MERKLE_BATCH, batch_id.clone());
+        env.storage().persistent().set(&batch_key, &batch);
+        env.storage()
+            .persistent()
+            .extend_ttl(&batch_key, TTL_MAX, TTL_MAX);
+        let root_key = (MERKLE_ROOT, batch_id.clone());
+        env.storage().persistent().set(&root_key, &root);
+        env.storage()
+            .persistent()
+            .extend_ttl(&root_key, TTL_MAX, TTL_MAX);
+        env.events().publish(
+            (CRED, symbol_short!("mrklreg")),
+            (EVENT_VERSION, batch_id, issuer, root.clone()),
+        );
+        Ok(root)
+    }
+
+    /// Returns the stored Merkle root for `batch_id`, or the all-zero hash when
+    /// no batch has been registered under that id.
+    pub fn get_merkle_root(env: Env, batch_id: BytesN<32>) -> BytesN<32> {
+        env.storage()
+            .persistent()
+            .get(&(MERKLE_ROOT, batch_id))
+            .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
+    }
+
+    /// Returns the full stored batch metadata (root, leaf count, leaves).
+    pub fn get_merkle_batch(
+        env: Env,
+        batch_id: BytesN<32>,
+    ) -> Result<MerkleBatch, ContractError> {
+        env.storage()
+            .persistent()
+            .get(&(MERKLE_BATCH, batch_id))
+            .ok_or(ContractError::CredentialNotFound)
+    }
+
+    /// Generates an inclusion proof for `credential_id` in the batch stored
+    /// under `batch_id`. This is the on-chain counterpart of the off-chain
+    /// proof-generation SDK helper.
+    pub fn get_merkle_proof(
+        env: Env,
+        batch_id: BytesN<32>,
+        credential_id: BytesN<32>,
+    ) -> Result<MerkleProof, ContractError> {
+        let batch: MerkleBatch = env
+            .storage()
+            .persistent()
+            .get(&(MERKLE_BATCH, batch_id.clone()))
+            .ok_or(ContractError::CredentialNotFound)?;
+        merkle::build_proof(&env, &batch.leaves, &credential_id)
+            .ok_or(ContractError::CredentialNotFound)
+    }
+
+    /// Verifies a Merkle inclusion proof against the root stored for `batch_id`.
+    ///
+    /// The proof is rejected (returns `false`) if the batch is unknown, the
+    /// proof shape is malformed, or the recomputed root does not match. This is
+    /// a pure read: no storage is written, keeping verification cheap.
+    pub fn verify_merkle_proof(
+        env: Env,
+        batch_id: BytesN<32>,
+        proof: MerkleProof,
+    ) -> bool {
+        let stored_root: BytesN<32> = match env
+            .storage()
+            .persistent()
+            .get(&(MERKLE_ROOT, batch_id))
+        {
+            Some(root) => root,
+            None => return false,
+        };
+        merkle::verify_proof(&env, &stored_root, &proof)
+    }
+
+    /// Incrementally adds a leaf to an existing batch and updates the stored
+    /// root. Only the batch's original issuer may update it. Adding a leaf that
+    /// is already present is a no-op that returns the current root.
+    pub fn update_merkle_batch(
+        env: Env,
+        issuer: Address,
+        batch_id: BytesN<32>,
+        credential_id: BytesN<32>,
+    ) -> Result<BytesN<32>, ContractError> {
+        issuer.require_auth();
+        Self::require_not_paused(&env)?;
+        let batch_key = (MERKLE_BATCH, batch_id.clone());
+        let mut batch: MerkleBatch = env
+            .storage()
+            .persistent()
+            .get(&batch_key)
+            .ok_or(ContractError::CredentialNotFound)?;
+        if batch.issuer != issuer {
+            return Err(ContractError::UnauthorizedIssuer);
+        }
+        if batch.leaves.contains(&credential_id) {
+            return Ok(batch.root);
+        }
+        if batch.leaf_count >= MAX_MERKLE_LEAVES {
+            return Err(ContractError::BatchTooLarge);
+        }
+        batch.leaves.push_back(credential_id.clone());
+        batch.leaf_count = batch.leaves.len();
+        batch.root = merkle::build_root(&env, &batch.leaves);
+        batch.updated_at = env.ledger().timestamp();
+        let root = batch.root.clone();
+        env.storage().persistent().set(&batch_key, &batch);
+        env.storage()
+            .persistent()
+            .extend_ttl(&batch_key, TTL_MAX, TTL_MAX);
+        let root_key = (MERKLE_ROOT, batch_id.clone());
+        env.storage().persistent().set(&root_key, &root);
+        env.storage()
+            .persistent()
+            .extend_ttl(&root_key, TTL_MAX, TTL_MAX);
+        env.events().publish(
+            (CRED, symbol_short!("mrklupd")),
+            (EVENT_VERSION, batch_id, issuer, root.clone()),
+        );
+        Ok(root)
     }
 
     /// Returns the Merkle root for the revocation period containing `timestamp`.
@@ -4549,6 +4713,141 @@ mod tests {
         assert_eq!(
             client.try_revoke_delegation(&subject, &delegate),
             Err(Ok(ContractError::DelegationNotFound))
+        );
+    }
+
+    // ── Merkle batch tests (#1056) ────────────────────────────────────────────
+
+    fn merkle_batch_id(env: &Env, tag: u8) -> BytesN<32> {
+        BytesN::from_array(env, &[tag; 32])
+    }
+
+    #[test]
+    fn test_register_merkle_batch_stores_root() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        client.add_issuer(&issuer);
+
+        let mut ids = Vec::new(&env);
+        for i in 0..4u8 {
+            ids.push_back(BytesN::from_array(&env, &[i + 1; 32]));
+        }
+        let batch_id = merkle_batch_id(&env, 7);
+        let root = client.register_merkle_batch(&issuer, &batch_id, &ids);
+
+        assert_eq!(client.get_merkle_root(&batch_id), root);
+        let batch = client.get_merkle_batch(&batch_id);
+        assert_eq!(batch.leaf_count, 4);
+        assert_eq!(batch.issuer, issuer);
+    }
+
+    #[test]
+    fn test_merkle_proof_verifies_for_every_leaf() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        client.add_issuer(&issuer);
+
+        let mut ids = Vec::new(&env);
+        for i in 0..5u8 {
+            ids.push_back(BytesN::from_array(&env, &[i + 1; 32]));
+        }
+        let batch_id = merkle_batch_id(&env, 8);
+        client.register_merkle_batch(&issuer, &batch_id, &ids);
+
+        for id in ids.iter() {
+            let proof = client.get_merkle_proof(&batch_id, &id);
+            assert!(client.verify_merkle_proof(&batch_id, &proof));
+        }
+    }
+
+    #[test]
+    fn test_merkle_proof_rejects_tampered_leaf() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        client.add_issuer(&issuer);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(BytesN::from_array(&env, &[1u8; 32]));
+        ids.push_back(BytesN::from_array(&env, &[2u8; 32]));
+        let batch_id = merkle_batch_id(&env, 9);
+        client.register_merkle_batch(&issuer, &batch_id, &ids);
+
+        let mut proof = client.get_merkle_proof(&batch_id, &ids.get(0).unwrap());
+        proof.leaf = BytesN::from_array(&env, &[99u8; 32]);
+        assert!(!client.verify_merkle_proof(&batch_id, &proof));
+    }
+
+    #[test]
+    fn test_merkle_proof_unknown_batch_is_false() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        client.add_issuer(&issuer);
+        let mut ids = Vec::new(&env);
+        ids.push_back(BytesN::from_array(&env, &[1u8; 32]));
+        let batch_id = merkle_batch_id(&env, 10);
+        client.register_merkle_batch(&issuer, &batch_id, &ids);
+        let proof = client.get_merkle_proof(&batch_id, &ids.get(0).unwrap());
+
+        let unknown = merkle_batch_id(&env, 11);
+        assert!(!client.verify_merkle_proof(&unknown, &proof));
+    }
+
+    #[test]
+    fn test_incremental_merkle_update_changes_root_and_keeps_proofs_valid() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        client.add_issuer(&issuer);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(BytesN::from_array(&env, &[1u8; 32]));
+        ids.push_back(BytesN::from_array(&env, &[2u8; 32]));
+        let batch_id = merkle_batch_id(&env, 12);
+        let root_before = client.register_merkle_batch(&issuer, &batch_id, &ids);
+
+        let new_leaf = BytesN::from_array(&env, &[3u8; 32]);
+        let root_after = client.update_merkle_batch(&issuer, &batch_id, &new_leaf);
+        assert_ne!(root_before, root_after);
+        assert_eq!(client.get_merkle_root(&batch_id), root_after);
+
+        // The newly added leaf has a valid proof against the updated root.
+        let proof = client.get_merkle_proof(&batch_id, &new_leaf);
+        assert!(client.verify_merkle_proof(&batch_id, &proof));
+
+        // Re-adding an existing leaf is a no-op.
+        assert_eq!(
+            client.update_merkle_batch(&issuer, &batch_id, &new_leaf),
+            root_after
+        );
+    }
+
+    #[test]
+    fn test_incremental_merkle_update_rejects_non_issuer() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        client.add_issuer(&issuer);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(BytesN::from_array(&env, &[1u8; 32]));
+        let batch_id = merkle_batch_id(&env, 13);
+        client.register_merkle_batch(&issuer, &batch_id, &ids);
+
+        assert_eq!(
+            client.try_update_merkle_batch(&attacker, &batch_id, &BytesN::from_array(&env, &[2u8; 32])),
+            Err(Ok(ContractError::UnauthorizedIssuer))
+        );
+    }
+
+    #[test]
+    fn test_register_merkle_batch_rejects_empty_and_oversized() {
+        let (env, _admin, client) = setup();
+        let issuer = Address::generate(&env);
+        client.add_issuer(&issuer);
+        let batch_id = merkle_batch_id(&env, 14);
+
+        assert_eq!(
+            client.try_register_merkle_batch(&issuer, &batch_id, &Vec::new(&env)),
+            Err(Ok(ContractError::BatchTooLarge))
         );
     }
 }
