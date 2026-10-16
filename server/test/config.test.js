@@ -158,6 +158,12 @@ test('loadConfig — uses hardcoded default when neither RPC_URL nor STELLAR_RPC
   assert.strictEqual(config.rpcUrl, 'https://soroban-testnet.stellar.org', 'loadConfig should use hardcoded testnet default');
 });
 
+test('MOCK_API_ENABLED is opt-in and cannot enable mock routes in production', () => {
+  assert.equal(loadConfig({}).mockApiEnabled, false);
+  assert.equal(loadConfig({ MOCK_API_ENABLED: 'true', NODE_ENV: 'development' }).mockApiEnabled, true);
+  assert.equal(loadConfig({ MOCK_API_ENABLED: 'true', NODE_ENV: 'production' }).mockApiEnabled, false);
+});
+
 test('validateConfig — accepts RPC_URL as valid alternative to STELLAR_RPC_URL', () => {
   const result = validateConfig({
     STELLAR_SECRET_KEY: 'SAXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',

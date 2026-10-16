@@ -1,4 +1,5 @@
 import { logger } from './logger.js';
+import { correlationHeaders } from './middleware/tracing.js';
 
 /**
  * Render the subject line for an expiry reminder.
@@ -199,7 +200,7 @@ export class EmailTransport {
     const startTime = Date.now();
     const response = await this.fetchImpl(this.config.emailApiUrl, {
       method: 'POST',
-      headers,
+      headers: { ...headers, ...correlationHeaders() },
       body,
     });
     const durationMs = Date.now() - startTime;

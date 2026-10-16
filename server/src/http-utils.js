@@ -391,16 +391,6 @@ export function notFound(res, req = null) {
  * @param {string[]} requiredScopes - Array of required scopes (e.g., ['credentials:write'])
  * @returns {boolean} True if authenticated and authorized, false otherwise
  */
-export function requireAuth(req, res, config, requiredScopes = []) {
-  if (!config.adminApiKey) {
-    sendFormatted(req, res, 503, { 
-      error: "admin_api_key_not_configured",
-      code: "SERVICE_UNAVAILABLE",
-      message: "API key authentication is not configured"
-    });
-    return false;
-  }
-  
 export async function requireAuth(req, res, config, requiredScopes = []) {
   const token =
     req.headers["x-api-key"] ||

@@ -1,6 +1,7 @@
 import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { logger } from './logger.js';
+import { correlationHeaders } from './middleware/tracing.js';
 
 const DEFAULT_REFRESH_FRACTION = 0.8;
 const MIN_REFRESH_SECONDS = 30;
@@ -61,7 +62,7 @@ export class VaultLeaseManager {
     }
     const response = await this.fetch(`${this.address}/v1/auth/jwt/login`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...correlationHeaders() },
       body: JSON.stringify({ role, jwt }),
     });
     if (!response.ok) throw new Error(`Vault JWT login failed with HTTP ${response.status}`);
@@ -93,7 +94,7 @@ export class VaultLeaseManager {
     let leaseDurationSeconds = Number.POSITIVE_INFINITY;
     for (const secretPath of this.paths) {
       const response = await this.fetch(`${this.address}/v1/${secretPath}`, {
-        headers: { 'x-vault-token': token },
+        headers: { 'x-vault-token': token, ...correlationHeaders() },
       });
       if (!response.ok) throw new Error(`Vault read failed for ${secretPath} with HTTP ${response.status}`);
       const body = await response.json();

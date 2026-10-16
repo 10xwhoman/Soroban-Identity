@@ -212,7 +212,15 @@ export async function appendAuditLog(config, entry) {
 
   const context = requestContextStore.getStore();
   const tenant_id = entry.tenant_id || context?.tenantId || config?.tenantId || 'default';
-  const record = { timestamp: new Date().toISOString(), tenant_id, ...entry };
+  const requestId = entry.requestId ?? context?.requestId ?? context?.correlationId;
+  const correlationId = entry.correlationId ?? context?.correlationId ?? requestId;
+  const record = {
+    timestamp: new Date().toISOString(),
+    tenant_id,
+    ...entry,
+    ...(requestId ? { requestId } : {}),
+    ...(correlationId ? { correlationId } : {}),
+  };
   const line = `${JSON.stringify(record)}\n`;
 
   // Acquire a per-file mutex so concurrent callers queue up and each write
