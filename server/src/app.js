@@ -47,6 +47,16 @@ import {
   validateContentType,
 } from "./http-utils.js";
 import { KEY_ID_HEADER, NonceStore, verifySignedRequest } from "./request-signing.js";
+import {
+  ENCRYPTION_KEY_ID_HEADER,
+  ENCRYPTION_ENABLED_HEADER,
+  SessionKeyRegistry,
+  decryptSensitiveRequestFields,
+  encryptSensitiveResponseFields,
+  isEncryptionEnabled,
+  negotiateSessionKey,
+  wrapResponseEncryption,
+} from "./response-encryption.js";
 import { normalizeCspReports, setSecurityHeaders } from "./security-headers.js";
 import {
   CREDENTIAL_STATUS_TYPE,
@@ -129,6 +139,7 @@ export function createApp({
   quotaTracker = null,
   deprecationRegistry = null,
   ddosProtection = null,
+  sessionKeyRegistry = null,
 }) {
   // Expose the key service on config so http-utils.requireAuth can validate
   // issued API keys instead of falling back to the single admin key.
@@ -179,6 +190,17 @@ export function createApp({
         if (!apiKeyId || !deprecation.shouldNotify(apiKeyId, rule.name)) return undefined;
         return notifyDeprecatedEndpointOwner({ config, apiKeyService, emailTransport, apiKeyId, rule });
       },
+    });
+
+  // Per-session AES-GCM key registry (#1049). Keys are generated per session,
+  // rotated on demand, and never persisted: a restart simply invalidates the
+  // sessions that were using them.
+  const encryptionKeys =
+    sessionKeyRegistry ??
+    new SessionKeyRegistry({
+      ttlSeconds: config.encryptionSessionKeyTtlSeconds,
+      rotationSeconds: config.encryptionKeyRotationSeconds,
+      maxKeys: config.encryptionMaxSessionKeys,
     });
 
   const tenantRegistry = new TenantRegistry(config);
@@ -279,6 +301,16 @@ export function createApp({
       return res.writeHead(204).end();
     }
 
+    // End-to-end encryption for sensitive credential data (#1049). The
+    // middleware wraps sendJson/sendFormatted so any response body produced
+    // downstream is encrypted with the session key the client negotiated.
+    // It is a no-op unless the feature is enabled and the client presented a
+    // key id, so existing clients are unaffected.
+    if (isEncryptionEnabled(config)) {
+      res.setHeader("X-Encryption-Supported", "aes-256-gcm");
+      wrapResponseEncryption(req, res, { config, registry: encryptionKeys });
+    }
+
     // Record analytics when response completes
     res.on("finish", () => {
       const durationMs = Math.max(0, Date.now() - startTime);
@@ -305,9 +337,100 @@ export function createApp({
     });
 
         if (await handleMockApiRequest(req, res, config)) return;
+
+    // Session key exchange (#1049). Unauthenticated by design: the key it
+    // returns is only useful to the client that generated the ephemeral
+    // keypair, and it carries no authority of its own. The response is
+    // deliberately not encrypted — it is what establishes the key.
+    if (req.method === "POST" && pathname === "/encryption/session") {
+      if (validateContentType(req, res)) return;
+      const body = await readJson(req, config);
+      if (body.__payloadTooLarge) {
+        return sendJson(res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
+      }
+      const validated = validateRequest(res, schemas.encryptionSession, { body });
+      if (!validated.ok) return;
+      try {
+        const negotiated = negotiateSessionKey({
+          config,
+          registry: encryptionKeys,
+          clientPublicKey: validated.data.body.clientPublicKey,
+          clientKeyId: validated.data.body.keyId ?? null,
+        });
+        return sendJson(res, 201, negotiated);
+      } catch (err) {
+        logger.warn({ error: err.message }, "Session key negotiation failed");
+        return sendJson(res, 400, {
+          error: "key_exchange_failed",
+          code: "KEY_EXCHANGE_FAILED",
+          message: err.message,
+        });
+      }
+    }
+
+    // Key rotation (#1049). A client that holds a key id may ask for a fresh
+    // key; the old one stays valid until its TTL elapses so in-flight
+    // responses encrypted with it can still be decrypted.
+    if (req.method === "POST" && pathname === "/encryption/rotate") {
+      const keyId = req.headers[ENCRYPTION_KEY_ID_HEADER] ?? null;
+      if (!keyId) {
+        return sendJson(res, 400, {
+          error: "missing_key_id",
+          code: "MISSING_KEY_ID",
+          message: `Provide the current session key id in the ${ENCRYPTION_KEY_ID_HEADER} header.`,
+        });
+      }
+      const rotated = encryptionKeys.rotate(keyId);
+      if (!rotated) {
+        return sendJson(res, 404, {
+          error: "unknown_key_id",
+          code: "UNKNOWN_KEY_ID",
+          message: "The supplied session key id is unknown or has expired.",
+        });
+      }
+      res.setHeader(ENCRYPTION_KEY_ID_HEADER, rotated.keyId);
+      return sendJson(res, 200, {
+        keyId: rotated.keyId,
+        algorithm: rotated.algorithm,
+        expiresAt: rotated.expiresAt,
+        previousKeyId: keyId,
+      });
+    }
+
     // Validate well-known request headers before any routing or auth work.
     if (!validateRequest(res, schemas.commonHeaders, { headers: req.headers }).ok) {
       return;
+    }
+
+    // Decrypt sensitive request fields (#1049) before any handler reads the
+    // body. The body is buffered and memoised, so readJson downstream sees
+    // the plaintext. A request that claims encryption but cannot be
+    // decrypted is rejected rather than silently processed as plaintext.
+    if (isEncryptionEnabled(config) && req.headers[ENCRYPTION_ENABLED_HEADER]) {
+      const { tooLarge, buffer } = await readRawBody(req, config);
+      if (tooLarge) {
+        return sendJson(res, 413, {
+          code: "PAYLOAD_TOO_LARGE",
+          message: "Request body exceeds the size limit.",
+        });
+      }
+      const decrypted = decryptSensitiveRequestFields({
+        headers: req.headers,
+        body: buffer,
+        registry: encryptionKeys,
+      });
+      if (!decrypted.ok) {
+        logger.warn({ code: decrypted.code, route: routeLabel(pathname) }, "Rejected encrypted request");
+        return sendJson(res, decrypted.status, {
+          error: "decryption_failed",
+          code: decrypted.code,
+          message: decrypted.message,
+        });
+      }
+      if (decrypted.body !== null) {
+        req.rawBody = decrypted.body;
+        req.encryptionKeyId = decrypted.keyId ?? null;
+      }
     }
 
     // Extract tier and API key ID from API key or headers early if present
@@ -512,6 +635,14 @@ export function createApp({
             supportedVersions: SUPPORTED_VERSIONS,
             features: SERVER_FEATURES,
             minSdkVersion: MIN_SDK_VERSION,
+            encryption: {
+              enabled: isEncryptionEnabled(config),
+              algorithm: "aes-256-gcm",
+              keyExchange: "/encryption/session",
+              rotation: "/encryption/rotate",
+              keyIdHeader: ENCRYPTION_KEY_ID_HEADER,
+              encryptedFields: ["claims", "subject", "credentialSubject"],
+            },
           });
         }
 
@@ -860,6 +991,57 @@ export function createApp({
             credentialId,
             ...status,
             checkedAt: new Date().toISOString(),
+          });
+        }
+
+        // Encrypted credential payload (#1049). Returns only the sensitive
+        // fields, encrypted with the caller's session key, so a client can
+        // fetch credential material without it ever appearing in plaintext
+        // on the wire.
+        const encryptedCredentialMatch = pathname.match(/^\/credentials\/([^/]+)\/encrypted$/);
+        if (req.method === "GET" && encryptedCredentialMatch) {
+          if (!await requireAuth(req, res, config, ['credentials:read'])) return;
+          const credentialId = decodeURIComponent(encryptedCredentialMatch[1]);
+          if (!validateRequest(res, schemas.credentialByIdParams, { params: { credentialId } }).ok) {
+            return;
+          }
+          const keyId = req.headers[ENCRYPTION_KEY_ID_HEADER] ?? null;
+          if (!keyId || !encryptionKeys.has(keyId)) {
+            return sendJson(res, 400, {
+              error: "missing_session_key",
+              code: "MISSING_SESSION_KEY",
+              message: `Negotiate a session key at POST /encryption/session and send it in the ${ENCRYPTION_KEY_ID_HEADER} header.`,
+            });
+          }
+          const credentials = await readCredentials(config);
+          const credential = credentials.find((c) => c.id === credentialId);
+          if (!credential) return notFound(res, req);
+
+          const sensitive = {
+            claims: credential.claims ?? null,
+            subject: credential.subject ?? null,
+            credentialSubject: credential.credentialSubject ?? null,
+          };
+          const encrypted = encryptSensitiveResponseFields(sensitive, {
+            registry: encryptionKeys,
+            keyId,
+          });
+          if (!encrypted) {
+            return sendJson(res, 500, {
+              error: "encryption_failed",
+              code: "ENCRYPTION_FAILED",
+              message: "Unable to encrypt the credential payload.",
+            });
+          }
+          res.setHeader(ENCRYPTION_KEY_ID_HEADER, encrypted.keyId);
+          return sendJson(res, 200, {
+            credentialId,
+            algorithm: encrypted.algorithm,
+            keyId: encrypted.keyId,
+            iv: encrypted.iv,
+            tag: encrypted.tag,
+            ciphertext: encrypted.ciphertext,
+            encryptedAt: new Date().toISOString(),
           });
         }
 
@@ -1744,6 +1926,42 @@ export function createApp({
             logger.error({ error: err.message, stack: err.stack }, 'Failed to export audit logs');
             return sendJson(res, 500, { error: 'audit_log_export_failed', message: err.message });
           }
+        }
+
+        // Session key lifecycle (#1049): a client can inspect and drop the
+        // keys it negotiated without going through the admin surface.
+        if (req.method === "GET" && pathname === "/encryption/keys") {
+          const keyId = req.headers[ENCRYPTION_KEY_ID_HEADER] ?? null;
+          if (!keyId) {
+            return sendJson(res, 400, {
+              error: "missing_key_id",
+              code: "MISSING_KEY_ID",
+              message: `Provide the session key id in the ${ENCRYPTION_KEY_ID_HEADER} header.`,
+            });
+          }
+          const key = encryptionKeys.describe(keyId);
+          if (!key) {
+            return sendJson(res, 404, {
+              error: "unknown_key_id",
+              code: "UNKNOWN_KEY_ID",
+              message: "The supplied session key id is unknown or has expired.",
+            });
+          }
+          return sendJson(res, 200, key);
+        }
+
+        if (req.method === "DELETE" && pathname === "/encryption/keys") {
+          const keyId = req.headers[ENCRYPTION_KEY_ID_HEADER] ?? null;
+          if (!keyId) {
+            return sendJson(res, 400, {
+              error: "missing_key_id",
+              code: "MISSING_KEY_ID",
+              message: `Provide the session key id in the ${ENCRYPTION_KEY_ID_HEADER} header.`,
+            });
+          }
+          const revoked = encryptionKeys.revoke(keyId);
+          if (!revoked) return notFound(res);
+          return sendJson(res, 200, { revoked: true, keyId });
         }
 
         // Multi-tenant administration and provisioning endpoints (#800)

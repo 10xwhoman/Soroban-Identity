@@ -317,6 +317,61 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
   const [selectedCredentialsForExport, setSelectedCredentialsForExport] = useState<Set<string>>(new Set());
   const [sharingCredential, setSharingCredential] = useState<Credential | null>(null);
 
+  // ── Credential comparison (#1048) ───────────────────────────────────────
+  // Selection is separate from the export selection so the two features don't
+  // interfere with each other. 2-4 credentials can be compared at once.
+  const MIN_COMPARE = 2;
+  const MAX_COMPARE = 4;
+  const [selectedForComparison, setSelectedForComparison] = useState<Set<string>>(new Set());
+  const [showComparison, setShowComparison] = useState(false);
+  const [comparisonIds, setComparisonIds] = useState<string[]>([]);
+
+  const toggleComparisonSelection = (credentialId: string) => {
+    setSelectedForComparison((prev) => {
+      const next = new Set(prev);
+      if (next.has(credentialId)) {
+        next.delete(credentialId);
+      } else if (next.size < MAX_COMPARE) {
+        next.add(credentialId);
+      } else {
+        toast.error(`You can compare at most ${MAX_COMPARE} credentials at once.`);
+      }
+      return next;
+    });
+  };
+
+  const openComparison = (ids: string[]) => {
+    if (ids.length < MIN_COMPARE || ids.length > MAX_COMPARE) {
+      toast.error(`Select between ${MIN_COMPARE} and ${MAX_COMPARE} credentials to compare.`);
+      return;
+    }
+    setComparisonIds(ids);
+    setShowComparison(true);
+  };
+
+  // Shareable-link entry point: read `compare` credential IDs from the URL and
+  // open the comparison view automatically once the credentials are available.
+  const [pendingCompareIds] = useState<string[]>(() => {
+    const raw = new URLSearchParams(window.location.search).get("compare");
+    if (!raw) return [];
+    return raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, MAX_COMPARE);
+  });
+
+  useEffect(() => {
+    if (pendingCompareIds.length < MIN_COMPARE) return;
+    if (displayCredentials.length === 0) return;
+    const available = pendingCompareIds.filter((id) => displayCredentials.some((c) => c.id === id));
+    if (available.length >= MIN_COMPARE) {
+      setSelectedForComparison(new Set(available));
+      setComparisonIds(available);
+      setShowComparison(true);
+    }
+  }, [pendingCompareIds, fetchedCredentials]);
+
   // ── Pagination ──────────────────────────────────────────────────────────
   const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
   const readIntParam = (name: string, fallback: number): number => {
@@ -730,6 +785,22 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
     setSelectedCredentialsForExport(newSet);
   };
 
+  const handleCopyComparisonLink = async () => {
+    const ids = Array.from(selectedForComparison);
+    if (ids.length < MIN_COMPARE) {
+      toast.error(`Select at least ${MIN_COMPARE} credentials to share a comparison link.`);
+      return;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.set("compare", ids.join(","));
+    try {
+      await navigator.clipboard.writeText(url.toString());
+      toast.success("Comparison link copied to clipboard.");
+    } catch {
+      toast.error("Could not copy the comparison link.");
+    }
+  };
+
   const displayCredentials = fetchedCredentials ?? [];
 
   const filteredCredentials =
@@ -1071,6 +1142,84 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
             Last checked: {formatCheckedAt(lastCheckedAt)} (auto-refreshes every 30s)
           </p>
         )}
+
+        {/* Comparison selection toolbar (#1048) */}
+        {displayCredentials.length >= MIN_COMPARE && (
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              alignItems: "center",
+              gap: "0.5rem",
+              marginBottom: "1rem",
+              padding: "0.5rem 0.75rem",
+              background: "var(--card-bg-accent)",
+              borderRadius: "0.5rem",
+              fontSize: "0.85rem",
+            }}
+          >
+            <span style={{ color: "var(--text-muted)" }}>
+              Compare ({selectedForComparison.size}/{MAX_COMPARE}):
+            </span>
+            <button
+              type="button"
+              onClick={() => openComparison(Array.from(selectedForComparison))}
+              disabled={selectedForComparison.size < MIN_COMPARE}
+              onMouseEnter={preloadCredentialComparison}
+              onFocus={preloadCredentialComparison}
+              style={{
+                padding: "0.35rem 0.85rem",
+                backgroundColor: "var(--accent-light)",
+                color: "white",
+                border: "none",
+                borderRadius: "0.25rem",
+                cursor: selectedForComparison.size < MIN_COMPARE ? "not-allowed" : "pointer",
+                fontSize: "0.85rem",
+                fontWeight: 500,
+                opacity: selectedForComparison.size < MIN_COMPARE ? 0.6 : 1,
+              }}
+              title={`Compare ${selectedForComparison.size} selected credential(s)`}
+            >
+              ⚖ Compare
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleCopyComparisonLink()}
+              disabled={selectedForComparison.size < MIN_COMPARE}
+              style={{
+                padding: "0.35rem 0.85rem",
+                backgroundColor: "transparent",
+                color: "var(--accent-light)",
+                border: "1px solid var(--accent-light)",
+                borderRadius: "0.25rem",
+                cursor: selectedForComparison.size < MIN_COMPARE ? "not-allowed" : "pointer",
+                fontSize: "0.85rem",
+                fontWeight: 500,
+                opacity: selectedForComparison.size < MIN_COMPARE ? 0.6 : 1,
+              }}
+              title="Copy a shareable comparison link"
+            >
+              🔗 Copy link
+            </button>
+            {selectedForComparison.size > 0 && (
+              <button
+                type="button"
+                onClick={() => setSelectedForComparison(new Set())}
+                style={{
+                  padding: "0.35rem 0.85rem",
+                  backgroundColor: "transparent",
+                  color: "var(--text-muted)",
+                  border: "1px solid var(--border-input)",
+                  borderRadius: "0.25rem",
+                  cursor: "pointer",
+                  fontSize: "0.85rem",
+                }}
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        )}
         <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginBottom: "1rem" }}>
           {EXPIRY_FILTER_OPTIONS.map((status) => {
             const count = countByExpiry(displayCredentials, status);
@@ -1161,7 +1310,18 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
                       toggleCredentialSelection(cred.id);
                     }}
                     style={{ cursor: "pointer" }}
-                    aria-label={`Select credential ${cred.id}`}
+                    aria-label={`Select credential ${cred.id} for export`}
+                  />
+                  <input
+                    type="checkbox"
+                    checked={selectedForComparison.has(cred.id)}
+                    onChange={(e) => {
+                      e.stopPropagation();
+                      toggleComparisonSelection(cred.id);
+                    }}
+                    style={{ cursor: "pointer" }}
+                    aria-label={`Select credential ${cred.id} for comparison`}
+                    title="Select for comparison"
                   />
                   <span style={{ fontSize: "1.2rem", minWidth: "1.5rem" }}>
                     {CREDENTIAL_TYPE_ICONS[cred.credentialType] || "📋"}
@@ -1591,6 +1751,16 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
           <CredentialShare
             credential={sharingCredential}
             onClose={() => setSharingCredential(null)}
+          />
+        </Suspense>
+      )}
+
+      {/* Comparison Modal (#1048) */}
+      {showComparison && comparisonIds.length >= MIN_COMPARE && (
+        <Suspense fallback={<LoadingFallback />}>
+          <CredentialComparison
+            credentials={displayCredentials.filter((c) => comparisonIds.includes(c.id))}
+            onClose={() => setShowComparison(false)}
           />
         </Suspense>
       )}

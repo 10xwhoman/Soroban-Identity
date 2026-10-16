@@ -141,6 +141,27 @@ export const DEFAULT_CORS_EXPOSED_HEADERS = [
 /** Preflight cache lifetime in seconds. Browsers cap this themselves. */
 export const DEFAULT_CORS_MAX_AGE = 86400;
 
+/**
+ * Response fields encrypted with AES-256-GCM before leaving the server (#1049).
+ * These are the credential payloads that carry secrets or personal data; the
+ * list is matched against response body keys when the encryption layer is on.
+ */
+export const DEFAULT_ENCRYPTION_SENSITIVE_FIELDS = [
+  "secretKey",
+  "privateKey",
+  "seed",
+  "mnemonic",
+  "password",
+  "apiKey",
+  "credentialSubject",
+];
+
+/** How often (seconds) the session key is rotated. */
+export const DEFAULT_ENCRYPTION_KEY_ROTATION_SECONDS = 300;
+
+/** How long (seconds) a session key stays valid before clients must re-exchange. */
+export const DEFAULT_ENCRYPTION_SESSION_TTL_SECONDS = 900;
+
 function parseThresholds(value, fallback = [30, 7, 1]) {
   if (!value) return fallback;
   try {
@@ -182,6 +203,25 @@ export function loadConfig(env = process.env) {
     ),
     corsMaxAge: parseInteger(env.CORS_MAX_AGE, DEFAULT_CORS_MAX_AGE, true),
     maxBodyBytes: parseInteger(env.MAX_BODY_BYTES, 64 * 1024),
+    // End-to-end encryption of sensitive credential data in transit (#1049).
+    // Off by default: enabling it changes the response shape for the fields
+    // listed in ENCRYPTION_SENSITIVE_FIELDS, so clients must be updated to
+    // decrypt before this is switched on.
+    encryptionEnabled: parseBoolean(env.ENCRYPTION_ENABLED, false),
+    // Session keys are rotated on this interval; must be shorter than the
+    // session TTL so a client always has a window in which its key is valid.
+    encryptionKeyRotationSeconds: parseInteger(
+      env.ENCRYPTION_KEY_ROTATION_SECONDS,
+      DEFAULT_ENCRYPTION_KEY_ROTATION_SECONDS,
+    ),
+    encryptionSessionTtlSeconds: parseInteger(
+      env.ENCRYPTION_SESSION_TTL_SECONDS,
+      DEFAULT_ENCRYPTION_SESSION_TTL_SECONDS,
+    ),
+    encryptionSensitiveFields: parseList(
+      env.ENCRYPTION_SENSITIVE_FIELDS,
+      DEFAULT_ENCRYPTION_SENSITIVE_FIELDS,
+    ),
     // HMAC request signing (#752). Off by default: turning it on is a
     // breaking change for existing clients, which must be given their signing
     // secrets before their requests start being rejected.
@@ -433,6 +473,8 @@ export function validateConfig(env = process.env) {
     { key: "OAUTH_AUTH_CODE_TTL_MS", desc: "must be a valid integer" },
     { key: "OAUTH_ACCESS_TOKEN_TTL_MS", desc: "must be a valid integer" },
     { key: "OAUTH_REFRESH_TOKEN_TTL_MS", desc: "must be a valid integer" },
+    { key: "ENCRYPTION_KEY_ROTATION_SECONDS", desc: "must be a valid integer" },
+    { key: "ENCRYPTION_SESSION_TTL_SECONDS", desc: "must be a valid integer" },
   ];
 
   for (const item of numericVars) {
@@ -537,6 +579,31 @@ export function validateConfig(env = process.env) {
     }
   }
 
+  const encryptionEnabled = parseBoolean(env.ENCRYPTION_ENABLED, false);
+  if (encryptionEnabled) {
+    const rotation = parseInteger(
+      env.ENCRYPTION_KEY_ROTATION_SECONDS,
+      DEFAULT_ENCRYPTION_KEY_ROTATION_SECONDS,
+    );
+    const ttl = parseInteger(
+      env.ENCRYPTION_SESSION_TTL_SECONDS,
+      DEFAULT_ENCRYPTION_SESSION_TTL_SECONDS,
+    );
+    // A rotation interval at or beyond the session TTL would let a key expire
+    // before it is ever rotated, leaving clients unable to decrypt responses.
+    if (rotation >= ttl) {
+      invalid.push(
+        "ENCRYPTION_KEY_ROTATION_SECONDS: must be less than ENCRYPTION_SESSION_TTL_SECONDS",
+      );
+    }
+    const fields = parseList(env.ENCRYPTION_SENSITIVE_FIELDS, []);
+    if (fields.length === 0) {
+      invalid.push(
+        "ENCRYPTION_SENSITIVE_FIELDS: must list at least one response field when ENCRYPTION_ENABLED is true",
+      );
+    }
+  }
+
   return {
     isValid: missing.length === 0 && invalid.length === 0,
     missing,
@@ -599,6 +666,19 @@ export function logDefaultValues(env = process.env) {
     { key: "CORS_ALLOWED_HEADERS", defaultVal: DEFAULT_CORS_ALLOWED_HEADERS.join(",") },
     { key: "CORS_EXPOSED_HEADERS", defaultVal: DEFAULT_CORS_EXPOSED_HEADERS.join(",") },
     { key: "CORS_MAX_AGE", defaultVal: String(DEFAULT_CORS_MAX_AGE) },
+    { key: "ENCRYPTION_ENABLED", defaultVal: "false" },
+    {
+      key: "ENCRYPTION_KEY_ROTATION_SECONDS",
+      defaultVal: String(DEFAULT_ENCRYPTION_KEY_ROTATION_SECONDS),
+    },
+    {
+      key: "ENCRYPTION_SESSION_TTL_SECONDS",
+      defaultVal: String(DEFAULT_ENCRYPTION_SESSION_TTL_SECONDS),
+    },
+    {
+      key: "ENCRYPTION_SENSITIVE_FIELDS",
+      defaultVal: DEFAULT_ENCRYPTION_SENSITIVE_FIELDS.join(","),
+    },
     { key: "JAEGER_ENABLED", defaultVal: "false" },
     { key: "JAEGER_SERVICE_NAME", defaultVal: "'soroban-identity-server'" },
     { key: "JAEGER_AGENT_HOST", defaultVal: "'localhost'" },
