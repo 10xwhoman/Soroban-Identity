@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { logger } from './logger.js';
+import { correlationHeaders } from './middleware/tracing.js';
 
 /**
  * Process start time, captured once at module load so uptime is measured from
@@ -83,7 +84,7 @@ export async function checkStorage(config, { fsImpl = fs } = {}) {
 export async function checkRpc(config, { fetchImpl = fetch } = {}) {
   const response = await fetchImpl(config.rpcUrl, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...correlationHeaders() },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
   });
 

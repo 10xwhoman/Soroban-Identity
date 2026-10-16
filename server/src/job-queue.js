@@ -1,5 +1,6 @@
 import { logger } from './logger.js';
 import { encodeCommand } from './redis-client.js';
+import { requestContextStore } from './request-context.js';
 
 /**
  * Job queue for asynchronous credential processing.
@@ -45,11 +46,15 @@ export class JobQueue {
     const jobId = options.jobId ?? `${jobType}:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`;
     const priority = this.priorityLevels[options.priority] ?? this.priorityLevels.normal;
     const delayMs = options.delayMs ?? 0;
+    const requestContext = requestContextStore.getStore() ?? {};
 
     const job = {
       id: jobId,
       type: jobType,
       data,
+      ...(requestContext.requestId ? { requestId: requestContext.requestId } : {}),
+      ...(requestContext.correlationId ? { correlationId: requestContext.correlationId } : {}),
+      ...(requestContext.tenantId ? { tenantId: requestContext.tenantId } : {}),
       priority,
       attempts: 0,
       maxAttempts: options.maxAttempts ?? this.maxRetries + 1,
@@ -203,8 +208,14 @@ export class JobQueue {
       await this.redisClient.command('SET', [jobKey, JSON.stringify(job)]);
 
       // Process with timeout
+      const context = {
+        ...(job.requestId ? { requestId: job.requestId } : {}),
+        ...(job.correlationId ? { correlationId: job.correlationId } : {}),
+        ...(job.tenantId ? { tenantId: job.tenantId } : {}),
+      };
+      const processJob = () => handler(job.data);
       const result = await Promise.race([
-        handler(job.data),
+        Object.keys(context).length ? requestContextStore.run(context, processJob) : processJob(),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error('Job processing timeout')), this.processingTimeoutMs)
         ),

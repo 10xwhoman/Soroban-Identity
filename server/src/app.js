@@ -1,12 +1,3 @@
-import { URL } from 'node:url';
-import crypto from 'node:crypto';
-import { appendAuditLog, readCredentials } from './storage.js';
-import { findExpiringCredentials, paginate } from './expiry.js';
-import { notFound, readJson, requireAdmin, sendJson, sendText } from './http-utils.js';
-import { requestContextStore } from './request-context.js';
-import { logger } from './logger.js';
-
-export function createApp({ config, soroban, metrics, metricsAggregator }) {
 import { URL } from "node:url";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
@@ -23,10 +14,6 @@ import {
 } from "./storage.js";
 import { findExpiringCredentials, paginate } from "./expiry.js";
 import {
-  buildPaginationMeta,
-  decodeOffsetCursor,
-  paginateArray,
-  resolvePageSize,
   setPaginationHeaders,
 } from "./routes/pagination.js";
 import {
@@ -91,13 +78,14 @@ import {
 import { routeLabel } from "./route-label.js";
 import { requestContextStore } from "./request-context.js";
 import { correlationMiddleware, handleTraceRoutes } from "./middleware/tracing.js";
-import { cursorPage, offsetMeta, offsetPage, pageNumberMeta, setPaginationHeaders } from "./routes/pagination.js";
+import { cursorPage, offsetMeta, offsetPage, pageNumberMeta } from "./routes/pagination.js";
 import { handleEventsRequest } from "./sse.js";
 import { handleLongPollRequest } from "./long-poll.js";
 import { logger } from "./logger.js";
 import { AnalyticsService, detectCountry } from "./analytics.js";
 import { createRateLimiter } from "./middleware/ratelimit.js";
 import { ApiKeyService } from "./api-keys.js";
+import { OAuthService } from "./oauth.js";
 import { UsageTracker } from "./analytics/usage.js";
 import { EmailTransport } from "./email.js";
 import { pickQuotaBinding, QuotaTracker, notifyQuotaThresholdOwner } from "./quota.js";
@@ -106,6 +94,8 @@ import { DdosProtection, ddosResponse } from "./ddos-protection.js";
 import { TenantRegistry, handleTenantRoutes, resolveTenantId } from "./tenancy/index.js";
 import { openTelemetryHttpMiddleware } from "./tracing/index.js";
 import { EventStore, EventReplayer, createEvent, EventTypes, handleEventSourcingRoutes } from "./events/index.js";
+import { handleMockApiRequest } from "./mock-api.js";
+import { collectHealth, collectReadiness } from "./health.js";
 const SERVER_VERSION = "0.1.0";
 const MIN_SDK_VERSION = "0.1.0";
 const SERVER_FEATURES = [
@@ -122,9 +112,6 @@ const SERVER_FEATURES = [
   "hateoas",
 ];
 
-export function createApp({ config, soroban, metrics, metricsAggregator, analytics = new AnalyticsService() }) {
-  return function app(req, res) {
-    const startTime = Date.now();
 const usageTracker = new UsageTracker();
 
 export function createApp({
@@ -132,6 +119,7 @@ export function createApp({
   soroban,
   metrics,
   metricsAggregator,
+  analytics = new AnalyticsService(),
   didCache = null,
   // Health and readiness probes only need something that can answer PING;
   // the DID cache already owns a connected client, so reuse it unless a
@@ -140,6 +128,8 @@ export function createApp({
   webhookService = new WebhookDeliveryService(config),
   apiKeyService = new ApiKeyService(config),
   oauthService = new OAuthService(config),
+  credentialIssueQueue = config.credentialIssueQueue ?? null,
+  batchVerificationQueue = config.batchVerificationQueue ?? null,
   rateLimiter = null,
   accessLogSink = null,
   realtime = null,
@@ -153,6 +143,7 @@ export function createApp({
   // Expose the key service on config so http-utils.requireAuth can validate
   // issued API keys instead of falling back to the single admin key.
   config.apiKeyService = apiKeyService;
+  config.oauthService = oauthService;
   
   // Expose job queues on config for route handlers
   config.credentialIssueQueue = credentialIssueQueue;
@@ -208,6 +199,7 @@ export function createApp({
   const eventReplayer = new EventReplayer(eventStore);
 
   return async function app(req, res) {
+    const startTime = Date.now();
     const url = new URL(
       req.url,
       `http://${req.headers.host ?? "localhost"}`,
@@ -237,16 +229,9 @@ export function createApp({
       });
     }
 
-    // Check if this is the metrics endpoint before setting X-Request-ID
+    // Correlation IDs are validated and normalized by the middleware, then
+    // used consistently for both request-ID aliases and downstream context.
     const isMetricsEndpoint = req.method === "GET" && pathname === "/metrics";
-    
-    // Generate requestId for all endpoints except metrics
-    const requestId = isMetricsEndpoint ? null : (req.headers["x-correlation-id"] || req.headers["x-request-id"] || crypto.randomUUID());
-    
-    if (!isMetricsEndpoint) {
-      res.setHeader("X-Request-ID", requestId);
-      res.setHeader("X-Correlation-ID", requestId);
-    }
 
     // Resolve tenant context (#800)
     const tenantId = resolveTenantId(req);
@@ -255,8 +240,10 @@ export function createApp({
 
     // Correlation ID + trace record (#946). Every response, including the
     // metrics endpoint, carries X-Correlation-ID.
-    const correlationId = correlationMiddleware(req, res, { requestId, path: pathname });
+    const correlationId = correlationMiddleware(req, res, { path: pathname });
+    const requestId = correlationId;
 
+    const handler = async () => {
     // Distributed Tracing with OpenTelemetry (#801)
     openTelemetryHttpMiddleware()(req, res);
 
@@ -327,10 +314,7 @@ export function createApp({
       });
     });
 
-    return requestContextStore.run({ requestId, correlationId }, async () => {
-      try {
-        if (req.method === "GET" && url.pathname === "/info") {
-          return sendFormatted(req, res, 200, {
+        if (await handleMockApiRequest(req, res, config)) return;
     // Validate well-known request headers before any routing or auth work.
     if (!validateRequest(res, schemas.commonHeaders, { headers: req.headers }).ok) {
       return;
@@ -531,32 +515,16 @@ export function createApp({
       }
     }
 
-    return requestContextStore.run({ ...(requestContextStore.getStore() || {}), requestId, tenantId }, async () => {
-      try {
-        const linkPrefix = resolveLinkPrefix({ version, isExplicitUrlVersion });
-
-        if (req.method === "GET" && (pathname === "/" || pathname === "/info")) {
-          const rootLinks = buildApiRootLinks(linkPrefix);
-          return sendJson(
-            res,
-            200,
-            {
-              version: SERVER_VERSION,
-              apiVersion: version,
-              supportedVersions: SUPPORTED_VERSIONS,
-              features: SERVER_FEATURES,
-              minSdkVersion: MIN_SDK_VERSION,
-              _links: rootLinks,
-            },
-            { Link: formatLinkHeader(rootLinks) },
-          );
+        if (req.method === "GET" && pathname === "/info") {
+          return sendJson(res, 200, {
+            version: SERVER_VERSION,
+            apiVersion: version,
+            supportedVersions: SUPPORTED_VERSIONS,
+            features: SERVER_FEATURES,
+            minSdkVersion: MIN_SDK_VERSION,
+          });
         }
 
-        if (req.method === "GET" && url.pathname === "/health") {
-          const contracts = await soroban.pingAllContracts();
-          const ok = Object.values(contracts).every(Boolean);
-          return sendFormatted(req, res, ok ? 200 : 503, {
-            status: ok ? "ok" : "degraded",
         // CSP violation reports (#754). Unauthenticated by necessity — the
         // browser posts these on its own behalf, with no credentials — so the
         // handler only ever logs and counts, and never trusts the contents.
@@ -685,12 +653,6 @@ export function createApp({
           return sendText(res, 200, body, metrics.contentType ? { "content-type": metrics.contentType } : {});
         }
 
-        // #390: paginated credential list
-        if (req.method === "GET" && url.pathname === "/credentials") {
-          const limitParam = url.searchParams.get("limit") ?? "50";
-          const limitNum = Number.parseInt(limitParam, 10) || 50;
-          if (limitNum > 200) {
-            return sendFormatted(req, res, 400, { code: "INVALID_REQUEST", message: "limit must not exceed 200" });
         // ── GraphQL Endpoint ─────────────────────────────────────────
         if (pathname === "/graphql") {
           if (req.method === "GET") {
@@ -752,23 +714,14 @@ export function createApp({
           });
           if (!validated.ok) return;
           const limitNum = validated.data.query.limit ?? 50;
+          const direction = validated.data.query.direction ?? "next";
           const credentials = await readCredentials(config);
           const { items, nextCursor, previousCursor, pagination } = cursorPage(credentials, {
             limit: limitNum,
             cursor: validated.data.query.cursor ?? null,
             direction,
           });
-          // #958: has_more follows the direction of travel.
-          const pagination = buildPaginationMeta({
-            totalCount: credentials.length,
-            pageSize: Math.min(200, Math.max(1, limitNum)),
-            hasMore: direction === "prev" ? Boolean(previousCursor) : Boolean(nextCursor),
-            nextCursor,
-            previousCursor,
-            extraLinkParams: { prev: { direction: "prev" } },
-          });
           setPaginationHeaders(res, url, pagination);
-          return sendFormatted(req, res, 200, { items, nextCursor, pagination });
 
           if (wantsJsonLd(req, url)) {
             return sendJson(
@@ -1155,7 +1108,7 @@ export function createApp({
 
         // Request traces API and dashboard (#946)
         if (pathname.startsWith("/admin/traces")) {
-          if (!requireAuth(req, res, config, ['admin:read'])) return;
+          if (!await requireAuth(req, res, config, ['admin:read'])) return;
           if (handleTraceRoutes(req, res, { pathname, searchParams: url.searchParams }, { sendJson, nonce: req.cspNonce })) return;
         }
 
@@ -1171,14 +1124,14 @@ export function createApp({
 
         // Analytics Dashboard
         if (req.method === "GET" && url.pathname === "/admin/analytics/dashboard") {
-          if (!requireAuth(req, res, config, ['admin:read'])) return;
+          if (!await requireAuth(req, res, config, ['admin:read'])) return;
           res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
           return res.end(analytics.renderDashboardHtml());
         }
 
         // Analytics Export (CSV or JSON)
         if (req.method === "GET" && url.pathname === "/admin/analytics/export") {
-          if (!requireAuth(req, res, config, ['admin:read'])) return;
+          if (!await requireAuth(req, res, config, ['admin:read'])) return;
           const format = url.searchParams.get("format")?.toLowerCase();
           if (format === "json" || req.headers["accept"] === "application/json") {
             return sendFormatted(req, res, 200, analytics.exportJson(), {
@@ -1194,22 +1147,10 @@ export function createApp({
 
         // Analytics Summary Data
         if (req.method === "GET" && url.pathname === "/admin/analytics") {
-          if (!requireAuth(req, res, config, ['admin:read'])) return;
+          if (!await requireAuth(req, res, config, ['admin:read'])) return;
           return sendFormatted(req, res, 200, analytics.getSummary());
         }
 
-        if (req.method === "POST" && url.pathname === "/credentials") {
-          if (!requireAuth(req, res, config, ['credentials:write'])) return;
-          if (validateContentType(req, res)) return;
-          const body = await readJson(req, config);
-          if (body.__payloadTooLarge)
-            return sendFormatted(req, res, 413, { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the size limit." });
-          if (!body.id)
-            return sendFormatted(req, res, 400, { code: "INVALID_REQUEST", message: "Request body must include a credential id." });
-          try {
-            const updated = await createAndPersistCredential(config, body);
-            await appendAuditLog(config, { action: "issue_credential", credentialId: body.id });
-            return sendFormatted(req, res, 201, body);
         if (req.method === "POST" && (pathname === "/credentials" || pathname === "/credentials/issue")) {
           if (!await requireAuth(req, res, config, ['credentials:write'])) return;
           if (validateContentType(req, res)) return;
@@ -1627,10 +1568,6 @@ export function createApp({
           const body = await readJson(req, config);
           if (body.__payloadTooLarge)
             return sendFormatted(req, res, 413, { error: "payload_too_large" });
-          if (!body.issuer)
-            return sendFormatted(req, res, 400, { error: "issuer_required" });
-          await soroban.addIssuer(body.issuer);
-            return sendJson(res, 413, { error: "payload_too_large" });
           const validated = validateRequest(res, schemas.addIssuer, { body });
           if (!validated.ok) return;
           const { issuer } = validated.data.body;
@@ -1642,7 +1579,6 @@ export function createApp({
             issuer,
           });
           return sendFormatted(req, res, 201, { issuer: body.issuer });
-          return sendJson(res, 201, { issuer });
         }
 
         if (req.method === "DELETE" && pathname === "/admin/issuers") {
@@ -1652,9 +1588,6 @@ export function createApp({
           const body = await readJson(req, config);
           if (body.__payloadTooLarge)
             return sendFormatted(req, res, 413, { error: "payload_too_large" });
-          const issuer = body.issuer ?? url.searchParams.get("issuer");
-          if (!issuer) return sendFormatted(req, res, 400, { error: "issuer_required" });
-            return sendJson(res, 413, { error: "payload_too_large" });
           const validated = validateRequest(res, schemas.removeIssuer, {
             body,
             query: url.searchParams,
@@ -1776,12 +1709,17 @@ export function createApp({
         if (req.method === "GET" && url.pathname === "/admin/api-keys") {
           if (!await requireAuth(req, res, config, ['admin:read'])) return;
           const keys = await apiKeyService.listKeys();
-          const page = paginateArray(keys, {
-            pageSize: url.searchParams.get("limit"),
+          const page = cursorPage(keys, {
+            limit: url.searchParams.get("limit"),
             cursor: url.searchParams.get("cursor"),
           });
-          setPaginationHeaders(res, url, page.meta);
-          return sendJson(res, 200, { keys: page.items, pagination: page.meta });
+          setPaginationHeaders(res, url, page.pagination);
+          return sendJson(res, 200, {
+            keys: page.items,
+            nextCursor: page.nextCursor,
+            previousCursor: page.previousCursor,
+            pagination: page.pagination,
+          });
         }
 
         const apiKeyIdMatch = url.pathname.match(/^\/admin\/api-keys\/([^/]+)$/);
@@ -1982,13 +1920,8 @@ export function createApp({
         }
 
         return notFound(res);
-      } catch (error) {
-        if (error.name === 'SorobanError') {
-          logger.error(error.internalDetail);
-          return sendJson(res, 500, { error: error.category, message: error.publicMessage });
-        }
-        logger.error(error);
-        return sendJson(res, 500, { error: 'internal_server_error', message: error.message });
+    };
+    return requestContextStore.run({ requestId, correlationId, tenantId }, handler).catch((error) => {
         if (error.name === "SorobanError" || error.name === "SorobanUnavailableError") {
           const isUnavailable = error.name === "SorobanUnavailableError" || error.category === "rpc_unavailable";
           const statusCode = isUnavailable ? 503 : 500;
@@ -2008,7 +1941,6 @@ export function createApp({
           error: "internal_server_error",
           message: error.message,
         });
-      }
     });
   };
 }

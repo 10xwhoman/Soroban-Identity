@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { correlationHeaders } from './middleware/tracing.js';
 
 /**
  * Lightweight origin-side DDoS controls. Edge providers should reject most
@@ -86,7 +87,7 @@ export class DdosProtection {
     if (this.verifyCaptcha) return Boolean(await this.verifyCaptcha({ token: String(token), secret: this.captchaSecret, ip }));
     try {
       const response = await fetch(this.captchaUrl, {
-        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', ...correlationHeaders() },
         body: new URLSearchParams({ secret: this.captchaSecret, response: String(token), remoteip: ip }),
       });
       return response.ok && Boolean((await response.json()).success);

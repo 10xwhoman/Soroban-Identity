@@ -38,16 +38,6 @@ export function sanitizeHeaders(headers = {}) {
   return sanitize({ ...headers });
 }
 
-function write(stream, level, args) {
-  console[stream](...args.map((a) => sanitize(a)));
-}
-
-export const logger = {
-  info: (...args) => write('log', 'info', args),
-  warn: (...args) => write('warn', 'warn', args),
-  error: (...args) => write('error', 'error', args),
-};
-
 // Middleware-style wrapper: logs a sanitized request/response line per request.
 export function withRequestLogging(handler, log = logger) {
   return async function loggedHandler(req, res) {
@@ -63,8 +53,20 @@ export function withRequestLogging(handler, log = logger) {
     });
     return handler(req, res);
   };
+}
+
 import pino from 'pino';
 import { requestContextStore } from './request-context.js';
+
+export function getRequestLogFields(store = requestContextStore.getStore()) {
+  if (!store) return {};
+  return {
+    ...(store.requestId || store.correlationId ? { requestId: store.requestId ?? store.correlationId } : {}),
+    ...(store.correlationId ? { correlationId: store.correlationId } : {}),
+    ...(store.traceId ? { traceId: store.traceId } : {}),
+    ...(store.spanId ? { spanId: store.spanId } : {}),
+  };
+}
 
 /**
  * Create a structured JSON logger using pino.
@@ -88,15 +90,7 @@ function createLogger() {
     base: undefined, // Remove default pid/hostname
     mixin() {
       // Inject requestId and correlationId (#946) from the request context
-      const store = requestContextStore.getStore();
-      if (store && (store.requestId || store.traceId)) {
-        return {
-          ...(store.requestId ? { requestId: store.requestId } : {}),
-          ...(store.traceId ? { traceId: store.traceId } : {}),
-          ...(store.spanId ? { spanId: store.spanId } : {}),
-        };
-      }
-      return {};
+      return getRequestLogFields();
     },
   });
 }

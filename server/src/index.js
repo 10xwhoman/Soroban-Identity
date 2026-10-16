@@ -6,15 +6,17 @@ import { ExpiryNotificationJob } from './expiry.js';
 import { MetricsAggregator, MetricsService } from './metrics.js';
 import { AnalyticsService } from './analytics.js';
 import { SorobanClient } from './soroban.js';
-import { logger, withRequestLogging } from './logger.js';
+import { logger } from './logger.js';
 import { DidCache } from './did-cache.js';
 import { WebhookDeliveryService } from './webhooks.js';
 import { ApiKeyService } from './api-keys.js';
 import { WebSocketHub } from './websocket.js';
-import { logger } from './logger.js';
 import { RotatingFileSink } from './access-log.js';
 import { VaultLeaseManager } from './vault.js';
 import { initFeatureFlags, getFlag } from './feature-flags.js';
+import { QueryResultCache } from './query-cache.js';
+import { DdosProtection } from './ddos-protection.js';
+import { createBatchVerificationQueue, createCredentialIssueQueue } from './job-queue.js';
 
 // Load secrets before validation so existing config consumers see the same
 // values as environment-backed deployments. Vault is opt-in and fails closed
@@ -32,15 +34,15 @@ if (vaultManager.enabled) {
 const validationResult = validateConfig();
 if (!validationResult.isValid) {
   if (validationResult.missing.length > 0) {
-    logger.error({ missing: validationResult.missing }, 'Missing required environment variables');
+    console.error('[config] Missing required environment variables:');
     for (const err of validationResult.missing) {
-      logger.error(`  - ${err}`);
+      console.error(`[config] ${err}`);
     }
   }
   if (validationResult.invalid.length > 0) {
-    logger.error({ invalid: validationResult.invalid }, 'Invalid environment variables');
+    console.error('[config] Invalid environment variables:');
     for (const err of validationResult.invalid) {
-      logger.error(`  - ${err}`);
+      console.error(`[config] ${err}`);
     }
   }
   process.exit(1);
@@ -74,12 +76,16 @@ if (!getFlag('new_credential_types')) {
 }
 const metrics = new MetricsService();
 const analytics = new AnalyticsService();
-const soroban = new SorobanClient(config, metrics);
 const didCache = new DidCache(config, { metrics });
-const queryCache = new QueryResultCache(config, { redisClient: didCache.client, metrics });
-const ddosProtection = new DdosProtection(config, { onAlert: async (event) => { metrics.observeDdosEvent(event.type); logger.warn(event, 'DDoS protection event'); } });
 // Connecting never throws: a cache outage must not stop the server booting.
 await didCache.connect();
+const queryCache = new QueryResultCache(config, { redisClient: didCache.client, metrics });
+const ddosProtection = new DdosProtection(config, {
+  onAlert: async (event) => {
+    metrics.observeDdosEvent(event.type);
+    logger.warn(event, 'DDoS protection event');
+  },
+});
 const soroban = new SorobanClient(config, metrics, { didCache, queryCache });
 if (config.queryCacheWarmQueries.length > 0) {
   void queryCache.warm(config.queryCacheWarmQueries, async (query) => {
@@ -87,23 +93,17 @@ if (config.queryCacheWarmQueries.length > 0) {
     return null;
   }).catch((error) => logger.warn({ error: error.message }, 'Query cache warm failed'));
 }
-
 if (config.didCacheWarmList.length > 0) {
-  // Warm in the background so startup is not blocked on RPC round trips.
   void didCache
     .warm(config.didCacheWarmList, (did) => soroban.resolveDid(did))
     .catch((error) => logger.error({ error: error.message }, 'DID cache warm failed'));
 }
 const webhookService = new WebhookDeliveryService(config);
-const metricsAggregator = new MetricsAggregator(soroban, metrics, { startLedger: Number.parseInt(process.env.METRICS_START_LEDGER ?? '0', 10) });
+const metricsAggregator = new MetricsAggregator(soroban, metrics, {
+  startLedger: Number.parseInt(process.env.METRICS_START_LEDGER ?? '0', 10),
+});
 const expiryJob = new ExpiryNotificationJob(config, soroban);
-
 if (process.env.DISABLE_EXPIRY_JOB !== 'true') expiryJob.start();
-
-const server = http.createServer(withRequestLogging(createApp({ config, soroban, metrics, metricsAggregator })));
-server.listen(config.port, () => {
-  logger.info(`Soroban Identity server listening on :${config.port}`);
-const server = http.createServer(createApp({ config, soroban, metrics, metricsAggregator, analytics }));
 const apiKeyService = new ApiKeyService(config);
 
 // Initialize job queues for async processing (#716)
@@ -165,6 +165,8 @@ const server = http.createServer(
     metrics,
     metricsAggregator,
     didCache,
+    credentialIssueQueue,
+    batchVerificationQueue,
     webhookService,
     apiKeyService,
     accessLogSink,
@@ -172,18 +174,6 @@ const server = http.createServer(
     ddosProtection,
   }),
 );
-
-// Apply response compression middleware (#721)
-if (config.compressionEnabled) {
-  const compression = createCompressionMiddleware({
-    threshold: config.compressionThreshold,
-    gzipLevel: config.compressionGzipLevel,
-    brotliLevel: config.compressionBrotliLevel,
-    enableBrotli: config.compressionEnableBrotli,
-    metrics,
-  });
-  // Note: Compression is applied in app.js via middleware pattern
-}
 
 if (realtime) {
   realtime.attach(server);
@@ -206,7 +196,7 @@ server.on('connection', (socket) => {
 });
 
 server.listen(config.port, () => {
-  logger.info({ port: config.port }, 'Soroban Identity server listening');
+  logger.info({ port: config.port }, `Soroban Identity server listening on :${config.port}`);
 });
 
 let shuttingDown = false;
@@ -279,18 +269,6 @@ function shutdown(signal) {
   // Don't wait for lingering connections
   server.closeAllConnections?.();
 }
-
-const connections = new Set();
-server.on('connection', (socket) => {
-  connections.add(socket);
-  socket.on('close', () => {
-    connections.delete(socket);
-  });
-});
-
-server.listen(config.port, () => {
-  logger.info({ port: config.port }, 'Soroban Identity server listening');
-});
 
 // Register signal handlers
 process.on('SIGTERM', () => shutdown('SIGTERM'));

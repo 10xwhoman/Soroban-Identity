@@ -161,6 +161,8 @@ export function loadConfig(env = process.env) {
   const nodeEnv = env.NODE_ENV ?? "development";
   return {
     nodeEnv,
+    // The deterministic mock API is opt-in and never enabled in production.
+    mockApiEnabled: nodeEnv !== "production" && parseBoolean(env.MOCK_API_ENABLED, false),
     port: parseInteger(env.PORT, 3001),
     adminApiKey: env.ADMIN_API_KEY ?? "",
     adminActor: env.ADMIN_ACTOR ?? "admin",

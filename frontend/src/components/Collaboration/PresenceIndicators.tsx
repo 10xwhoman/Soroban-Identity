@@ -229,7 +229,7 @@ export const PresenceIndicators: React.FC<PresenceIndicatorsProps> = ({
             title={`${c.name} is ${c.status}`}
           >
             {c.avatarUrl ? (
-              <img src={c.avatarUrl} alt={c.name} />
+              <img src={c.avatarUrl} alt={c.name} loading="lazy" decoding="async" />
             ) : (
               <span aria-hidden="true">{initials(c.name)}</span>
             )}
