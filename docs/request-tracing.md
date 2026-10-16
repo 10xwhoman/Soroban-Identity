@@ -8,11 +8,11 @@ Every request is tagged with a correlation ID. That ID follows the request throu
 
 ```mermaid
 flowchart LR
-  C[Client] -- "X-Correlation-ID (optional)" --> M[correlationMiddleware]
+  C[Client] -- "X-Correlation-ID or X-Request-ID (optional)" --> M[correlationMiddleware]
   M -- "requestContextStore\n{ requestId, correlationId }" --> H[Route handlers]
-  M -- "X-Correlation-ID" --> C
+  M -- "X-Correlation-ID + X-Request-ID" --> C
   H --> L[pino logger mixin\ncorrelationId on every line]
-  H --> S[soroban.js]
+  H --> S[soroban.js, Vault, health, email, CAPTCHA]
   S -- "x-correlation-id header" --> RPC[Soroban RPC]
   S -- "SOROBAN_IDENTITY_CORRELATION_ID env" --> CLI[stellar CLI]
   H --> W[webhooks.js] -- "x-correlation-id header" --> R[Webhook receivers]
@@ -35,8 +35,9 @@ IDs that fail the pattern are discarded rather than sanitized. This stops a clie
 | --- | --- |
 | Request context | Stored in `AsyncLocalStorage` (`requestContextStore`) next to `requestId` and `tenantId` |
 | Logs | The `logger.js` mixin adds `correlationId` to every log line emitted within the request |
-| Response | `X-Correlation-ID` header on every response |
-| Soroban RPC (`fetch`) | `x-correlation-id` request header via `correlationHeaders()` |
+| Response | `X-Correlation-ID` and `X-Request-ID` carry the same canonical ID |
+| Logs and audit records | Structured logs and persisted audit entries include `requestId` and `correlationId` |
+| HTTP service calls | Soroban RPC, Vault, webhooks, health checks, email, CAPTCHA, and trace export use `correlationHeaders()` |
 | Stellar CLI (`spawn`) | `SOROBAN_IDENTITY_CORRELATION_ID` env var via `correlationEnv()` |
 | Webhook delivery | `x-correlation-id` header, when delivery happens inside a request |
 

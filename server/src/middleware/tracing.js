@@ -141,14 +141,16 @@ export const defaultTraceStore = new TraceStore({
  * Returns the correlation ID; callers put it into the request context store
  * so everything downstream (logs, spans, outbound calls) sees it.
  */
-export function correlationMiddleware(req, res, { traceStore = defaultTraceStore, requestId = null, path } = {}) {
+export function correlationMiddleware(req, res, { traceStore = defaultTraceStore, path } = {}) {
   const correlationId = resolveCorrelationId(req);
   req.correlationId = correlationId;
+  req.requestId = correlationId;
   res.setHeader(CORRELATION_RESPONSE_HEADER, correlationId);
+  res.setHeader("X-Request-ID", correlationId);
 
   traceStore.start({
     correlationId,
-    requestId,
+    requestId: correlationId,
     method: req.method,
     path: path ?? (req.url ?? "/").split("?")[0],
     tenantId: req.tenantId ?? null,

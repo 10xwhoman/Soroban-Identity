@@ -23,7 +23,9 @@ export function openTelemetryHttpMiddleware(tracer = defaultTracer) {
     // Inject traceparent in response headers for client visibility
     tracer.injectContext(span, res);
     res.setHeader('X-Trace-Id', span.traceId);
-    res.setHeader('X-Correlation-ID', req.headers['x-correlation-id'] || req.headers['x-request-id'] || span.traceId);
+    const correlationId = req.correlationId ?? req.requestId ?? req.headers['x-correlation-id'] ?? req.headers['x-request-id'] ?? span.traceId;
+    res.setHeader('X-Correlation-ID', correlationId);
+    res.setHeader('X-Request-ID', correlationId);
     req.traceId = span.traceId;
     req.spanId = span.spanId;
 

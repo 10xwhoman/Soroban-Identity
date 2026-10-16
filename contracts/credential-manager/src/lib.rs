@@ -3179,7 +3179,9 @@ impl CredentialManager {
         if expires_at <= now {
             return TTL_MIN;
         }
-        let ledgers = ((expires_at - now) / 5) as u32;
+        // Clamp while the value is still u64. Casting first would wrap for
+        // distant-future expiries and could shorten credential retention.
+        let ledgers = (((expires_at - now) / 5).min(u64::from(TTL_MAX))) as u32;
         ledgers.min(TTL_MAX).max(TTL_MIN)
     }
 
@@ -3329,6 +3331,24 @@ mod tests {
         let admin = Address::generate(&env);
         client.initialize(&admin, &registry_id);
         (env, admin, client)
+    }
+
+    #[test]
+    fn distant_future_credential_expiry_saturates_without_u32_wraparound() {
+        let env = Env::default();
+        let now = env.ledger().timestamp();
+        let post_2106 = u64::from(u32::MAX) + 1;
+        assert_eq!(CredentialManager::ttl_for_credential(&env, post_2106), TTL_MAX);
+
+        // The ledger count itself can also exceed u32 even though the Unix
+        // expiry timestamp is a valid u64.
+        let beyond_u32_ledgers = now
+            .saturating_add(u64::from(u32::MAX).saturating_mul(5))
+            .saturating_add(10);
+        assert_eq!(
+            CredentialManager::ttl_for_credential(&env, beyond_u32_ledgers),
+            TTL_MAX,
+        );
     }
 
     fn issue_kyc(

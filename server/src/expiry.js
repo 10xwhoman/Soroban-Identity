@@ -1,5 +1,6 @@
 import { readCredentials, upsertCredential, writeCredentials } from './storage.js';
 import { logger } from './logger.js';
+import { correlationHeaders } from './middleware/tracing.js';
 import { CronJob } from './cron.js';
 import { EmailTransport, renderExpirySubject, renderExpiryBody, resolveRecipient } from './email.js';
 import { appendNotificationLog } from './notification-log.js';
@@ -551,7 +552,7 @@ export class ExpiryNotificationJob {
         const startTime = Date.now();
         const response = await fetch(target, {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: { 'content-type': 'application/json', ...correlationHeaders() },
           body: JSON.stringify(payload),
         });
         const durationMs = Date.now() - startTime;
