@@ -27,6 +27,22 @@ export const V2_ROUTES = Object.fromEntries(
 );
 
 /**
+ * Tenant management routes (#1053).
+ *
+ * Derived from the v1 route map so that every tenant-scoped endpoint keeps a
+ * single source of truth for its path, while v2 exposes them under the /v2
+ * prefix with the standard v2 response envelope applied by `wrapResponse`.
+ */
+export const V2_TENANT_ROUTES = Object.fromEntries(
+  Object.entries(V1_ROUTES)
+    .filter(([name]) => name.startsWith("tenant"))
+    .map(([name, descriptor]) => [
+      name,
+      { ...descriptor, path: withV1Prefix(descriptor.path).replace("/v1", "/v2") },
+    ]),
+);
+
+/**
  * Given a bare path (no version prefix), return the v2-prefixed equivalent.
  *
  * @param {string} path  e.g. "/credentials"
