@@ -7,6 +7,7 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 export interface ExpiryNotification {
   count: number;
   credentials: Credential[];
+  readIds: string[];
   dismissed: boolean;
 }
 
@@ -19,6 +20,7 @@ export function useCredentialExpiryCheck(
   fetchCredentials: (address: string) => Promise<Credential[]>
 ) {
   const [notification, setNotification] = useState<ExpiryNotification | null>(null);
+  const readIdsRef = useRef<Set<string>>(new Set());
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const check = useCallback(async () => {
@@ -32,8 +34,16 @@ export function useCredentialExpiryCheck(
         return expiryMs > now && expiryMs - now <= SEVEN_DAYS_MS;
       });
       if (expiring.length > 0) {
+        const unreadCount = expiring.filter((c) => !readIdsRef.current.has(c.id)).length;
         setNotification((prev: ExpiryNotification | null) =>
-          prev?.dismissed ? prev : { count: expiring.length, credentials: expiring, dismissed: false }
+          prev?.dismissed
+            ? prev
+            : {
+                count: unreadCount,
+                credentials: expiring,
+                readIds: Array.from(readIdsRef.current),
+                dismissed: unreadCount === 0,
+              }
         );
       } else {
         setNotification(null);
@@ -45,6 +55,7 @@ export function useCredentialExpiryCheck(
 
   useEffect(() => {
     if (!publicKey) {
+      readIdsRef.current.clear();
       setNotification(null);
       return;
     }
@@ -55,9 +66,52 @@ export function useCredentialExpiryCheck(
     };
   }, [publicKey, check]);
 
-  const dismiss = useCallback(() => {
-    setNotification((prev: ExpiryNotification | null) => (prev ? { ...prev, dismissed: true } : null));
+  const markAsRead = useCallback((credentialId: string) => {
+    readIdsRef.current.add(credentialId);
+    setNotification((prev: ExpiryNotification | null) => {
+      if (!prev) return null;
+      const unread = prev.credentials.filter((c) => !readIdsRef.current.has(c.id));
+      return {
+        ...prev,
+        count: unread.length,
+        readIds: Array.from(readIdsRef.current),
+        dismissed: unread.length === 0 ? true : prev.dismissed,
+      };
+    });
   }, []);
 
-  return { notification, dismiss };
+  const markBatchAsRead = useCallback((credentialIds: string[]) => {
+    credentialIds.forEach((id) => readIdsRef.current.add(id));
+    setNotification((prev: ExpiryNotification | null) => {
+      if (!prev) return null;
+      const unread = prev.credentials.filter((c) => !readIdsRef.current.has(c.id));
+      return {
+        ...prev,
+        count: unread.length,
+        readIds: Array.from(readIdsRef.current),
+        dismissed: unread.length === 0 ? true : prev.dismissed,
+      };
+    });
+  }, []);
+
+  const markAllAsRead = useCallback(() => {
+    setNotification((prev: ExpiryNotification | null) => {
+      if (!prev) return null;
+      prev.credentials.forEach((c) => readIdsRef.current.add(c.id));
+      return {
+        ...prev,
+        count: 0,
+        readIds: Array.from(readIdsRef.current),
+        dismissed: true,
+      };
+    });
+  }, []);
+
+  const dismiss = useCallback(() => {
+    setNotification((prev: ExpiryNotification | null) =>
+      prev ? { ...prev, count: 0, dismissed: true } : null
+    );
+  }, []);
+
+  return { notification, dismiss, markAsRead, markBatchAsRead, markAllAsRead };
 }

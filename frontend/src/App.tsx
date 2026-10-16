@@ -191,7 +191,7 @@ export default function App() {
     [],
   );
 
-  const { notification, dismiss } = useCredentialExpiryCheck(
+  const { notification, dismiss, markAllAsRead } = useCredentialExpiryCheck(
     wallet.publicKey,
     fetchCredentials,
   );
@@ -438,7 +438,7 @@ export default function App() {
         </div>
       )}
 
-      {notification && !notification.dismissed && (
+      {notification && !notification.dismissed && notification.count > 0 && (
         <div
           role="alert"
           style={{
@@ -455,22 +455,43 @@ export default function App() {
           }}
         >
           <span>
-            <span aria-hidden="true">⚠</span> {notification.count} credential
+            <span aria-hidden="true">⚠</span>{" "}
+            <span className="notification-badge" data-testid="notification-badge-count">
+              {notification.count}
+            </span>{" "}
+            credential
             {notification.count > 1 ? "s" : ""} expiring within 7 days
           </span>
-          <button
-            onClick={dismiss}
-            aria-label={t("a11y.dismissNotification")}
-            style={{
-              background: "none",
-              border: "none",
-              cursor: "pointer",
-              fontSize: "1rem",
-              color: "inherit",
-            }}
-          >
-            ✕
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+            <button
+              type="button"
+              onClick={markAllAsRead}
+              style={{
+                background: "none",
+                border: "1px solid currentColor",
+                borderRadius: "0.25rem",
+                padding: "0.2rem 0.5rem",
+                cursor: "pointer",
+                fontSize: "0.8rem",
+                color: "inherit",
+              }}
+            >
+              Mark all as read
+            </button>
+            <button
+              onClick={dismiss}
+              aria-label={t("a11y.dismissNotification")}
+              style={{
+                background: "none",
+                border: "none",
+                cursor: "pointer",
+                fontSize: "1rem",
+                color: "inherit",
+              }}
+            >
+              ✕
+            </button>
+          </div>
         </div>
       )}
 
