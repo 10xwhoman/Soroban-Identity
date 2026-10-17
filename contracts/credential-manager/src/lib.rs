@@ -133,6 +133,14 @@ const SIG_THRESHOLD: Symbol = symbol_short!("SIGTH");
 /// Admin action proposal expiration time in seconds (15 minutes).
 const ADMIN_ACTION_EXPIRATION_SECS: u64 = 900;
 
+// ── Issue #1057: credential escrow storage keys ──────────────────────────────
+/// Maps an escrow ID to its [`EscrowRecord`].
+const ESCROW: Symbol = symbol_short!("ESCROW");
+/// Sequence number for generating unique escrow IDs.
+const ESCROW_SEQ: Symbol = symbol_short!("ESCRSEQ");
+/// Reverse index: maps a depositor address to the escrow IDs they created.
+const ESCROW_BY_DEPOSITOR: Symbol = symbol_short!("ESCBYDEP");
+
 #[contracterror]
 #[derive(Clone, Debug, PartialEq, Copy)]
 pub enum ContractError {
@@ -3114,6 +3122,313 @@ impl CredentialManager {
             .instance()
             .get(&action_key)
             .ok_or(ContractError::AdminActionNotFound)
+    }
+
+    // ── Issue #1057: credential escrow ────────────────────────────────────────
+
+    /// Deposits a credential into escrow with a set of release conditions.
+    ///
+    /// The depositor must be the current subject of `credential_id` and must
+    /// sign the call. `conditions` must be non-empty; each condition is
+    /// validated before the escrow is created. Emits an `escrow_deposited`
+    /// lifecycle event.
+    pub fn escrow_deposit(
+        env: Env,
+        depositor: Address,
+        credential_id: BytesN<32>,
+        beneficiary: Address,
+        conditions: Vec<EscrowCondition>,
+    ) -> Result<u64, ContractError> {
+        depositor.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if conditions.len() == 0 {
+            return Err(ContractError::InvalidReleaseCondition);
+        }
+        for condition in conditions.iter() {
+            escrow::validate_condition(&env, &condition)?;
+        }
+
+        // The depositor must own the credential being escrowed.
+        let cred: Credential = env
+            .storage()
+            .persistent()
+            .get(&Self::cred_key(&credential_id))
+            .ok_or(ContractError::CredentialNotFound)?;
+        if cred.subject != depositor {
+            return Err(ContractError::UnauthorizedEscrowCaller);
+        }
+        if cred.revoked {
+            return Err(ContractError::CredentialRevoked);
+        }
+
+        let seq: u64 = env.storage().instance().get(&ESCROW_SEQ).unwrap_or(0);
+        let escrow_id = seq + 1;
+        env.storage().instance().set(&ESCROW_SEQ, &escrow_id);
+
+        let now = env.ledger().timestamp();
+        let record = escrow::build_record(
+            &env,
+            escrow_id,
+            depositor.clone(),
+            beneficiary.clone(),
+            credential_id.clone(),
+            conditions.clone(),
+            now,
+        );
+
+        let key = (ESCROW, escrow_id);
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, TTL_MAX, TTL_MAX);
+
+        // Reverse index for depositor-scoped queries.
+        let idx_key = (ESCROW_BY_DEPOSITOR, depositor.clone());
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        ids.push_back(escrow_id);
+        env.storage().persistent().set(&idx_key, &ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&idx_key, TTL_MAX, TTL_MAX);
+
+        env.events().publish(
+            (ESCROW, symbol_short!("deposit")),
+            (
+                EVENT_VERSION,
+                escrow_id,
+                depositor,
+                beneficiary,
+                credential_id,
+                conditions.len() as u32,
+            ),
+        );
+
+        Ok(escrow_id)
+    }
+
+    /// Releases an escrowed credential to its beneficiary once every release
+    /// condition has been satisfied. Only the depositor may release. Emits an
+    /// `escrow_released` lifecycle event.
+    pub fn escrow_release(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let key = (ESCROW, escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::EscrowNotFound)?;
+
+        if record.depositor != caller {
+            return Err(ContractError::UnauthorizedEscrowCaller);
+        }
+        if record.status == EscrowStatus::Disputed {
+            return Err(ContractError::EscrowDisputed);
+        }
+        if record.status != EscrowStatus::Active {
+            return Err(ContractError::EscrowNotReleasable);
+        }
+        if !escrow::conditions_satisfied(&env, &record) {
+            return Err(ContractError::EscrowNotReleasable);
+        }
+
+        record.status = EscrowStatus::Released;
+        record.resolved_at = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, TTL_MAX, TTL_MAX);
+
+        env.events().publish(
+            (ESCROW, symbol_short!("release")),
+            (
+                EVENT_VERSION,
+                escrow_id,
+                record.depositor.clone(),
+                record.beneficiary.clone(),
+                record.credential_id.clone(),
+            ),
+        );
+
+        Ok(())
+    }
+
+    /// Raises a dispute on an active escrow. Either the depositor or the
+    /// beneficiary may dispute. Emits an `escrow_disputed` lifecycle event.
+    pub fn escrow_dispute(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        reason: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let key = (ESCROW, escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::EscrowNotFound)?;
+
+        if record.depositor != caller && record.beneficiary != caller {
+            return Err(ContractError::UnauthorizedEscrowCaller);
+        }
+        if record.status != EscrowStatus::Active {
+            return Err(ContractError::EscrowNotReleasable);
+        }
+
+        record.status = EscrowStatus::Disputed;
+        record.disputed_by = Some(caller.clone());
+        record.dispute_reason = Some(reason.clone());
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, TTL_MAX, TTL_MAX);
+
+        env.events().publish(
+            (ESCROW, symbol_short!("dispute")),
+            (EVENT_VERSION, escrow_id, caller, reason),
+        );
+
+        Ok(())
+    }
+
+    /// Resolves a disputed escrow (admin only). `release_to_beneficiary`
+    /// selects whether the credential goes to the beneficiary or is returned
+    /// to the depositor. Emits an `escrow_resolved` lifecycle event.
+    pub fn escrow_resolve(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        release_to_beneficiary: bool,
+    ) -> Result<(), ContractError> {
+        Self::require_admin_caller(&env, &admin)?;
+
+        let key = (ESCROW, escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::EscrowNotFound)?;
+
+        if record.status != EscrowStatus::Disputed {
+            return Err(ContractError::EscrowNotReleasable);
+        }
+
+        record.status = if release_to_beneficiary {
+            EscrowStatus::Released
+        } else {
+            EscrowStatus::Refunded
+        };
+        record.resolved_at = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, TTL_MAX, TTL_MAX);
+
+        env.events().publish(
+            (ESCROW, symbol_short!("resolve")),
+            (
+                EVENT_VERSION,
+                escrow_id,
+                admin,
+                release_to_beneficiary,
+            ),
+        );
+
+        Ok(())
+    }
+
+    /// Refunds an escrow back to its depositor when the release conditions
+    /// have failed (for example, an expired time window). Only the depositor
+    /// may trigger a refund. Emits an `escrow_refunded` lifecycle event.
+    pub fn escrow_refund(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let key = (ESCROW, escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::EscrowNotFound)?;
+
+        if record.depositor != caller {
+            return Err(ContractError::UnauthorizedEscrowCaller);
+        }
+        if record.status == EscrowStatus::Disputed {
+            return Err(ContractError::EscrowDisputed);
+        }
+        if record.status != EscrowStatus::Active {
+            return Err(ContractError::EscrowNotReleasable);
+        }
+        if !escrow::conditions_failed(&env, &record) {
+            return Err(ContractError::EscrowNotReleasable);
+        }
+
+        record.status = EscrowStatus::Refunded;
+        record.resolved_at = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, TTL_MAX, TTL_MAX);
+
+        env.events().publish(
+            (ESCROW, symbol_short!("refund")),
+            (
+                EVENT_VERSION,
+                escrow_id,
+                record.depositor.clone(),
+                record.credential_id.clone(),
+            ),
+        );
+
+        Ok(())
+    }
+
+    /// Returns the full escrow record for `escrow_id`.
+    pub fn get_escrow(env: Env, escrow_id: u64) -> Result<EscrowRecord, ContractError> {
+        env.storage()
+            .persistent()
+            .get(&(ESCROW, escrow_id))
+            .ok_or(ContractError::EscrowNotFound)
+    }
+
+    /// Returns the current lifecycle status of an escrow.
+    pub fn get_escrow_status(env: Env, escrow_id: u64) -> Result<EscrowStatus, ContractError> {
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&(ESCROW, escrow_id))
+            .ok_or(ContractError::EscrowNotFound)?;
+        Ok(record.status)
+    }
+
+    /// Returns whether every release condition for `escrow_id` is currently
+    /// satisfied, without mutating state.
+    pub fn is_escrow_releasable(env: Env, escrow_id: u64) -> Result<bool, ContractError> {
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&(ESCROW, escrow_id))
+            .ok_or(ContractError::EscrowNotFound)?;
+        if record.status != EscrowStatus::Active {
+            return Ok(false);
+        }
+        Ok(escrow::conditions_satisfied(&env, &record))
+    }
+
+    /// Lists the escrow IDs created by `depositor`.
+    pub fn get_depositor_escrows(env: Env, depositor: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&(ESCROW_BY_DEPOSITOR, depositor))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

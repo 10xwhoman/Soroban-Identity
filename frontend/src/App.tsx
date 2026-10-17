@@ -15,12 +15,16 @@ const IdentityPanel = lazy(() => import("./components/IdentityPanel"));
 const CredentialsPanel = lazy(() => import("./components/CredentialsPanel"));
 const IssuerDashboard = lazy(() => import("./pages/IssuerDashboard"));
 const CredentialRecipientVerify = lazy(() => import("./components/CredentialRecipientVerify"));
+const NetworkStatistics = lazy(() => import("./pages/NetworkStatistics"));
 
 const preloadCredentialsPanel = () => {
   void import("./components/CredentialsPanel");
 };
 const preloadCredentialRecipientVerify = () => {
   void import("./components/CredentialRecipientVerify");
+};
+const preloadNetworkStatistics = () => {
+  void import("./pages/NetworkStatistics");
 };
 import WalletButton from "./components/WalletButton";
 import ErrorBoundary from "./components/ErrorBoundary";
@@ -55,9 +59,10 @@ export enum Tab {
   Identity = "identity",
   Credentials = "credentials",
   IssuerAnalytics = "issuerAnalytics",
+  NetworkStatistics = "networkStatistics",
 }
 
-const TAB_ORDER: Tab[] = [Tab.Identity, Tab.Credentials, Tab.IssuerAnalytics];
+const TAB_ORDER: Tab[] = [Tab.Identity, Tab.Credentials, Tab.IssuerAnalytics, Tab.NetworkStatistics];
 
 function AppContent() {
   const [tab, setTab] = useState<Tab>(Tab.Identity);
@@ -579,8 +584,20 @@ function AppContent() {
             }}
             data-tour={`tab-${name}`}
             onClick={() => setTab(name)}
-            onMouseEnter={name === Tab.Credentials ? preloadCredentialsPanel : undefined}
-            onFocus={name === Tab.Credentials ? preloadCredentialsPanel : undefined}
+            onMouseEnter={
+              name === Tab.Credentials
+                ? preloadCredentialsPanel
+                : name === Tab.NetworkStatistics
+                  ? preloadNetworkStatistics
+                  : undefined
+            }
+            onFocus={
+              name === Tab.Credentials
+                ? preloadCredentialsPanel
+                : name === Tab.NetworkStatistics
+                  ? preloadNetworkStatistics
+                  : undefined
+            }
           >
             {t(`tabs.${name}`)}
           </button>

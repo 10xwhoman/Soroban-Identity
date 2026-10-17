@@ -181,3 +181,66 @@ export function stripV1Prefix(path) {
 export function wrapResponse(data) {
   return data;
 }
+
+/**
+ * Scopes permitted to read aggregated network statistics.
+ */
+export const NETWORK_STATISTICS_SCOPES = ["admin:read", "analytics:read"];
+
+/**
+ * Check whether the given scopes grant access to network statistics.
+ *
+ * @param {string[]|string|undefined} scopes
+ * @returns {boolean}
+ */
+export function canReadNetworkStatistics(scopes) {
+  if (!scopes) return false;
+  const list = Array.isArray(scopes) ? scopes : String(scopes).split(/\s+/);
+  return list.some((scope) => NETWORK_STATISTICS_SCOPES.includes(scope));
+}
+
+/**
+ * GET /analytics/network-statistics handler.
+ *
+ * Returns the aggregated network statistics payload produced by
+ * AnalyticsService (DID/credential totals over time, top issuers,
+ * geographic distribution, verification success rate, credential type
+ * distribution, etc.).
+ *
+ * Requires the `admin:read` or `analytics:read` scope.
+ *
+ * @param {object} deps
+ * @param {{ getNetworkStatistics: Function }} deps.analyticsService
+ * @param {object} [deps.query]  optional query params forwarded to the service
+ * @returns {Promise<*>}
+ */
+export async function getNetworkStatistics({ analyticsService, query = {} } = {}) {
+  if (!analyticsService || typeof analyticsService.getNetworkStatistics !== "function") {
+    throw new Error("AnalyticsService with getNetworkStatistics() is required");
+  }
+  return analyticsService.getNetworkStatistics(query);
+}
+
+/**
+ * Build the v1 route map entry for network statistics, including the
+ * required scope check, so app.js can register it consistently.
+ *
+ * @param {object} deps
+ * @param {{ getNetworkStatistics: Function }} deps.analyticsService
+ * @returns {{ method: string, path: string, scopes: string[], handler: Function }}
+ */
+export function networkStatisticsRoute({ analyticsService } = {}) {
+  return {
+    method: V1_ROUTES.networkStatistics.method,
+    path: withV1Prefix(V1_ROUTES.networkStatistics.path),
+    scopes: NETWORK_STATISTICS_SCOPES,
+    handler: (req) => {
+      if (!canReadNetworkStatistics(req?.scopes ?? req?.user?.scopes)) {
+        const err = new Error("Insufficient scope for network statistics");
+        err.status = 403;
+        throw err;
+      }
+      return getNetworkStatistics({ analyticsService, query: req?.query });
+    },
+  };
+}

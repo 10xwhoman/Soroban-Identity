@@ -65,4 +65,25 @@ Notes for indexers:
 | --- | --- |
 | `SCORE,updated` | `[subject: string, reporter: string, delta: number, score: number]` |
 
+## credential-escrow events
+
+Escrow lifecycle events are emitted by the credential escrow contract. Indexers can
+track escrow state transitions by following the `ESCROW` topic prefix; clients can
+subscribe to a specific escrow by filtering on the escrow `id` in the payload.
+
+| Topic | Payload |
+| --- | --- |
+| `ESCROW,created` | `[id: string, depositor: string, beneficiary: string, amount: number, condition: number, deadline: number]` — escrow funded and awaiting condition verification; `condition` is a `ConditionType` discriminant |
+| `ESCROW,released` | `[id: string, beneficiary: string, amount: number, releasedAt: number]` — all release conditions verified and funds transferred to the beneficiary |
+| `ESCROW,refunded` | `[id: string, depositor: string, amount: number, refundedAt: number]` — conditions failed or expired and funds returned to the depositor |
+| `ESCROW,disputed` | `[id: string, challenger: string, reason: number, disputedAt: number]` — a party opened a dispute, freezing release until resolution; `reason` is a `DisputeReason` discriminant |
+| `ESCROW,resolved` | `[id: string, resolver: string, outcome: number, resolvedAt: number]` — dispute resolved by the arbiter; `outcome` is a `DisputeOutcome` discriminant (`0` = release, `1` = refund) |
+| `ESCROW,cancelled` | `[id: string, depositor: string, cancelledAt: number]` — escrow cancelled before any condition was met |
+
+### Escrow status queries
+
+The current escrow state is not carried in events; clients should query it via
+`get_escrow(id)` which returns the escrow record including its `EscrowStatus`
+(`Pending`, `Released`, `Refunded`, `Disputed`, `Resolved`, or `Cancelled`).
+
 > The payload arrays are decoded from contract event values and reflect the contract tuple order.
