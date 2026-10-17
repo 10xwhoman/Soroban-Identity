@@ -169,62 +169,10 @@ export class MetricsService {
       registers: [this.registry],
     });
 
-    // Event sourcing metrics (#1050)
-    this.eventStoreSize = new client.Gauge({
-      name: 'event_store_size',
-      help: 'Number of events currently held in the append-only event store, by stream',
-      labelNames: ['stream'],
-      registers: [this.registry],
-    });
-
-    this.eventStoreAppends = new client.Counter({
-      name: 'event_store_appends_total',
-      help: 'Total events appended to the event store, by stream and event type',
-      labelNames: ['stream', 'event_type'],
-      registers: [this.registry],
-    });
-
-    this.eventStoreAppendDuration = new client.Histogram({
-      name: 'event_store_append_duration_seconds',
-      help: 'Event store append latency in seconds, by stream',
-      labelNames: ['stream'],
-      buckets: HISTOGRAM_BUCKETS,
-      registers: [this.registry],
-    });
-
-    this.eventReplayDuration = new client.Histogram({
-      name: 'event_replay_duration_seconds',
-      help: 'Credential state rebuild (event replay) duration in seconds, by stream',
-      labelNames: ['stream'],
-      buckets: HISTOGRAM_BUCKETS,
-      registers: [this.registry],
-    });
-
-    this.eventReplayEvents = new client.Counter({
-      name: 'event_replay_events_total',
-      help: 'Total events processed during event replay, by stream and outcome',
-      labelNames: ['stream', 'outcome'],
-      registers: [this.registry],
-    });
-
-    this.eventSubscriptionLag = new client.Gauge({
-      name: 'event_subscription_lag_events',
-      help: 'Number of events a subscription is behind the head of its stream',
-      labelNames: ['stream', 'subscriber'],
-      registers: [this.registry],
-    });
-
-    this.eventSubscriptionCheckpoint = new client.Gauge({
-      name: 'event_subscription_checkpoint_sequence',
-      help: 'Last sequence number processed by an event stream subscription',
-      labelNames: ['stream', 'subscriber'],
-      registers: [this.registry],
-    });
-
-    this.eventProjectionUpdates = new client.Counter({
-      name: 'event_projection_updates_total',
-      help: 'Total read-model/projection updates applied from events, by projection and result',
-      labelNames: ['projection', 'result'],
+    this.nonceCollisions = new client.Counter({
+      name: 'nonce_collisions_total',
+      help: 'Total rejected requests carrying a duplicate (already-used) nonce, by route and key id',
+      labelNames: ['route', 'key_id'],
       registers: [this.registry],
     });
     this.queryCacheLatency = new client.Histogram({
@@ -413,69 +361,17 @@ export class MetricsService {
   observeDdosEvent(type) { this.ddosEvents.inc({ type: type || 'unknown' }); }
 
   /**
-   * Record an event appended to the append-only event store (#1050).
-   * @param {object} sample
-   * @param {string} sample.stream     - Stream/aggregate identifier
-   * @param {string} sample.eventType
-   * @param {number} [sample.durationSeconds] - Append latency, if measured
+   * Record a rejected request whose nonce had already been used (#1052).
+   *
+   * A sustained non-zero rate indicates either a replay attack or a client
+   * that is reusing nonces; alert on the rate rather than the raw counter.
+   *
+   * @param {object} [sample]
+   * @param {string} [sample.route]  - Normalized route pattern, not the raw path
+   * @param {string} [sample.keyId]  - API key / client identifier, when known
    */
-  observeEventAppend({ stream, eventType, durationSeconds } = {}) {
-    const labels = { stream: stream || 'unknown', event_type: eventType || 'unknown' };
-    this.eventStoreAppends.inc(labels);
-    if (durationSeconds !== undefined) {
-      this.eventStoreAppendDuration.observe({ stream: labels.stream }, durationSeconds);
-    }
-  }
-
-  /**
-   * Set the current number of events held for a stream.
-   * @param {string} stream
-   * @param {number} size
-   */
-  setEventStoreSize(stream, size) {
-    this.eventStoreSize.set({ stream: stream || 'unknown' }, Number(size) || 0);
-  }
-
-  /**
-   * Record a completed credential state rebuild from events (#1050).
-   * @param {object} sample
-   * @param {string} sample.stream
-   * @param {number} sample.durationSeconds
-   * @param {number} [sample.eventCount]
-   * @param {'success'|'failed'} [sample.outcome]
-   */
-  observeEventReplay({ stream, durationSeconds, eventCount, outcome = 'success' } = {}) {
-    const streamLabel = stream || 'unknown';
-    this.eventReplayDuration.observe({ stream: streamLabel }, durationSeconds ?? 0);
-    if (eventCount !== undefined) {
-      this.eventReplayEvents.inc({ stream: streamLabel, outcome: outcome || 'unknown' }, Number(eventCount) || 0);
-    }
-  }
-
-  /**
-   * Record a subscription's progress against the head of its stream (#1050).
-   * @param {object} sample
-   * @param {string} sample.stream
-   * @param {string} sample.subscriber
-   * @param {number} sample.lagEvents
-   * @param {number} [sample.checkpointSequence]
-   */
-  observeEventSubscriptionLag({ stream, subscriber, lagEvents, checkpointSequence } = {}) {
-    const labels = { stream: stream || 'unknown', subscriber: subscriber || 'unknown' };
-    this.eventSubscriptionLag.set(labels, Number(lagEvents) || 0);
-    if (checkpointSequence !== undefined) {
-      this.eventSubscriptionCheckpoint.set(labels, Number(checkpointSequence) || 0);
-    }
-  }
-
-  /**
-   * Record a read-model/projection update applied from an event (#1050).
-   * @param {object} sample
-   * @param {string} sample.projection
-   * @param {'success'|'failed'|'skipped'} [sample.result]
-   */
-  observeEventProjectionUpdate({ projection, result = 'success' } = {}) {
-    this.eventProjectionUpdates.inc({ projection: projection || 'unknown', result: result || 'unknown' });
+  observeNonceCollision({ route, keyId } = {}) {
+    this.nonceCollisions.inc({ route: route || 'unknown', key_id: keyId || 'unknown' });
   }
 
   observeCircuitBreakerState(toState, fromState) {

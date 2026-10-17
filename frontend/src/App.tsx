@@ -5,9 +5,9 @@ import LoadingFallback from "./components/LoadingFallback";
 import KeyboardShortcutsModal from "./components/KeyboardShortcutsModal";
 import { useKeyboardShortcuts, useSequentialShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useKeyboardShortcutsContext } from "./context/KeyboardShortcutsContext";
-import { TourProvider, useTour } from "./context/TourContext";
-import TourOverlay from "./components/TourOverlay";
-import { TOUR_ENABLED } from "./config";
+import ViewTransition from "./components/ViewTransition";
+import VoiceCommandButton from "./components/VoiceCommandButton";
+import { useVoiceCommands, type VoiceCommand } from "./hooks/useVoiceCommands";
 
 // Tab panels are route-like application surfaces. Keep the initial identity
 // route small and fetch the credentials route only when it is needed.
@@ -80,9 +80,43 @@ function AppContent() {
   const { enabled: shortcutsEnabled, toggleHelp: toggleShortcutsHelp, showHelp: showShortcutsHelp } = useKeyboardShortcutsContext();
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Guided onboarding tour (#1042). The provider only auto-starts for users
-  // with no stored progress, and only when the feature flag is on.
-  const { startTour, restartTour, isActive: tourActive } = useTour();
+  // Voice commands (#1046): hands-free search, navigation and verification.
+  const voiceCommands = useMemo<VoiceCommand[]>(
+    () => [
+      {
+        phrases: ["search", "find", "buscar", "rechercher", "搜索"],
+        description: t("voice.commands.search"),
+        handler: () => {
+          searchInputRef.current?.focus();
+        },
+      },
+      {
+        phrases: ["navigate", "go to", "open", "navegar", "aller", "导航"],
+        description: t("voice.commands.navigate"),
+        handler: (transcript) => {
+          const target = transcript.toLowerCase();
+          if (target.includes("credential")) {
+            setTab(Tab.Credentials);
+          } else if (target.includes("issuer") || target.includes("analytics")) {
+            setTab(Tab.IssuerAnalytics);
+          } else {
+            setTab(Tab.Identity);
+          }
+        },
+      },
+      {
+        phrases: ["verify", "verificar", "vérifier", "验证"],
+        description: t("voice.commands.verify"),
+        handler: () => {
+          setTab(Tab.Credentials);
+          setScanning(true);
+        },
+      },
+    ],
+    [t],
+  );
+
+  const voice = useVoiceCommands({ commands: voiceCommands });
 
   // Mobile nav drawer (#882): while open, focus moves into the drawer and
   // Tab cycles inside it, the page behind does not scroll, and Escape closes
@@ -198,7 +232,7 @@ function AppContent() {
     [],
   );
 
-  const { notification, dismiss } = useCredentialExpiryCheck(
+  const { notification, dismiss, markAllAsRead } = useCredentialExpiryCheck(
     wallet.publicKey,
     fetchCredentials,
   );
@@ -387,17 +421,25 @@ function AppContent() {
           >
             {getThemeIcon(theme, isDarkMode)} {getThemeLabel(theme, isDarkMode, t)}
           </button>
-          {TOUR_ENABLED && (
-            <button
-              type="button"
-              className="tour-help-btn"
-              data-tour="tour-help"
-              onClick={() => (tourActive ? restartTour() : startTour())}
-              aria-label={t("tour.restart", "Restart guided tour")}
-              title={t("tour.restart", "Restart guided tour")}
+          {notification && !notification.dismissed && notification.count > 0 && (
+            <span
+              className="notification-badge-icon"
+              data-testid="notification-badge"
+              aria-label={`${notification.count} notification${notification.count > 1 ? "s" : ""}`}
+              style={{
+                position: "relative",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "0.25rem",
+                fontSize: "0.85rem",
+                fontWeight: 600,
+              }}
             >
-              <span aria-hidden="true">?</span> {t("tour.help", "Tour")}
-            </button>
+              <span aria-hidden="true">🔔</span>
+              <span className="badge badge-yellow" data-testid="notification-badge-count">
+                {notification.count}
+              </span>
+            </span>
           )}
           <WalletButton wallet={wallet} />
         </div>
@@ -457,7 +499,7 @@ function AppContent() {
         </div>
       )}
 
-      {notification && !notification.dismissed && (
+      {notification && !notification.dismissed && notification.count > 0 && (
         <div
           role="alert"
           style={{
@@ -474,22 +516,43 @@ function AppContent() {
           }}
         >
           <span>
-            <span aria-hidden="true">⚠</span> {notification.count} credential
+            <span aria-hidden="true">⚠</span>{" "}
+            <span className="notification-badge" data-testid="notification-badge-count">
+              {notification.count}
+            </span>{" "}
+            credential
             {notification.count > 1 ? "s" : ""} expiring within 7 days
           </span>
-          <button
-            onClick={dismiss}
-            aria-label={t("a11y.dismissNotification")}
-            style={{
-              background: "none",
-              border: "none",
-              cursor: "pointer",
-              fontSize: "1rem",
-              color: "inherit",
-            }}
-          >
-            ✕
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+            <button
+              type="button"
+              onClick={markAllAsRead}
+              style={{
+                background: "none",
+                border: "1px solid currentColor",
+                borderRadius: "0.25rem",
+                padding: "0.2rem 0.5rem",
+                cursor: "pointer",
+                fontSize: "0.8rem",
+                color: "inherit",
+              }}
+            >
+              Mark all as read
+            </button>
+            <button
+              onClick={dismiss}
+              aria-label={t("a11y.dismissNotification")}
+              style={{
+                background: "none",
+                border: "none",
+                cursor: "pointer",
+                fontSize: "1rem",
+                color: "inherit",
+              }}
+            >
+              ✕
+            </button>
+          </div>
         </div>
       )}
 
@@ -527,6 +590,7 @@ function AppContent() {
       <main id="main-content" tabIndex={-1}>
         <ErrorBoundary>
           <Suspense fallback={<LoadingFallback />}>
+          <ViewTransition viewKey={tab}>
           <div
             id={`panel-${Tab.Identity}`}
             role="tabpanel"
@@ -577,6 +641,7 @@ function AppContent() {
           >
             {tab === Tab.IssuerAnalytics && <IssuerDashboard />}
           </div>
+          </ViewTransition>
           </Suspense>
         </ErrorBoundary>
       </main>

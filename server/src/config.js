@@ -273,6 +273,18 @@ export function loadConfig(env = process.env) {
     requestSigningEnforce:
       (env.REQUEST_SIGNING_ENFORCE ?? "mutations").toLowerCase() === "all" ? "all" : "mutations",
     requestSigningMaxAgeSeconds: parseInteger(env.REQUEST_SIGNING_MAX_AGE_SECONDS, 300),
+    // Nonce-based replay prevention (#1052). Off by default for the same
+    // reason as request signing: enabling it rejects requests from clients
+    // that do not yet send a nonce.
+    requestNonceEnabled: parseBoolean(env.REQUEST_NONCE_ENABLED, false),
+    // How long a used nonce is remembered in Redis. Falls back to the signing
+    // max-age so the two windows stay aligned unless set explicitly.
+    requestNonceTtlSeconds: parseInteger(
+      env.REQUEST_NONCE_TTL_SECONDS ?? env.REQUEST_SIGNING_MAX_AGE_SECONDS,
+      300,
+    ),
+    // Response header carrying the server-issued nonce for the next request.
+    requestNonceHeader: env.REQUEST_NONCE_HEADER ?? "X-Nonce",
     // Content Security Policy (#754). Report-only by default: an enforced
     // policy that is even slightly too tight breaks the page, so a deployment
     // should watch reports first and switch to enforcing once they are clean.
@@ -552,12 +564,7 @@ export function validateConfig(env = process.env) {
     { key: "OAUTH_AUTH_CODE_TTL_MS", desc: "must be a valid integer" },
     { key: "OAUTH_ACCESS_TOKEN_TTL_MS", desc: "must be a valid integer" },
     { key: "OAUTH_REFRESH_TOKEN_TTL_MS", desc: "must be a valid integer" },
-    { key: "REPLICA_MAX_LAG_MS", desc: "must be a valid integer" },
-    { key: "REPLICA_WARN_LAG_MS", desc: "must be a valid integer" },
-    { key: "REPLICA_LAG_CHECK_INTERVAL_MS", desc: "must be a valid integer" },
-    { key: "REPLICA_FAILURE_THRESHOLD", desc: "must be a valid integer" },
-    { key: "REPLICA_RECOVERY_THRESHOLD", desc: "must be a valid integer" },
-    { key: "REPLICA_CONSISTENCY_WINDOW_MS", desc: "must be a valid integer" },
+    { key: "REQUEST_NONCE_TTL_SECONDS", desc: "must be a valid integer" },
   ];
 
   for (const item of numericVars) {
@@ -785,6 +792,9 @@ export function logDefaultValues(env = process.env) {
     { key: "JAEGER_AGENT_PORT", defaultVal: "6832" },
     { key: "JAEGER_SAMPLER_TYPE", defaultVal: "'const'" },
     { key: "JAEGER_SAMPLER_PARAM", defaultVal: "1" },
+    { key: "REQUEST_NONCE_ENABLED", defaultVal: "false" },
+    { key: "REQUEST_NONCE_TTL_SECONDS", defaultVal: "300" },
+    { key: "REQUEST_NONCE_HEADER", defaultVal: "'X-Nonce'" },
   ];
 
   for (const item of defaults) {

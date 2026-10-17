@@ -145,6 +145,58 @@ The API server supports multiple response formats based on the client's `Accept`
 }
 ```
 
+## Replay Prevention (#1052)
+
+Sensitive operations are protected against replay attacks using a
+nonce-based scheme. Clients must supply a unique nonce per request and
+the server rejects any nonce it has already seen.
+
+### Request contract
+
+- Send the nonce in the `X-Nonce` request header.
+- Each nonce must be unique per request; reuse is rejected.
+- Nonces are single-use and are stored server-side in Redis with a
+  **5-minute TTL** (the nonce expiry window). After the window elapses
+  the nonce is evicted and may be reused.
+
+```http
+POST /credentials HTTP/1.1
+Authorization: Bearer sk_<hex>
+X-Nonce: 8f14e45fceea167a5a36dedd4bea2543
+Content-Type: application/json
+```
+
+### Response contract
+
+Every response to a nonce-protected request echoes the nonce that was
+accepted (or generated) for that request:
+
+- `X-Nonce` — the nonce associated with the request/response.
+
+Duplicate nonces are rejected with `409 Conflict` and the standard error
+envelope:
+
+```json
+{
+  "error": {
+    "code": "ALREADY_EXISTS",
+    "message": "Nonce has already been used",
+    "details": { "nonce": "8f14e45fceea167a5a36dedd4bea2543" }
+  }
+}
+```
+
+### Client guidance
+
+- Generate a fresh, high-entropy nonce (e.g. 16 random bytes hex-encoded)
+  for every sensitive request; never reuse a nonce across requests.
+- Treat a `409` replay response as a hard failure — do not retry with the
+  same nonce. Generate a new nonce and retry if the operation is still
+  desired.
+- A nonce may only be reused after its 5-minute expiry window has passed.
+- Nonce collisions are monitored server-side; a rising collision rate
+  indicates clients are generating insufficiently random nonces.
+
 ## API Analytics & Usage Dashboard (#682)
 
 The server includes real-time API analytics monitoring and an administrative usage dashboard.

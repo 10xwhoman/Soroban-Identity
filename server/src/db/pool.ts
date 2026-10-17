@@ -1,6 +1,7 @@
 import { Pool, PoolClient, PoolConfig, QueryResult, QueryResultRow } from 'pg';
 import { config } from '../config';
 import { logger } from '../utils/logger';
+import { getCurrentTenantId } from '../context/tenantContext';
 
 /**
  * Connection pool management with health checks, automatic reconnection,
@@ -86,6 +87,35 @@ const DEFAULT_MAX_LAG_MS = 5_000;
 const DEFAULT_LAG_CHECK_INTERVAL_MS = 15_000;
 const DEFAULT_UNHEALTHY_COOLDOWN_MS = 30_000;
 const DEFAULT_READ_YOUR_WRITES_MS = 5_000;
+
+/** Postgres session variable used by row-level security policies. */
+const TENANT_SETTING = 'app.tenant_id';
+
+/**
+ * Error raised when a query would cross tenant boundaries or when no
+ * tenant is available in the current request context.
+ */
+export class TenantIsolationError extends Error {
+  readonly code = 'TENANT_ISOLATION';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'TenantIsolationError';
+  }
+}
+
+/**
+ * Heuristic check for queries that reference tenant-scoped tables without
+ * constraining them by tenant_id. Used as a defence-in-depth guard on top
+ * of database row-level security.
+ */
+function referencesTenantColumn(text: string): boolean {
+  return /\btenant_id\b/i.test(text);
+}
+
+function isWriteStatement(text: string): boolean {
+  return /^\s*(insert|update|delete|merge|truncate)\b/i.test(text);
+}
 
 /** Errors that indicate a transient/lost connection worth retrying. */
 const RETRYABLE_CODES = new Set([
@@ -440,55 +470,63 @@ export class DatabasePool {
   }
 
   /**
-   * Execute a read query against the nearest healthy replica for the given
-   * region. Falls back to the primary when no replica is available, when the
-   * replica is lagging, or when a recent write requires read-your-writes
-   * consistency. Replica failures transparently fail over to the primary.
+   * Resolve the tenant for the current request, falling back to an explicit
+   * override. Throws when no tenant can be determined so that unscoped
+   * queries never reach the database.
    */
-  async readQuery<T extends QueryResultRow = QueryResultRow>(
-    text: string,
-    params?: unknown[],
-    options: { region?: string; timeoutMillis?: number } = {},
-  ): Promise<QueryResult<T>> {
-    const timeoutMillis = options.timeoutMillis ?? this.queryTimeoutMillis;
-    const replicaName = this.needsPrimaryForRead()
-      ? null
-      : this.selectReplica(options.region);
-
-    if (replicaName) {
-      const pool = this.replicaPools.get(replicaName)!;
-      try {
-        return await this.queryOnPool<T>(pool, text, params, timeoutMillis);
-      } catch (err) {
-        // Failover: mark the replica unhealthy and retry on the primary.
-        const health = this.replicaHealth.get(replicaName);
-        if (health) {
-          health.healthy = false;
-          health.lastError = (err as Error).message;
-          health.lastCheckedAt = Date.now();
-        }
-        logger.warn('db.pool: replica read failed, failing over to primary', {
-          replica: replicaName,
-          error: (err as Error).message,
-        });
-      }
+  private resolveTenantId(explicitTenantId?: string): string {
+    const tenantId = explicitTenantId ?? getCurrentTenantId();
+    if (!tenantId) {
+      throw new TenantIsolationError(
+        'db.pool: no tenant in context; refusing to run tenant-scoped query',
+      );
     }
-
-    return this.query<T>(text, params, timeoutMillis);
+    return tenantId;
   }
 
-  /** Execute a query against a specific pool with timeout + retry. */
-  private async queryOnPool<T extends QueryResultRow>(
-    pool: Pool,
-    text: string,
-    params: unknown[] | undefined,
+  /**
+   * Apply the tenant context to a client session so that row-level security
+   * policies (using current_setting('app.tenant_id')) are enforced.
+   */
+  private async setTenantContext(
+    client: PoolClient,
+    tenantId: string,
     timeoutMillis: number,
+  ): Promise<void> {
+    await this.withTimeout(
+      client.query(`SELECT set_config($1, $2, true)`, [TENANT_SETTING, tenantId]),
+      timeoutMillis,
+    );
+  }
+
+  /**
+   * Execute a tenant-scoped query. The current tenant id is injected into the
+   * session so row-level security applies, and queries that touch tenant
+   * columns without constraining them are rejected.
+   */
+  async tenantQuery<T extends QueryResultRow = QueryResultRow>(
+    text: string,
+    params?: unknown[],
+    timeoutMillis: number = this.queryTimeoutMillis,
+    tenantId?: string,
   ): Promise<QueryResult<T>> {
+    const resolvedTenantId = this.resolveTenantId(tenantId);
+    if (isWriteStatement(text) && !referencesTenantColumn(text)) {
+      throw new TenantIsolationError(
+        'db.pool: tenant-scoped write must reference tenant_id',
+      );
+    }
     let lastError: unknown;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      const client = await this.acquireHealthyClient(pool);
+      const client = await this.acquireHealthyClient();
       try {
-        return await this.withTimeout(client.query<T>(text, params), timeoutMillis);
+        await this.setTenantContext(client, resolvedTenantId, timeoutMillis);
+        const result = await this.withTimeout(
+          client.query<T>(text, params),
+          timeoutMillis,
+        );
+        client.release();
+        return result;
       } catch (err) {
         lastError = err;
         client.release(isRetryable(err));
@@ -496,24 +534,42 @@ export class DatabasePool {
           break;
         }
         const delay = this.retryDelayMillis * 2 ** attempt;
+        logger.warn('db.pool: tenant query failed, retrying', {
+          attempt: attempt + 1,
+          delay,
+          tenantId: resolvedTenantId,
+          error: (err as Error).message,
+        });
         await sleep(delay);
       }
     }
     throw lastError;
   }
 
-  /** Run a callback inside a transaction with timeout + retry. */
+  /**
+   * Run a callback inside a transaction with timeout + retry, scoped to the
+   * current tenant. The tenant context is set with SET LOCAL so it is
+   * automatically cleared when the transaction ends.
+   */
   async transaction<T>(
     fn: (client: PoolClient) => Promise<T>,
     timeoutMillis: number = this.queryTimeoutMillis,
+    tenantId?: string,
   ): Promise<T> {
+    const resolvedTenantId = this.resolveTenantId(tenantId);
     const client = await this.acquireHealthyClient();
+    let caught: unknown;
     try {
       await this.withTimeout(client.query('BEGIN'), timeoutMillis);
+      await this.withTimeout(
+        client.query(`SET LOCAL ${TENANT_SETTING} = $1`, [resolvedTenantId]),
+        timeoutMillis,
+      );
       const result = await this.withTimeout(fn(client), timeoutMillis);
       await this.withTimeout(client.query('COMMIT'), timeoutMillis);
       return result;
     } catch (err) {
+      caught = err;
       try {
         await client.query('ROLLBACK');
       } catch (rollbackErr) {
@@ -523,7 +579,7 @@ export class DatabasePool {
       }
       throw err;
     } finally {
-      client.release(isRetryable(err0(err)));
+      client.release(isRetryable(caught));
     }
   }
 
@@ -564,30 +620,6 @@ export class DatabasePool {
     ]);
     logger.info('db.pool: shutdown complete');
   }
-}
-
-// Small helper so the transaction finally block can inspect the caught error.
-function err0(err: unknown): unknown {
-  return err;
-}
-
-/** Heuristic: does this statement mutate data (and thus require the primary)? */
-function isWriteStatement(text: string): boolean {
-  const normalized = text.trimStart().toUpperCase();
-  return (
-    normalized.startsWith('INSERT') ||
-    normalized.startsWith('UPDATE') ||
-    normalized.startsWith('DELETE') ||
-    normalized.startsWith('REPLACE') ||
-    normalized.startsWith('TRUNCATE') ||
-    normalized.startsWith('CREATE') ||
-    normalized.startsWith('ALTER') ||
-    normalized.startsWith('DROP') ||
-    normalized.startsWith('GRANT') ||
-    normalized.startsWith('REVOKE') ||
-    normalized.startsWith('COMMENT') ||
-    normalized.startsWith('WITH') // CTEs may contain writes; be conservative.
-  );
 }
 
 export const dbPool = new DatabasePool();
