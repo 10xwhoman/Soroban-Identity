@@ -399,21 +399,48 @@
             }
           },
           "409": {
-            "description": "Credential with the given ID already exists",
+            "description": "Conflict - the credential ID already exists, or the request nonce was already used (replay attack). Replay rejections return code `NONCE_REPLAYED` (alias `SIGNATURE_REPLAYED`).",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 },
-                "example": {
-                  "code": "CREDENTIAL_ALREADY_EXISTS",
-                  "message": "Credential with ID \"cred-kyc-2026-001\" already exists",
-                  "details": [
-                    {
-                      "field": "id",
-                      "value": "cred-kyc-2026-001"
+                "examples": {
+                  "credentialExists": {
+                    "summary": "Credential already exists",
+                    "value": {
+                      "code": "CREDENTIAL_ALREADY_EXISTS",
+                      "message": "Credential with ID \"cred-kyc-2026-001\" already exists",
+                      "details": [
+                        {
+                          "field": "id",
+                          "value": "cred-kyc-2026-001"
+                        }
+                      ]
                     }
-                  ]
+                  },
+                  "nonceReplayed": {
+                    "summary": "Nonce already used (replay)",
+                    "value": {
+                      "code": "NONCE_REPLAYED",
+                      "error": "conflict",
+                      "message": "Nonce has already been used. Generate a fresh nonce for each request.",
+                      "details": [
+                        {
+                          "field": "X-Nonce",
+                          "value": "b7f3c1a2e9d84f6b8c0a1d2e3f4a5b6c"
+                        }
+                      ]
+                    }
+                  },
+                  "signatureReplayed": {
+                    "summary": "Signature replayed",
+                    "value": {
+                      "code": "SIGNATURE_REPLAYED",
+                      "error": "conflict",
+                      "message": "Request signature has already been used. Generate a fresh nonce for each request."
+                    }
+                  }
                 }
               }
             }
@@ -570,21 +597,48 @@
             }
           },
           "409": {
-            "description": "Credential with the given ID already exists",
+            "description": "Conflict - the credential ID already exists, or the request nonce was already used (replay attack). Replay rejections return code `NONCE_REPLAYED` (alias `SIGNATURE_REPLAYED`).",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 },
-                "example": {
-                  "code": "CREDENTIAL_ALREADY_EXISTS",
-                  "message": "Credential with ID \"cred-kyc-2026-001\" already exists",
-                  "details": [
-                    {
-                      "field": "id",
-                      "value": "cred-kyc-2026-001"
+                "examples": {
+                  "credentialExists": {
+                    "summary": "Credential already exists",
+                    "value": {
+                      "code": "CREDENTIAL_ALREADY_EXISTS",
+                      "message": "Credential with ID \"cred-kyc-2026-001\" already exists",
+                      "details": [
+                        {
+                          "field": "id",
+                          "value": "cred-kyc-2026-001"
+                        }
+                      ]
                     }
-                  ]
+                  },
+                  "nonceReplayed": {
+                    "summary": "Nonce already used (replay)",
+                    "value": {
+                      "code": "NONCE_REPLAYED",
+                      "error": "conflict",
+                      "message": "Nonce has already been used. Generate a fresh nonce for each request.",
+                      "details": [
+                        {
+                          "field": "X-Nonce",
+                          "value": "b7f3c1a2e9d84f6b8c0a1d2e3f4a5b6c"
+                        }
+                      ]
+                    }
+                  },
+                  "signatureReplayed": {
+                    "summary": "Signature replayed",
+                    "value": {
+                      "code": "SIGNATURE_REPLAYED",
+                      "error": "conflict",
+                      "message": "Request signature has already been used. Generate a fresh nonce for each request."
+                    }
+                  }
                 }
               }
             }
@@ -767,6 +821,27 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Conflict - the request nonce was already used (replay attack). Returns code `NONCE_REPLAYED` (alias `SIGNATURE_REPLAYED`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "code": "NONCE_REPLAYED",
+                  "error": "conflict",
+                  "message": "Nonce has already been used. Generate a fresh nonce for each request.",
+                  "details": [
+                    {
+                      "field": "X-Nonce",
+                      "value": "b7f3c1a2e9d84f6b8c0a1d2e3f4a5b6c"
+                    }
+                  ]
+                }
+              }
+            }
           }
         },
         "operationId": "deleteCredential"
@@ -846,6 +921,27 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Conflict - the request nonce was already used (replay attack). Returns code `NONCE_REPLAYED` (alias `SIGNATURE_REPLAYED`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "code": "NONCE_REPLAYED",
+                  "error": "conflict",
+                  "message": "Nonce has already been used. Generate a fresh nonce for each request.",
+                  "details": [
+                    {
+                      "field": "X-Nonce",
+                      "value": "b7f3c1a2e9d84f6b8c0a1d2e3f4a5b6c"
+                    }
+                  ]
+                }
+              }
+            }
           }
         },
         "operationId": "revokeCredential"
@@ -920,6 +1016,27 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict - the request nonce was already used (replay attack). Returns code `NONCE_REPLAYED` (alias `SIGNATURE_REPLAYED`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "code": "NONCE_REPLAYED",
+                  "error": "conflict",
+                  "message": "Nonce has already been used. Generate a fresh nonce for each request.",
+                  "details": [
+                    {
+                      "field": "X-Nonce",
+                      "value": "b7f3c1a2e9d84f6b8c0a1d2e3f4a5b6c"
+                    }
+                  ]
                 }
               }
             }
@@ -2215,6 +2332,11 @@
       "X-Total-Count": {
         "description": "Same as pagination.total_count.",
         "schema": { "type": "integer" }
+      },
+      "X-Nonce": {
+        "description": "Nonce issued for the request/response pair. Clients must send a unique nonce (via the `X-Nonce` request header) on sensitive operations; the server echoes the accepted nonce back in this response header. Nonces are single-use and expire after 5 minutes (300 seconds).",
+        "schema": { "type": "string" },
+        "example": "b7f3c1a2e9d84f6b8c0a1d2e3f4a5b6c"
       }
     },
     "parameters": {
@@ -2577,7 +2699,7 @@
       "ErrorResponse": {
         "type": "object",
         "properties": {
-          "code": { "type": "string", "example": "INVALID_REQUEST" },
+          "code": { "type": "string", "example": "INVALID_REQUEST", "description": "Machine-readable error code. Replay rejections use `NONCE_REPLAYED` (alias `SIGNATURE_REPLAYED`)." },
           "error": { "type": "string", "example": "unauthorized" },
           "message": { "type": "string", "example": "Request body must include a credential id." },
           "requiredScopes": { "type": "array", "items": { "type": "string" } },
@@ -2588,6 +2710,33 @@
               "type": "object",
               "properties": {
                 "field": { "type": "string" },
+                "value": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "NonceReplayError": {
+        "type": "object",
+        "description": "Returned with HTTP 409 when a request nonce has already been consumed within the 5-minute nonce window (#1052).",
+        "required": ["code", "message"],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": ["NONCE_REPLAYED", "SIGNATURE_REPLAYED"],
+            "example": "NONCE_REPLAYED"
+          },
+          "error": { "type": "string", "example": "conflict" },
+          "message": {
+            "type": "string",
+            "example": "Nonce has already been used. Generate a fresh nonce for each request."
+          },
+          "details": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "field": { "type": "string", "example": "X-Nonce" },
                 "value": { "type": "string" }
               }
             }
@@ -3439,7 +3588,8 @@
         "properties": {
           "code": {
             "type": "string",
-            "example": "INVALID_REQUEST"
+            "example": "INVALID_REQUEST",
+            "description": "Machine-readable error code. Replay rejections use `NONCE_REPLAYED` (alias `SIGNATURE_REPLAYED`)."
           },
           "error": {
             "type": "string",
@@ -3468,6 +3618,47 @@
               "properties": {
                 "field": {
                   "type": "string"
+                },
+                "value": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "NonceReplayError": {
+        "type": "object",
+        "description": "Returned with HTTP 409 when a request nonce has already been consumed within the 5-minute nonce window (#1052).",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "NONCE_REPLAYED",
+              "SIGNATURE_REPLAYED"
+            ],
+            "example": "NONCE_REPLAYED"
+          },
+          "error": {
+            "type": "string",
+            "example": "conflict"
+          },
+          "message": {
+            "type": "string",
+            "example": "Nonce has already been used. Generate a fresh nonce for each request."
+          },
+          "details": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "field": {
+                  "type": "string",
+                  "example": "X-Nonce"
                 },
                 "value": {
                   "type": "string"

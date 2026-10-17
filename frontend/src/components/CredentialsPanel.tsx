@@ -68,17 +68,35 @@ type FilterType = "All" | CredentialType;
 type ExpiryFilterType = "All" | "Active" | "Expired";
 type CredentialStatus = "active" | "expired" | "revoked";
 
-function formatExpiry(expiresAt: number): string {
-  if (expiresAt === 0) return "No expiry";
+const MAX_SAFE_TIMESTAMP_SECS = 8_640_000_000_000; // Max ECMAScript Date in seconds (~year 275760)
+const MAX_U64_TIMESTAMP = 18_446_744_073_709_551_615n;
 
-  const now = Date.now();
-  const expiryMs = expiresAt * 1000;
-  const diffMs = expiryMs - now;
-  const diffDays = Math.floor(Math.abs(diffMs) / (1000 * 60 * 60 * 24));
-  const diffHours = Math.floor(Math.abs(diffMs) / (1000 * 60 * 60));
-  const diffMinutes = Math.floor(Math.abs(diffMs) / (1000 * 60));
+function normalizeExpiryTimestamp(expiresAt: number | bigint | string): number {
+  if (typeof expiresAt === "bigint") {
+    if (expiresAt <= 0n) return 0;
+    return expiresAt > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(expiresAt);
+  }
+  const num = typeof expiresAt === "string" ? Number(expiresAt) : expiresAt;
+  if (!Number.isFinite(num)) return 0;
+  // Recover from signed 32-bit integer overflow (e.g. dates past 2038/2106 coerced via bitwise ops)
+  if (num < 0) {
+    return num + 0x100000000;
+  }
+  return num;
+}
 
-  if (diffMs < 0) {
+function formatExpiry(expiresAt: number | bigint): string {
+  const normalized = normalizeExpiryTimestamp(expiresAt);
+  if (normalized === 0) return "No expiry";
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const diffSec = normalized - nowSec;
+  const absSec = Math.abs(diffSec);
+  const diffDays = Math.floor(absSec / (60 * 60 * 24));
+  const diffHours = Math.floor(absSec / (60 * 60));
+  const diffMinutes = Math.floor(absSec / 60);
+
+  if (diffSec < 0) {
     if (diffDays > 0) return `Expired ${diffDays} day${diffDays > 1 ? "s" : ""} ago`;
     if (diffHours > 0) return `Expired ${diffHours} hour${diffHours > 1 ? "s" : ""} ago`;
     return `Expired ${diffMinutes} min${diffMinutes > 1 ? "s" : ""} ago`;
@@ -89,15 +107,15 @@ function formatExpiry(expiresAt: number): string {
   return `Expires in ${diffMinutes} min${diffMinutes > 1 ? "s" : ""}`;
 }
 
-function getExpiryStyle(expiresAt: number): React.CSSProperties {
-  if (expiresAt === 0) return { color: "var(--text-muted)" };
+function getExpiryStyle(expiresAt: number | bigint): React.CSSProperties {
+  const normalized = normalizeExpiryTimestamp(expiresAt);
+  if (normalized === 0) return { color: "var(--text-muted)" };
 
-  const now = Date.now();
-  const expiryMs = expiresAt * 1000;
-  const diffMs = expiryMs - now;
-  const diffDays = Math.floor(Math.abs(diffMs) / (1000 * 60 * 60 * 24));
+  const nowSec = Math.floor(Date.now() / 1000);
+  const diffSec = normalized - nowSec;
+  const diffDays = Math.floor(Math.abs(diffSec) / (60 * 60 * 24));
 
-  if (diffMs < 0) {
+  if (diffSec < 0) {
     return { color: "var(--error)", fontWeight: 600 };
   }
   if (diffDays <= 7) {
@@ -106,8 +124,9 @@ function getExpiryStyle(expiresAt: number): React.CSSProperties {
   return { color: "var(--text-muted)" };
 }
 
-function isExpired(expiresAt: number): boolean {
-  return expiresAt > 0 && Date.now() / 1000 > expiresAt;
+function isExpired(expiresAt: number | bigint): boolean {
+  const normalized = normalizeExpiryTimestamp(expiresAt);
+  return normalized > 0 && Math.floor(Date.now() / 1000) > normalized;
 }
 
 function getCredentialStatus(credential: Credential): CredentialStatus {
@@ -668,14 +687,19 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
       errors.claims = "At least one claim key-value pair is required";
     }
 
-    // Validate expiry date
-    const expiryNum = parseInt(expiresAt, 10);
-    if (isNaN(expiryNum) || expiryNum < 0) {
-      errors.expiresAt = "Expiry must be 0 or a positive number";
-    } else if (expiryNum > 0) {
-      const now = Math.floor(Date.now() / 1000);
-      if (expiryNum <= now) {
-        errors.expiresAt = "Expiry date must be in the future";
+    // Validate expiry date (supports 64-bit timestamps beyond year 2106 up to u64::MAX)
+    const trimmedExpiry = expiresAt.trim() || "0";
+    if (!/^\d+$/.test(trimmedExpiry)) {
+      errors.expiresAt = "Expiry must be 0 or a positive integer timestamp";
+    } else {
+      const expiryBig = BigInt(trimmedExpiry);
+      if (expiryBig > MAX_U64_TIMESTAMP) {
+        errors.expiresAt = "Expiry exceeds maximum 64-bit timestamp value";
+      } else if (expiryBig > 0n) {
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        if (expiryBig <= now) {
+          errors.expiresAt = "Expiry date must be in the future";
+        }
       }
     }
 
@@ -841,6 +865,14 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
     updatePaginationParams(1, pageSize);
   };
 
+  const handleResetFilters = () => {
+    setActiveFilter("All");
+    setActiveExpiryFilter("All");
+    setSearchAddress("");
+    setPage(1);
+    updatePaginationParams(1, pageSize);
+  };
+
   // ── #738: RPC rate-limit-aware transaction helper ─────────────────────────
   // Wraps an async RPC call in an exponential-backoff retry loop so transient
   // 429 / 503 errors do not permanently fail the transaction. Matches the same
@@ -914,7 +946,7 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
             nativeToScVal(claimsMap, { type: "map" }),
             nativeToScVal(Buffer.from(claimsHashHex, "hex"), { type: "bytes" }),
             nativeToScVal(Buffer.from(sigHex, "hex"), { type: "bytes" }),
-            nativeToScVal(parseInt(expiresAt || "0", 10), { type: "u64" })
+            nativeToScVal(BigInt(expiresAt.trim() || "0"), { type: "u64" })
           )
         )
         .setTimeout(30)
@@ -1257,6 +1289,23 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
               </button>
             );
           })}
+          {(activeFilter !== "All" || activeExpiryFilter !== "All" || searchAddress.trim() !== "") && (
+            <button
+              type="button"
+              onClick={handleResetFilters}
+              style={{
+                padding: "0.3rem 0.75rem",
+                borderRadius: "999px",
+                border: "2px solid var(--border-input)",
+                background: "transparent",
+                color: "var(--text-muted)",
+                cursor: "pointer",
+                fontSize: "0.85rem",
+              }}
+            >
+              Reset Filters
+            </button>
+          )}
         </div>
 
         {fetching ? (
@@ -1550,6 +1599,7 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
         </label>
         <input
           id="verify-credential-id"
+          data-tour="verify-credential-input"
           placeholder="Credential ID (hex)"
           value={credId}
           onChange={(e) => setCredId(e.target.value)}
@@ -1683,7 +1733,11 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
                 style={{ marginBottom: "1rem" }}
               />
 
-              <button onClick={handleIssue} disabled={issuing || Object.keys(issueErrors).length > 0}>
+              <button
+                data-tour="issue-credential-button"
+                onClick={handleIssue}
+                disabled={issuing || Object.keys(issueErrors).length > 0}
+              >
                 {issuing
                   ? "Issuing…"
                   : selectedTemplate
