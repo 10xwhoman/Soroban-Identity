@@ -117,3 +117,52 @@ export function wrapResponse(data, links) {
 export function toV2(v1Payload) {
   return wrapResponse(v1Payload);
 }
+
+/**
+ * Route a read query to the nearest healthy read replica (#1051).
+ *
+ * Reads are served from a geo-distributed replica when one is available and
+ * within the acceptable replication lag; otherwise the query transparently
+ * falls back to the primary. Callers may opt into strong consistency by
+ * passing `{ consistency: "strong" }`, which bypasses replicas entirely.
+ *
+ * @param {Function} queryFn  executes the query against the given connection
+ * @param {object}   [options]
+ * @param {"eventual"|"strong"} [options.consistency="eventual"]
+ * @param {string}   [options.region]  preferred region hint
+ * @returns {Promise<*>} query result
+ */
+export function readQuery(queryFn, options = {}) {
+  const { consistency = "eventual", region } = options;
+
+  if (consistency === "strong") {
+    return writeToPrimary(queryFn);
+  }
+
+  return readFromReplica(queryFn, { region });
+}
+
+/**
+ * Route a write query to the primary (#1051).
+ *
+ * Writes always target the primary; replicas converge asynchronously.
+ *
+ * @param {Function} queryFn  executes the query against the given connection
+ * @returns {Promise<*>} query result
+ */
+export function writeQuery(queryFn) {
+  return writeToPrimary(queryFn);
+}
+
+/**
+ * Execute a read that must observe a preceding write (read-your-writes).
+ *
+ * Uses strong consistency so the caller is guaranteed to see the latest
+ * committed state rather than a possibly-lagging replica.
+ *
+ * @param {Function} queryFn
+ * @returns {Promise<*>} query result
+ */
+export function readAfterWrite(queryFn) {
+  return readQuery(queryFn, { consistency: "strong" });
+}

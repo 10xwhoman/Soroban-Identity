@@ -1439,6 +1439,7 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
         </label>
         <input
           id="verify-credential-id"
+          data-tour="verify-credential-input"
           placeholder="Credential ID (hex)"
           value={credId}
           onChange={(e) => setCredId(e.target.value)}
@@ -1572,7 +1573,11 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
                 style={{ marginBottom: "1rem" }}
               />
 
-              <button onClick={handleIssue} disabled={issuing || Object.keys(issueErrors).length > 0}>
+              <button
+                data-tour="issue-credential-button"
+                onClick={handleIssue}
+                disabled={issuing || Object.keys(issueErrors).length > 0}
+              >
                 {issuing
                   ? "Issuing…"
                   : selectedTemplate

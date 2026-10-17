@@ -59,7 +59,7 @@ export enum Tab {
 
 const TAB_ORDER: Tab[] = [Tab.Identity, Tab.Credentials, Tab.IssuerAnalytics];
 
-export default function App() {
+function AppContent() {
   const [tab, setTab] = useState<Tab>(Tab.Identity);
   const tabRefs = useRef<Partial<Record<Tab, HTMLButtonElement | null>>>({});
   const [activeNetwork, setActiveNetwork] = useState<NetworkName>(DEFAULT_NETWORK);
@@ -577,6 +577,7 @@ export default function App() {
             ref={(node) => {
               tabRefs.current[name] = node;
             }}
+            data-tour={`tab-${name}`}
             onClick={() => setTab(name)}
             onMouseEnter={name === Tab.Credentials ? preloadCredentialsPanel : undefined}
             onFocus={name === Tab.Credentials ? preloadCredentialsPanel : undefined}
@@ -594,6 +595,7 @@ export default function App() {
             id={`panel-${Tab.Identity}`}
             role="tabpanel"
             aria-labelledby={`tab-${Tab.Identity}`}
+            data-tour="panel-identity"
             hidden={tab !== Tab.Identity}
           >
             {tab === Tab.Identity && <IdentityPanel />}
@@ -602,6 +604,7 @@ export default function App() {
             id={`panel-${Tab.Credentials}`}
             role="tabpanel"
             aria-labelledby={`tab-${Tab.Credentials}`}
+            data-tour="panel-credentials"
             hidden={tab !== Tab.Credentials}
           >
             {tab === Tab.Credentials && (
@@ -633,6 +636,7 @@ export default function App() {
             id={`panel-${Tab.IssuerAnalytics}`}
             role="tabpanel"
             aria-labelledby={`tab-${Tab.IssuerAnalytics}`}
+            data-tour="panel-issuer"
             hidden={tab !== Tab.IssuerAnalytics}
           >
             {tab === Tab.IssuerAnalytics && <IssuerDashboard />}
@@ -643,5 +647,14 @@ export default function App() {
       </main>
     </div>
     </ToastProvider>
+  );
+}
+
+export default function App() {
+  return (
+    <TourProvider>
+      <AppContent />
+      <TourOverlay />
+    </TourProvider>
   );
 }
